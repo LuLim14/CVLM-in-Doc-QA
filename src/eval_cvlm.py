@@ -68,6 +68,40 @@ def parse_args() -> argparse.Namespace:
             "sft",  # SFT-trained decoder loaded from --sft_model_path
         ],
     )
+    p.add_argument(
+        "--doc_truncation",
+        type=str,
+        default="none",
+        choices=["none", "first", "last", "random", "oracle", "file"],
+        help="baseline_llm_full/sft only: replace the document inside full_prompt "
+        "with a budgeted decoder-token window before appending '\\n\\n' + question. "
+        "first/last/random = contiguous window (random is deterministic: seed + "
+        "sample idx); oracle = window centred on the answer's occurrence in the "
+        "document (first-N fallback when not found); file = skim-then-read: the "
+        "document is replaced by `selected_text` from --doc_selection_file "
+        "(tools/score_chunks.py output, matched by idx; budget already applied "
+        "offline, so --doc_budget_cr must NOT be passed). 'none' keeps the full "
+        "document (current behaviour).",
+    )
+    p.add_argument(
+        "--doc_selection_file",
+        type=str,
+        default="",
+        help="JSONL from tools/score_chunks.py (one line per filtered sample: "
+        '{"idx", "selected_text", ...}). Required — and only valid — with '
+        "--doc_truncation=file. idx = position in the filtered dataset, so this "
+        "eval must use the same dataset/split and filter flags as the scoring run "
+        "(a line-count mismatch fails loudly).",
+    )
+    p.add_argument(
+        "--doc_budget_cr",
+        type=int,
+        default=0,
+        help="Document window budget in decoder tokens: min(ceil(L_enc/N), "
+        "max_vision_len) with L_enc the source length in encoder tokens — i.e. "
+        "exactly the CVLM vision-token budget at compression_rate=N. Required "
+        "(>0) when --doc_truncation != none.",
+    )
     p.add_argument("--compute_generation_metrics", action="store_true")
     p.add_argument(
         "--num_cached_samples",
@@ -78,6 +112,14 @@ def parse_args() -> argparse.Namespace:
         "*_samples.json file next to the per-ckpt eval JSON. 0 disables.",
     )
     p.add_argument("--output_json", type=str, default="")
+    p.add_argument(
+        "--dump_per_sample",
+        type=str,
+        default="",
+        help="Path to a JSONL file receiving one line per evaluated sample "
+        "(answer NLL / token counts; plus prediction/reference/rougeL when "
+        "--compute_generation_metrics is set) for bootstrap CIs. '' disables.",
+    )
     p.add_argument("--tensorboard_dir", type=str, default="")
     p.add_argument("--tb_run_name", type=str, default="")
     p.add_argument("--trackio_project", type=str, default=os.environ.get("TRACKIO_PROJECT", "cvlm"))
@@ -104,6 +146,34 @@ def parse_args() -> argparse.Namespace:
         type=lambda s: str(s).lower() in ("1", "true", "yes"),
         default=os.environ.get("LEGACY_PROJECTOR", "0") == "1",
         help="Must match training: omit pre-MLP RMSNorm so old checkpoints load without extra keys.",
+    )
+    p.add_argument(
+        "--vit_init",
+        type=str,
+        choices=["pretrained", "random"],
+        default=os.environ.get("VIT_INIT", "pretrained"),
+        help="Must match training. For 'random' the checkpoint overwrites ViT weights anyway (strict=False), but passing it avoids relying on that.",
+    )
+    p.add_argument(
+        "--freeze_vit",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("FREEZE_VIT", "0") == "1",
+        help="Must match training (frozen ViT weights are absent from the checkpoint and reload from HF).",
+    )
+    p.add_argument(
+        "--no_vit",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("NO_VIT", "0") == "1",
+        help="MUST match training for the no-ViT branch — otherwise eval silently builds a pretrained ViT and runs the latents through it.",
+    )
+    p.add_argument(
+        "--mixer_depth_map",
+        type=str,
+        default=os.environ.get("MIXER_DEPTH_MAP", ""),
+        help="RATE-DEPTH MIXER: MUST match training. Non-empty builds the model with the zero-gated "
+        "mixer stack instead of the ViT; the active depth is looked up from --compression_rate "
+        "(exact key; else nearest LOWER key; else smallest key — e.g. cr=32 with a map up to 16 "
+        "uses the cr=16 depth). Env: MIXER_DEPTH_MAP.",
     )
     p.add_argument("--global_step", type=int, default=0)
     p.add_argument("--no_bf16", action="store_true")
@@ -144,6 +214,78 @@ def _encode_source_for_baseline(model: CVLM, source_ids, source_mask):
     return pooled, vmask
 
 
+class PerSampleDumper:
+    """Streams per-sample eval stats to a JSONL file (--dump_per_sample).
+
+    Teacher-forcing lines ({idx, answer_nll_nats, answer_tokens, correct_tokens})
+    are appended batch-by-batch and flushed, so an interrupted run keeps
+    everything already evaluated. When generation metrics run afterwards,
+    ``merge_generation`` adds prediction/reference/rougeL to the same records
+    and rewrites the file with the merged lines.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.records: list[dict] = []
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self._fh = open(path, "w")
+
+    def add_tf_batch(self, nll: torch.Tensor, n_tokens: torch.Tensor, n_correct: torch.Tensor) -> None:
+        for j in range(nll.size(0)):
+            rec = {
+                "idx": len(self.records),
+                "answer_nll_nats": float(nll[j].item()),
+                "answer_tokens": int(n_tokens[j].item()),
+                "correct_tokens": int(n_correct[j].item()),
+            }
+            self.records.append(rec)
+            self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._fh.flush()
+
+    def merge_generation(
+        self, predictions: list[str], references: list[str], per_sample_rougeL: list[float]
+    ) -> None:
+        n = min(len(self.records), len(predictions), len(references), len(per_sample_rougeL))
+        for j in range(n):
+            self.records[j]["prediction"] = predictions[j]
+            self.records[j]["reference"] = references[j]
+            self.records[j]["rougeL"] = float(per_sample_rougeL[j])
+        self._fh.close()
+        self._fh = open(self.path, "w")
+        for rec in self.records:
+            self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        if not self._fh.closed:
+            self._fh.close()
+
+
+def _dump_tf_batch(
+    dumper: Optional[PerSampleDumper],
+    per_token_loss: torch.Tensor,
+    flat_mask: torch.Tensor,
+    preds: torch.Tensor,
+    answer_labels: torch.Tensor,
+    batch_size: int,
+) -> None:
+    """Reduce one batch's flat per-token losses to per-sample dump stats.
+
+    ``per_token_loss`` / ``flat_mask`` are the flattened shifted tensors the TF
+    loops already compute (loss is 0 at ignore_index positions, and we mask
+    anyway); ``preds`` / ``answer_labels`` are the [B, A] answer-region tensors.
+    """
+    if dumper is None:
+        return
+    loss_2d = per_token_loss.view(batch_size, -1).float()
+    mask_2d = flat_mask.view(batch_size, -1)
+    nll = (loss_2d * mask_2d).sum(dim=1)
+    n_tokens = mask_2d.sum(dim=1)
+    ans_mask = answer_labels != -100
+    n_correct = ((preds == answer_labels) & ans_mask).sum(dim=1)
+    dumper.add_tf_batch(nll, n_tokens, n_correct)
+
+
 # ---------------------------------------------------------------------------
 # Teacher-forcing metrics
 # ---------------------------------------------------------------------------
@@ -156,6 +298,7 @@ def eval_teacher_forcing_cvlm(
     device: torch.device,
     max_samples: int,
     shuffle_source: bool = False,
+    dumper: Optional[PerSampleDumper] = None,
 ) -> Dict[str, float]:
     """Teacher-forcing eval for CVLM.
 
@@ -227,6 +370,7 @@ def eval_teacher_forcing_cvlm(
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
+        _dump_tf_batch(dumper, per_tok, mask, preds, answer_labels, B)
         n_samples += B
         if 0 < max_samples <= n_samples:
             break
@@ -252,6 +396,7 @@ def eval_teacher_forcing_baseline_llm(
     loader: DataLoader,
     device: torch.device,
     max_samples: int,
+    dumper: Optional[PerSampleDumper] = None,
 ) -> Dict[str, float]:
     """Baseline: prompt tokens + answer tokens into the frozen decoder, no vision span."""
     model.eval()
@@ -300,6 +445,7 @@ def eval_teacher_forcing_baseline_llm(
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
+        _dump_tf_batch(dumper, per_token_loss, mask, preds, answer_labels, B)
         n_samples += B
         if 0 < max_samples <= n_samples:
             break
@@ -323,6 +469,7 @@ def eval_teacher_forcing_baseline_llm_full(
     loader: DataLoader,
     device: torch.device,
     max_samples: int,
+    dumper: Optional[PerSampleDumper] = None,
 ) -> Dict[str, float]:
     """Oracle baseline: full (document + question) text as the decoder prompt.
 
@@ -381,6 +528,7 @@ def eval_teacher_forcing_baseline_llm_full(
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
+        _dump_tf_batch(dumper, per_tok, mask, preds, answer_labels, B)
         n_samples += B
         if 0 < max_samples <= n_samples:
             break
@@ -405,6 +553,7 @@ def eval_teacher_forcing_sft(
     loader: DataLoader,
     device: torch.device,
     max_samples: int,
+    dumper: Optional[PerSampleDumper] = None,
 ) -> Dict[str, float]:
     """SFT-trained decoder eval: same input format as baseline_llm_full
     (`full_prompt_ids` = document + blank line + question, then answer), but
@@ -474,6 +623,7 @@ def eval_teacher_forcing_sft(
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
+        _dump_tf_batch(dumper, per_tok, mask, preds, answer_labels, B)
         n_samples += B
         if 0 < max_samples <= n_samples:
             break
@@ -499,6 +649,7 @@ def eval_teacher_forcing_baseline_proj(
     loader: DataLoader,
     device: torch.device,
     max_samples: int,
+    dumper: Optional[PerSampleDumper] = None,
 ) -> Dict[str, float]:
     """Baseline: text encoder → chunked pool → random linear projection → decoder (skip ViT)."""
     model.eval()
@@ -547,6 +698,7 @@ def eval_teacher_forcing_baseline_proj(
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
+        _dump_tf_batch(dumper, per_token_loss, mask, preds, answer_labels, B)
         n_samples += B
         if 0 < max_samples <= n_samples:
             break
@@ -726,7 +878,11 @@ def generate_answers(
     return predictions, references, cached_samples
 
 
-def compute_generation_metrics(predictions: list[str], references: list[str]) -> Dict[str, float]:
+def compute_generation_metrics(
+    predictions: list[str],
+    references: list[str],
+    per_sample_rougeL: Optional[list[float]] = None,
+) -> Dict[str, float]:
     import sacrebleu
     from rouge_score import rouge_scorer
 
@@ -737,6 +893,8 @@ def compute_generation_metrics(predictions: list[str], references: list[str]) ->
         r1.append(scores["rouge1"].fmeasure)
         r2.append(scores["rouge2"].fmeasure)
         rl.append(scores["rougeL"].fmeasure)
+    if per_sample_rougeL is not None:
+        per_sample_rougeL.extend(rl)
 
     bleu = sacrebleu.corpus_bleu(predictions, [references])
     n_exact = sum(1 for p, r in zip(predictions, references) if p.strip() == r.strip())
@@ -863,6 +1021,26 @@ def main() -> None:
             "--all_checkpoints is incompatible with --mode sft: SFT eval uses "
             "--sft_model_path (an HF directory) rather than model_step_*.safetensors."
         )
+    if args.doc_truncation != "none":
+        if args.mode not in ("baseline_llm_full", "sft"):
+            raise ValueError(
+                f"--doc_truncation only applies to modes that consume full_prompt_ids "
+                f"(baseline_llm_full / sft); got --mode {args.mode}"
+            )
+        if args.doc_truncation == "file":
+            if not args.doc_selection_file:
+                raise ValueError("--doc_truncation=file requires --doc_selection_file <score_chunks JSONL>")
+            if args.doc_budget_cr > 0:
+                raise ValueError(
+                    "--doc_truncation=file: the token budget was applied offline by "
+                    "tools/score_chunks.py (--budget_cr); do not pass --doc_budget_cr here."
+                )
+        elif args.doc_budget_cr <= 0:
+            raise ValueError("--doc_truncation != none requires --doc_budget_cr > 0")
+    elif args.doc_budget_cr > 0:
+        raise ValueError("--doc_budget_cr > 0 requires --doc_truncation != none")
+    if args.doc_selection_file and args.doc_truncation != "file":
+        raise ValueError("--doc_selection_file is only valid with --doc_truncation=file")
 
     # Optional per-checkpoint cr lookup: when --cr_schedule is set, each ckpt
     # is evaluated at the cr that produced its weights. Requires --all_checkpoints
@@ -895,6 +1073,10 @@ def main() -> None:
     model_args.compression_rate = args.compression_rate
     model_args.num_pool_latents = max(int(args.num_pool_latents), 1)
     model_args.projector_use_input_rmsnorm = not bool(args.legacy_projector)
+    model_args.vit_init = str(args.vit_init)
+    model_args.vit_freeze = bool(args.freeze_vit)
+    model_args.vit_skip = bool(args.no_vit)
+    model_args.mixer_depth_map = str(args.mixer_depth_map or "")
 
     training_args = TrainingArguments(output_dir="/tmp/eval_cvlm_dummy")
     training_args.bf16 = bool(use_bf16)
@@ -971,6 +1153,11 @@ def main() -> None:
         max_answer_len=args.max_answer_len,
         max_source_len=max_source_len,
         max_samples=args.max_samples,
+        doc_truncation=args.doc_truncation,
+        doc_budget_cr=args.doc_budget_cr,
+        doc_budget_cap=args.max_vision_len,
+        doc_truncation_seed=args.seed,
+        doc_selection_file=args.doc_selection_file,
     )
     loader = DataLoader(
         dataset,
@@ -1041,9 +1228,13 @@ def main() -> None:
             "max_answer_len": args.max_answer_len,
             "max_vision_len": args.max_vision_len,
             "max_source_len": args.max_source_len,
+            "doc_truncation": args.doc_truncation,
+            "doc_budget_cr": int(args.doc_budget_cr),
+            "doc_selection_file": args.doc_selection_file,
             "checkpoint_path": getattr(args, "checkpoint_path", "") or getattr(args, "sft_model_path", ""),
             "global_step": int(args.global_step),
             "all_checkpoints": bool(args.all_checkpoints),
+            "mixer_depth_map": str(args.mixer_depth_map or ""),
         }
         run = TrackioRun(
             project=args.trackio_project,
@@ -1093,25 +1284,42 @@ def main() -> None:
             eval_cr = int(args.compression_rate)
         assert comp_stats is not None
 
+        # Per-sample JSONL dump for bootstrap CIs. With --all_checkpoints each
+        # checkpoint gets its own file (same suffix scheme as --output_json).
+        dumper: Optional[PerSampleDumper] = None
+        if args.dump_per_sample:
+            if args.all_checkpoints:
+                dbase, dext = os.path.splitext(args.dump_per_sample)
+                dext = dext or ".jsonl"
+                if cr_schedule is not None:
+                    dump_path = f"{dbase}_native_step{ckpt_step}{dext}"
+                else:
+                    dump_path = f"{dbase}_step{ckpt_step}{dext}"
+            else:
+                dump_path = args.dump_per_sample
+            dumper = PerSampleDumper(dump_path)
+
         print(f"\n=== Teacher-forcing evaluation (mode={args.mode}, step={ckpt_step}) ===")
         if args.mode == "cvlm":
             assert model is not None
-            tf_metrics = eval_teacher_forcing_cvlm(model, loader, device, args.max_samples)
+            tf_metrics = eval_teacher_forcing_cvlm(model, loader, device, args.max_samples, dumper=dumper)
         elif args.mode == "cvlm_shuffle":
             assert model is not None
-            tf_metrics = eval_teacher_forcing_cvlm(model, loader, device, args.max_samples, shuffle_source=True)
+            tf_metrics = eval_teacher_forcing_cvlm(
+                model, loader, device, args.max_samples, shuffle_source=True, dumper=dumper
+            )
         elif args.mode == "baseline_llm":
             assert model is not None
-            tf_metrics = eval_teacher_forcing_baseline_llm(model, loader, device, args.max_samples)
+            tf_metrics = eval_teacher_forcing_baseline_llm(model, loader, device, args.max_samples, dumper=dumper)
         elif args.mode == "baseline_llm_full":
             assert model is not None
-            tf_metrics = eval_teacher_forcing_baseline_llm_full(model, loader, device, args.max_samples)
+            tf_metrics = eval_teacher_forcing_baseline_llm_full(model, loader, device, args.max_samples, dumper=dumper)
         elif args.mode == "baseline_proj":
             assert model is not None and proj is not None
-            tf_metrics = eval_teacher_forcing_baseline_proj(model, proj, loader, device, args.max_samples)
+            tf_metrics = eval_teacher_forcing_baseline_proj(model, proj, loader, device, args.max_samples, dumper=dumper)
         elif args.mode == "sft":
             assert sft_decoder is not None
-            tf_metrics = eval_teacher_forcing_sft(sft_decoder, loader, device, args.max_samples)
+            tf_metrics = eval_teacher_forcing_sft(sft_decoder, loader, device, args.max_samples, dumper=dumper)
         else:
             raise ValueError(f"Unknown mode: {args.mode}")
 
@@ -1170,12 +1378,30 @@ def main() -> None:
                 num_cached_samples=max(int(args.num_cached_samples), 0),
                 encoder_tokenizer=enc_tok_for_cache,
             )
-            gen_metrics = compute_generation_metrics(preds, refs)
+            per_sample_rl: list[float] = []
+            gen_metrics = compute_generation_metrics(
+                preds, refs, per_sample_rougeL=per_sample_rl if dumper is not None else None
+            )
+            if dumper is not None:
+                dumper.merge_generation(preds, refs, per_sample_rl)
             print(f"  ROUGE-1:       {gen_metrics['rouge1']:.4f}")
             print(f"  ROUGE-2:       {gen_metrics['rouge2']:.4f}")
             print(f"  ROUGE-L:       {gen_metrics['rougeL']:.4f}")
             print(f"  BLEU-4:        {gen_metrics['bleu4']:.2f}")
             print(f"  Exact Match:   {gen_metrics['exact_match']:.4f}")
+
+        if dumper is not None:
+            dumper.close()
+            print(f"  wrote per-sample dump: {dumper.path} ({len(dumper.records)} lines)")
+
+        # oracle_hit_rate: fraction of evaluated samples whose answer (or an
+        # 8-gram of it) was found verbatim in the document. Only meaningful for
+        # --doc_truncation oracle; null in the JSON otherwise.
+        oracle_hit_rate: Optional[float] = None
+        if args.doc_truncation == "oracle":
+            hits = dataset._oracle_hits
+            oracle_hit_rate = sum(1 for h in hits.values() if h) / max(len(hits), 1)
+            print(f"  oracle_hit_rate: {oracle_hit_rate:.4f} ({len(hits)} samples)")
 
         results = {
             **tf_metrics,
@@ -1184,6 +1410,10 @@ def main() -> None:
             "bits_per_source_token": bps,
             "effective_context_reduction": eff_reduction,
             "compression_rate": int(eval_cr),
+            "doc_truncation": args.doc_truncation,
+            "doc_budget_cr": int(args.doc_budget_cr),
+            "doc_selection_file": args.doc_selection_file,
+            "oracle_hit_rate": oracle_hit_rate,
         }
         last_results = results
 

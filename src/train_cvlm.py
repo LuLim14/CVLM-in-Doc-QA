@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import random
 import time
@@ -72,6 +73,63 @@ def _parse_cr_schedule(s: Optional[str]) -> Optional[List[Tuple[int, int]]]:
     return out
 
 
+def _parse_mixed_cr_set(s: Optional[str]) -> Optional[List[int]]:
+    """Parse a MIXED-CR set string like "1 2 4 8 16" (whitespace-separated).
+
+    Returns None for empty/None input (mixed-cr off). Raises ValueError on
+    non-integer tokens, cr < 1, or duplicate values.
+    """
+    if s is None:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    out: List[int] = []
+    for tok in s.split():
+        try:
+            cr = int(tok)
+        except ValueError:
+            raise ValueError(f"mixed_cr_set token {tok!r} is not an integer")
+        if cr < 1:
+            raise ValueError(f"mixed_cr_set cr={cr} must be >= 1")
+        if cr in out:
+            raise ValueError(f"mixed_cr_set has duplicate cr={cr}")
+        out.append(cr)
+    return out
+
+
+class MixedCrSampler:
+    """Balanced deterministic per-optimizer-step cr sequence for MIXED-CR training.
+
+    NOT naive per-step choice: the sequence is a concatenation of BLOCKS, each
+    block a fresh ``random.Random(seed)``-shuffled permutation of the FULL cr
+    set (sorted ascending before shuffling, so the sequence does not depend on
+    the formatting order of --mixed_cr_set). Guarantees:
+      (a) identical cr sequence across arms/runs for a given (seed, cr set);
+      (b) an EQUAL number of optimizer steps per cr in any prefix whose length
+          is a multiple of len(cr_set).
+    Blocks are generated lazily; on resume the sequence is reconstructed from
+    (seed, global_step) alone — nothing is stored in checkpoints.
+    """
+
+    def __init__(self, cr_set: List[int], seed: int) -> None:
+        if not cr_set:
+            raise ValueError("MixedCrSampler needs a non-empty cr set")
+        self._base = sorted(int(c) for c in cr_set)
+        self._rng = random.Random(int(seed))
+        self._seq: List[int] = []
+
+    def cr_for_step(self, step: int) -> int:
+        """cr for the 1-indexed optimizer step ``step`` (== global_step)."""
+        if step < 1:
+            raise ValueError(f"optimizer step must be >= 1, got {step}")
+        while len(self._seq) < step:
+            block = list(self._base)
+            self._rng.shuffle(block)
+            self._seq.extend(block)
+        return self._seq[step - 1]
+
+
 def _active_cr(schedule: List[Tuple[int, int]], step: int) -> int:
     """Return the cr for the bucket containing `step`.
 
@@ -130,6 +188,37 @@ def parse_args() -> argparse.Namespace:
         "0 (default) = encoder fully frozen, legacy behaviour.",
     )
     p.add_argument(
+        "--mixed_fidelity_p",
+        type=float,
+        default=float(os.environ.get("MIXED_FIDELITY_P", "0.0")),
+        help="MIXED-FIDELITY: per-chunk probability of feeding the decoder raw decoder-token "
+        "embeddings for that chunk instead of its 1 compressed vision token, interleaved in "
+        "document order. 0.0 (default) = off, legacy pure-compressed path. Fine-tuning feature: "
+        "combine with --restore_from. Incompatible with --cr_schedule (chunk->decoder-token "
+        "spans are precomputed in the dataset with the static --compression_rate).",
+    )
+    p.add_argument(
+        "--mixer_depth_map",
+        type=str,
+        default=os.environ.get("MIXER_DEPTH_MAP", ""),
+        help="RATE-DEPTH MIXER: 'cr:depth,...' map (e.g. '1:0,2:1,4:3,8:6,16:12'). Non-empty REPLACES "
+        "the ViT with a stack of zero-gated ViTLayer blocks whose active depth is looked up from the "
+        "current compression rate (exact key; else nearest lower key; else smallest key). Incompatible "
+        "with --no_vit / --freeze_vit / --vit_init random. Must also be passed to eval. "
+        "Empty (default) = legacy ViT branching. Env: MIXER_DEPTH_MAP.",
+    )
+    p.add_argument(
+        "--mixed_cr_set",
+        type=str,
+        default=os.environ.get("MIXED_CR_SET", ""),
+        help="MIXED-CR training: whitespace-separated cr set, e.g. '1 2 4 8 16'. Non-empty samples one "
+        "cr per optimizer step (all grad-accum micro-batches of a step share it) from a BALANCED "
+        "deterministic sequence: concatenated random.Random(seed+30000)-shuffled permutations of the "
+        "full set, indexed by global_step — equal per-cr update counts in any prefix divisible by the "
+        "set size, identical across arms for a given seed. Incompatible with --cr_schedule. "
+        "Empty (default) = off. Env: MIXED_CR_SET.",
+    )
+    p.add_argument(
         "--num_pool_latents",
         type=int,
         default=int(os.environ.get("NUM_POOL_LATENTS", "1")),
@@ -143,6 +232,25 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("LEGACY_PROJECTOR", "0") == "1",
         help="Use projectors without pre-MLP RMSNorm (checkpoint keys: up_proj/down_proj only). "
         "Set LEGACY_PROJECTOR=1 or pass --legacy_projector true for old safetensors.",
+    )
+    p.add_argument(
+        "--vit_init",
+        type=str,
+        choices=["pretrained", "random"],
+        default=os.environ.get("VIT_INIT", "pretrained"),
+        help="ViT weights: 'pretrained' (default) or 'random' (same architecture, config init) — prior ablation.",
+    )
+    p.add_argument(
+        "--freeze_vit",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("FREEZE_VIT", "0") == "1",
+        help="Freeze the ViT (no weight updates; gradient still flows through it).",
+    )
+    p.add_argument(
+        "--no_vit",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("NO_VIT", "0") == "1",
+        help="Bypass the ViT block entirely (no-ViT ablation). Must also be passed at eval.",
     )
     p.add_argument("--max_samples", type=int, default=0, help="Cap HF dataset to first N rows (0 = all).")
     p.add_argument(
@@ -314,11 +422,20 @@ def main() -> None:
         model_args.vision_encoder_name = args.vision_encoder_name
     if args.text_encoder_name:
         model_args.text_encoder_name = args.text_encoder_name
+    if not (0.0 <= args.mixed_fidelity_p <= 1.0):
+        raise ValueError(f"--mixed_fidelity_p must be in [0, 1], got {args.mixed_fidelity_p}")
     model_args.max_vision_len = args.max_vision_len
     model_args.compression_rate = args.compression_rate
+    model_args.mixed_fidelity_p = float(args.mixed_fidelity_p)
     model_args.unfreeze_encoder_top_k = int(args.unfreeze_encoder_top_k)
     model_args.num_pool_latents = max(int(args.num_pool_latents), 1)
     model_args.projector_use_input_rmsnorm = not bool(args.legacy_projector)
+    model_args.vit_init = str(args.vit_init)
+    model_args.vit_freeze = bool(args.freeze_vit)
+    model_args.vit_skip = bool(args.no_vit)
+    model_args.mixer_depth_map = str(args.mixer_depth_map or "")
+    # Bit-identical shared-module init across ablation branches (see ModelArguments).
+    model_args.shared_init_seed = int(args.seed) + 10000
 
     training_args = TrainingArguments(output_dir=args.output_dir)
     training_args.bf16 = bool(use_bf16)
@@ -326,10 +443,30 @@ def main() -> None:
     training_args.gradient_checkpointing = args.gradient_checkpointing
 
     model = CVLM(model_args, training_args)
+    if is_master:
+        # Audit: shared modules must hash identically across ablation branches.
+        def _sd_hash(mod):
+            h = hashlib.sha256()
+            for k, v in sorted(mod.state_dict().items()):
+                h.update(k.encode())
+                h.update(v.detach().cpu().to(torch.float32).numpy().tobytes())
+            return h.hexdigest()[:12]
+
+        print(
+            f"[init-hash] text_projector={_sd_hash(model.text_projector)} "
+            f"vision_projector={_sd_hash(model.vision_projector)} "
+            f"vision_pos_embed={_sd_hash(model.vision_pos_embed)} "
+            f"(shared_init_seed={model_args.shared_init_seed}; must match across branches)"
+        )
     model.to(device)
 
     # ---- compression-rate curriculum ------------------------------------
     cr_schedule = _parse_cr_schedule(args.cr_schedule)
+    if cr_schedule is not None and args.mixed_fidelity_p > 0.0:
+        raise ValueError(
+            "--mixed_fidelity_p > 0 is incompatible with --cr_schedule: chunk->decoder-token "
+            "spans are precomputed in the dataset with the static --compression_rate."
+        )
     if cr_schedule is not None:
         # Validate vision-len budget for the smallest cr in the schedule.
         min_cr = min(cr for cr, _ in cr_schedule)
@@ -353,6 +490,39 @@ def main() -> None:
         current_cr = first_cr
     else:
         current_cr = args.compression_rate
+    # ---- mixed-cr per-step sampling (balanced, deterministic) -----------
+    mixed_cr_set = _parse_mixed_cr_set(args.mixed_cr_set)
+    mixed_cr_sampler: Optional[MixedCrSampler] = None
+    if mixed_cr_set is not None:
+        if cr_schedule is not None:
+            raise ValueError(
+                "--mixed_cr_set is incompatible with --cr_schedule: use per-step cr sampling OR a "
+                "stage curriculum, not both (set CR_SCHEDULE='' for mixed-cr runs)."
+            )
+        if args.mixed_fidelity_p > 0.0:
+            raise ValueError(
+                "--mixed_cr_set is incompatible with --mixed_fidelity_p > 0: chunk->decoder-token "
+                "spans are precomputed in the dataset with the static --compression_rate."
+            )
+        # Same vision-len budget validation as cr_schedule: the smallest cr in
+        # the set must fit the source into max_vision_len chunks.
+        min_cr = min(mixed_cr_set)
+        effective_src = args.max_source_len if args.max_source_len > 0 else args.compression_rate * args.max_vision_len
+        required_vl = (effective_src + min_cr - 1) // min_cr
+        if args.max_vision_len < required_vl:
+            raise ValueError(
+                f"max_vision_len={args.max_vision_len} too small for mixed_cr_set "
+                f"min_cr={min_cr} with effective_source_len={effective_src} "
+                f"(needs >= {required_vl}). Raise the min cr in the set, "
+                f"raise --max_vision_len, or lower --max_source_len."
+            )
+        mixed_cr_sampler = MixedCrSampler(mixed_cr_set, int(args.seed) + 30000)
+        if is_master:
+            print(
+                f"[mixed-cr] BALANCED per-step cr sampling from {sorted(mixed_cr_set)} "
+                f"(shuffled-block sequence, rng seed = seed+30000 = {int(args.seed) + 30000}; "
+                f"equal per-cr update counts in any prefix divisible by {len(mixed_cr_set)})"
+            )
     # ---------------------------------------------------------------------
 
     dec_pad = model.tokenizer.pad_token_id
@@ -371,12 +541,19 @@ def main() -> None:
         max_answer_len=args.max_answer_len,
         max_source_len=max_source_len,
         max_samples=args.max_samples,
+        mixed_fidelity_p=float(args.mixed_fidelity_p),
+        mixed_chunk_cr=args.compression_rate,
+        mixed_max_chunks=args.max_vision_len,
     )
 
     sampler: Optional[DistributedSampler] = None
     if use_ddp:
         sampler = DistributedSampler(dataset, shuffle=True, drop_last=False)
 
+    # Dedicated generator: batch order must not depend on how much global RNG
+    # the model construction consumed (it differs across ablation branches).
+    loader_gen = torch.Generator()
+    loader_gen.manual_seed(int(args.seed) + 20000)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -385,6 +562,7 @@ def main() -> None:
         num_workers=0,
         collate_fn=collate,
         drop_last=False,
+        generator=loader_gen if sampler is None else None,
     )
 
     if use_ddp:
@@ -439,6 +617,15 @@ def main() -> None:
         if is_master:
             print(f"Resumed from {resume_from_dir} next_start_epoch={start_epoch} global_step={global_step}")
 
+    if mixed_cr_sampler is not None:
+        # cr for the upcoming optimizer step, set BEFORE its first micro-batch.
+        # On resume this reconstructs the same sequence position an
+        # uninterrupted run would be at (pure function of seed + global_step).
+        current_cr = mixed_cr_sampler.cr_for_step(global_step)
+        unwrap_model(model).set_compression_rate(current_cr)
+        if is_master:
+            print(f"[mixed-cr] step {global_step}: cr={current_cr}")
+
     if is_master:
         print(optimizer)
         print("init_lrs:", init_lrs)
@@ -468,9 +655,15 @@ def main() -> None:
             "vision_encoder_name": getattr(model_args, "vision_encoder_name", ""),
             "compression_rate": args.compression_rate,
             "max_vision_len": args.max_vision_len,
+            "mixed_fidelity_p": float(args.mixed_fidelity_p),
             "unfreeze_encoder_top_k": int(args.unfreeze_encoder_top_k),
             "num_pool_latents": int(model_args.num_pool_latents),
             "projector_use_input_rmsnorm": bool(model_args.projector_use_input_rmsnorm),
+            "vit_init": model_args.vit_init,
+            "vit_freeze": bool(model_args.vit_freeze),
+            "vit_skip": bool(model_args.vit_skip),
+            "mixer_depth_map": model_args.mixer_depth_map,
+            "mixed_cr_set": str(args.mixed_cr_set or ""),
             "max_source_len": args.max_source_len,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
@@ -497,6 +690,9 @@ def main() -> None:
         unwrap_model(model).text_encoder.eval()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
     pgs = -1
+    # Cross-arm batch-comparability audit: log the sha256 of the first batch's
+    # source ids once per process start (i.e. at step 1 and after each resume).
+    batch_hash_logged = False
 
     if start_epoch > args.epochs:
         if is_master:
@@ -511,6 +707,9 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         running_avg_batch_time = AverageMeter("time", ":6.3f")
         running_avg_loss_value = AverageMeter("loss", ":6.3f")
+        # MIXED-FIDELITY telemetry (stays at 0 when mixed_fidelity_p == 0).
+        running_avg_raw_frac = AverageMeter("raw_frac", ":6.3f")
+        running_avg_input_len = AverageMeter("input_len", ":8.1f")
         grad_norm = 0.0
         t0 = time.perf_counter()
         curr_lrs: List[float] = []
@@ -518,6 +717,13 @@ def main() -> None:
         for local_step, batch_data in enumerate(loader, start=1):
             data_time = time.perf_counter() - t0
             batch_cpu = batch_data
+            if is_master and not batch_hash_logged:
+                # Same seed => this line must print an identical hash across
+                # ablation arms (loader order is decoupled from model init RNG).
+                n_h = min(8, batch_cpu["source_ids"].size(0))
+                hb = batch_cpu["source_ids"][:n_h].detach().to(torch.long).contiguous()
+                print(f"[batch-hash] step={global_step} hash={hashlib.sha256(hb.numpy().tobytes()).hexdigest()}")
+                batch_hash_logged = True
             batch_data = move_batch(batch_cpu, device, dtype)
 
             # LR schedule: warmup (if any) uses linear on global_step, else read
@@ -541,8 +747,16 @@ def main() -> None:
                 answer_labels=batch_data["answer_labels"],
                 prompt_mask=batch_data["prompt_mask"],
                 answer_mask=batch_data["answer_mask"],
+                # MIXED-FIDELITY extras (None when mixed_fidelity_p == 0).
+                doc_dec_ids=batch_data.get("doc_dec_ids"),
+                chunk_dec_spans=batch_data.get("chunk_dec_spans"),
+                chunk_counts=batch_data.get("chunk_counts"),
             )
             loss = out["loss"]
+            mixed_stats = out.get("mixed_stats")
+            if mixed_stats is not None:
+                running_avg_raw_frac.update(mixed_stats["raw_frac"])
+                running_avg_input_len.update(mixed_stats["input_len"])
             loss = loss / grad_accum_steps
 
             sync_step = local_step % grad_accum_steps == 0 or local_step == len(loader)
@@ -578,6 +792,14 @@ def main() -> None:
                                 is_master=True,
                             )
                         current_cr = cr_now
+                elif mixed_cr_sampler is not None:
+                    # cr for the NEW global_step, set here — i.e. BEFORE the
+                    # first micro-batch of that optimizer step; all grad-accum
+                    # micro-batches of a step therefore share one cr.
+                    cr_next = mixed_cr_sampler.cr_for_step(global_step)
+                    if cr_next != current_cr:
+                        unwrap_model(model).set_compression_rate(cr_next)
+                    current_cr = cr_next
                 if trackio_run is not None and is_master:
                     trackio_run.log({"train/compression_rate": float(current_cr)}, step=global_step)
 
@@ -591,12 +813,27 @@ def main() -> None:
                 rp = global_step / max(total_steps, 1) * 100
                 curr_lrs_str = " ' ".join(f"{lr:.10f}" for lr in curr_lrs)
                 gn = f"grad norm: {grad_norm:>6.3f} " if grad_norm > 0 else ""
+                mx = (
+                    f"raw_frac: {running_avg_raw_frac.avg:>5.3f} input_len: {running_avg_input_len.avg:>7.1f} "
+                    if args.mixed_fidelity_p > 0
+                    else ""
+                )
+                crs = f"cr: {current_cr} " if mixed_cr_sampler is not None else ""
                 print(
                     f"epoch: {local_epoch} step: {global_step} ({total_steps}) | {rp:5.2f}% ",
                     f"lr: {curr_lrs_str} loss: {curr_loss:>6.3f} ({running_avg_loss_value.avg:>6.3f}) ",
+                    crs,
                     gn,
+                    mx,
                     f"data: {data_time:>7.5f}s batch: {batch_time:>6.3f}s",
                 )
+                # RATE-DEPTH MIXER ablation telemetry: gate values show how much
+                # of each ViTLayer the model actually uses.
+                mixer_gates_now = None
+                _core = unwrap_model(model)
+                if getattr(_core, "mixer_gates", None) is not None:
+                    mixer_gates_now = [round(float(g), 4) for g in _core.mixer_gates.detach().float().cpu().tolist()]
+                    print(f"    mixer_gates={mixer_gates_now}")
                 if trackio_run is not None:
                     metrics = {
                         "train/loss": curr_loss,
@@ -606,6 +843,12 @@ def main() -> None:
                     }
                     if grad_norm > 0:
                         metrics["train/grad_norm"] = grad_norm
+                    if args.mixed_fidelity_p > 0 and running_avg_raw_frac.count > 0:
+                        metrics["train/mixed_raw_frac"] = running_avg_raw_frac.avg
+                        metrics["train/mixed_input_len"] = running_avg_input_len.avg
+                    if mixer_gates_now is not None:
+                        for gi, gv in enumerate(mixer_gates_now):
+                            metrics[f"train/mixer_gate_{gi:02d}"] = gv
                     trackio_run.log(metrics, step=global_step)
                 if csv_writer is not None:
                     csv_writer.append(

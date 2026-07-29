@@ -70,10 +70,31 @@ export LEGACY_PROJECTOR
 CR_SCHEDULE="${CR_SCHEDULE:-1:6000,2:12000,4:18000,8:24000,16:0}"   # empty = static cr from COMPRESSION_RATE
 DISABLE_LR_SCHEDULE="${DISABLE_LR_SCHEDULE:-1}"   # 1 = constant LR after warmup (no cosine decay)
 
+# ViT ablation branch (prior study): VIT_INIT=pretrained|random, FREEZE_VIT=0|1, NO_VIT=0|1.
+VIT_INIT="${VIT_INIT:-pretrained}"
+FREEZE_VIT="${FREEZE_VIT:-0}"
+NO_VIT="${NO_VIT:-0}"
+
+# RATE-DEPTH MIXER: non-empty "cr:depth,..." map replaces the ViT with a stack
+# of zero-gated ViTLayer blocks (depth per compression rate). Passed to BOTH
+# train and eval. Incompatible with NO_VIT/FREEZE_VIT/VIT_INIT=random.
+MIXER_DEPTH_MAP="${MIXER_DEPTH_MAP:-}"
+# MIXED-CR training: non-empty whitespace-separated cr set (e.g. "1 2 4 8 16")
+# samples one cr per optimizer step from a balanced deterministic sequence.
+# Replaces the CR_SCHEDULE curriculum (an empty --cr_schedule is forced below).
+MIXED_CR_SET="${MIXED_CR_SET:-}"
+
+# Optional short tag baked into the default run-dir name (e.g. abl_randomvit).
+RUN_TAG="${RUN_TAG:-cvlm}"
+# Root for run dirs; override RUNS_ROOT or the full OUTPUT_DIR.
+RUNS_ROOT="${RUNS_ROOT:-${ROOT}/runs}"
 # Output dir — default name embeds main hyperparameters for easy A/B comparison.
 # Override by exporting OUTPUT_DIR=/abs/path before running the script.
-# OUTPUT_DIR="${OUTPUT_DIR:-/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_$(date +%Y%m%d_%H%M%S)_layer_norm_cr${COMPRESSION_RATE}_vl${MAX_VISION_LEN}_sl${MAX_SOURCE_LEN}_bs${BATCH_SIZE}_lr${LR}_ep${EPOCHS}_gc${GRADIENT_CHECKPOINTING}_unfrzed${UNFREEZE_ENCODER_TOP_K}_lt${NUM_POOL_LATENTS}}"
-OUTPUT_DIR=/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_20260515_231650_vit_large_cr1_vl1024_sl0_bs64_lr1e-4_ep10_gc1_unfrzed22_lt4
+OUTPUT_DIR="${OUTPUT_DIR:-${RUNS_ROOT}/run_$(date +%Y%m%d_%H%M%S)_${RUN_TAG}_cr${COMPRESSION_RATE}_vl${MAX_VISION_LEN}_sl${MAX_SOURCE_LEN}_bs${BATCH_SIZE}_lr${LR}_ep${EPOCHS}_gc${GRADIENT_CHECKPOINTING}_unfrzed${UNFREEZE_ENCODER_TOP_K}_lt${NUM_POOL_LATENTS}}"
+
+# Resume: export RESUME_DIR=/abs/path/to/run to continue from its latest
+# checkpoint pair (needed to survive partition walltime limits).
+RESUME_DIR="${RESUME_DIR:-}"
 
 # Eval
 EVAL_SPLIT="${EVAL_SPLIT:-test}"          # use 'test' once you have one
@@ -87,6 +108,11 @@ EVAL_COMPUTE_GEN="${EVAL_COMPUTE_GEN:-1}"  # 1 = run ROUGE / BLEU generation met
 NUM_CACHED_SAMPLES="${NUM_CACHED_SAMPLES:-16}"   # N decoded {doc,q,ref,pred} tuples dumped per ckpt next to eval JSON; 0 disables
 EVAL_ALL_CHECKPOINTS="${EVAL_ALL_CHECKPOINTS:-1}"  # 1 = sweep every model_step_*.safetensors
 EVAL_CR_SCHEDULE="${EVAL_CR_SCHEDULE:-1:6000,2:12000,4:18000,8:24000,16:0}"           # if set + EVAL_ALL_CHECKPOINTS=1, eval each ckpt at the cr that trained it
+if [[ -n "${MIXED_CR_SET}" ]]; then
+  # Mixed-cr training has no per-step "which cr trained this checkpoint"
+  # mapping, so the native-cr eval sweep would be wrong — force it off.
+  EVAL_CR_SCHEDULE=""
+fi
 
 # trackio (replaces TensorBoard for the live UI)
 TRACKIO_PROJECT="${TRACKIO_PROJECT:-cvlm}"
@@ -125,6 +151,12 @@ echo "  ENABLE_WARMUP     = ${ENABLE_WARMUP} (steps=${WARMUP_STEPS})"
 echo "  GRADIENT_CHECKPOINTING = ${GRADIENT_CHECKPOINTING}"
 echo "  UNFREEZE_ENCODER_TOP_K = ${UNFREEZE_ENCODER_TOP_K}"
 echo "  NUM_POOL_LATENTS  = ${NUM_POOL_LATENTS}"
+echo "  VIT_INIT          = ${VIT_INIT}"
+echo "  FREEZE_VIT        = ${FREEZE_VIT}"
+echo "  NO_VIT            = ${NO_VIT}"
+echo "  MIXER_DEPTH_MAP   = ${MIXER_DEPTH_MAP:-<off>}"
+echo "  MIXED_CR_SET      = ${MIXED_CR_SET:-<off>}"
+echo "  RESUME_DIR        = ${RESUME_DIR:-<none>}"
 echo "  LEGACY_PROJECTOR  = ${LEGACY_PROJECTOR}"
 echo "  CR_SCHEDULE       = ${CR_SCHEDULE:-<static>}"
 echo "  DISABLE_LR_SCHEDULE = ${DISABLE_LR_SCHEDULE}"
@@ -173,14 +205,32 @@ run_train() {
     --gradient_checkpointing "${GRADIENT_CHECKPOINTING}"
     --unfreeze_encoder_top_k "${UNFREEZE_ENCODER_TOP_K}"
     --num_pool_latents "${NUM_POOL_LATENTS}"
-    --cr_schedule "${CR_SCHEDULE}"
     --disable_lr_schedule "${DISABLE_LR_SCHEDULE}"
+    --vit_init "${VIT_INIT}"
+    --freeze_vit "${FREEZE_VIT}"
+    --no_vit "${NO_VIT}"
+    --seed "${SEED:-42}"
   )
+  if [[ -n "${MIXED_CR_SET}" ]]; then
+    # Mixed-cr replaces the stage curriculum. --cr_schedule "" is passed
+    # EXPLICITLY (not just omitted) so an exported CR_SCHEDULE env var cannot
+    # leak back in through the argparse env-default and trip the
+    # mixed_cr_set/cr_schedule incompatibility check.
+    TRAIN_ARGS+=( --mixed_cr_set "${MIXED_CR_SET}" --cr_schedule "" )
+  else
+    TRAIN_ARGS+=( --cr_schedule "${CR_SCHEDULE}" )
+  fi
+  if [[ -n "${MIXER_DEPTH_MAP}" ]]; then
+    TRAIN_ARGS+=( --mixer_depth_map "${MIXER_DEPTH_MAP}" )
+  fi
   if [[ "${LEGACY_PROJECTOR}" == "1" ]]; then
     TRAIN_ARGS+=( --legacy_projector true )
   fi
   if [[ "${ENABLE_WARMUP}" == "1" ]]; then
     TRAIN_ARGS+=( --enable_warmup --warmup_steps "${WARMUP_STEPS}" )
+  fi
+  if [[ -n "${RESUME_DIR}" ]]; then
+    TRAIN_ARGS+=( --resume_dir "${RESUME_DIR}" )
   fi
   if [[ "${NPROC}" -gt 1 ]]; then
     torchrun --nproc_per_node="${NPROC}" "${TRAIN_ARGS[@]}"
@@ -192,10 +242,10 @@ run_train() {
 SKIP_TRAIN="${SKIP_TRAIN:-0}"
 if [[ "${SKIP_TRAIN}" == "1" ]]; then
   echo; echo "===== Step 1/2: SKIPPED (eval-only) ====="
-elif compgen -G "${OUTPUT_DIR}/model_step_"*.safetensors >/dev/null 2>&1; then
+elif [[ -z "${RESUME_DIR}" ]] && compgen -G "${OUTPUT_DIR}/model_step_"*.safetensors >/dev/null 2>&1; then
   echo "ERROR: checkpoints already exist in OUTPUT_DIR=${OUTPUT_DIR}" >&2
   echo "  Refusing to train into an existing run. Use EVAL_ONLY=1 or SKIP_TRAIN=1 for eval," >&2
-  echo "  or set OUTPUT_DIR to a new directory to train from scratch." >&2
+  echo "  set RESUME_DIR=${OUTPUT_DIR} to continue it, or point OUTPUT_DIR at a new directory." >&2
   exit 1
 else
   run_train
@@ -239,7 +289,17 @@ for MODE in ${EVAL_MODES}; do
     --global_step "${STEP}"
     --output_json "${OUTPUT_DIR}/eval_${MODE}.json"
     --num_cached_samples "${NUM_CACHED_SAMPLES}"
+    --vit_init "${VIT_INIT}"
+    --freeze_vit "${FREEZE_VIT}"
+    --no_vit "${NO_VIT}"
+    --seed "${SEED:-42}"
   )
+  if [[ -n "${MIXER_DEPTH_MAP}" ]]; then
+    EVAL_CMD+=( --mixer_depth_map "${MIXER_DEPTH_MAP}" )
+  fi
+  if [[ "${EVAL_DUMP:-0}" == "1" ]]; then
+    EVAL_CMD+=( --dump_per_sample "${OUTPUT_DIR}/eval_${MODE}_dump.jsonl" )
+  fi
   if [[ "${LEGACY_PROJECTOR}" == "1" ]]; then
     EVAL_CMD+=( --legacy_projector true )
   fi

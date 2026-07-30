@@ -141,6 +141,16 @@ class ModelArguments:
             "zero-gated mixer stack (which has no final layernorm)."
         },
     )
+    compact_decoder_positions: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, construct decoder position_ids from the cumulative "
+            "attention mask so left-padding and masked latent slots do not shift "
+            "subsequent answer positions. False preserves legacy teacher-forcing "
+            "behaviour. GenerationMixin already uses compact positions by default, "
+            "so enabling this flag also removes a train/generation mismatch."
+        },
+    )
     shared_init_seed: int = field(
         default=0,
         metadata={
@@ -407,6 +417,24 @@ def _vit_encoder_forward_with_padding_mask(
         else:
             hidden_states = _vit_layer_forward_with_padding_mask(layer, hidden_states, valid_mask)
     return hidden_states
+
+
+def _compact_position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Position indices that ignore masked holes in a decoder sequence.
+
+    This matches Hugging Face ``GenerationMixin.prepare_inputs_for_generation``:
+    real tokens receive ``cumsum(mask)-1`` and masked slots receive an arbitrary
+    harmless value. CVLM has masked latent slots *inside* the sequence, between
+    prompt/document and answer. Letting the decoder infer ``0..L-1`` positions
+    makes a sample's answer coordinates depend on its batchmates and disagrees
+    with generation, which already compacts positions from the attention mask.
+    """
+    if attention_mask.ndim != 2:
+        raise ValueError(
+            f"attention_mask must have shape [B, L], got {tuple(attention_mask.shape)}"
+        )
+    positions = attention_mask.to(dtype=torch.long).cumsum(dim=-1) - 1
+    return positions.masked_fill(attention_mask == 0, 1)
 
 
 class RMSNorm(nn.Module):
@@ -720,6 +748,9 @@ class CVLM(torch.nn.Module):
         self.mask_vit_padding = bool(getattr(model_args, "mask_vit_padding", False))
         self.vit_apply_final_layernorm = bool(
             getattr(model_args, "vit_apply_final_layernorm", True)
+        )
+        self.compact_decoder_positions = bool(
+            getattr(model_args, "compact_decoder_positions", False)
         )
         # Diagnostic-only knob used by tools/measure_padding_contamination.py.
         # It appends masked latent slots AFTER pooling so the real content is
@@ -1188,11 +1219,17 @@ class CVLM(torch.nn.Module):
             # Train: pass labels so Liger's fused-linear-CE fuses lm_head x
             # labels into one Triton kernel and never materialises the
             # [B, L, vocab] logits tensor. decoder_outputs.logits is None.
+            decoder_position_kwargs = {}
+            if bool(getattr(self, "compact_decoder_positions", False)):
+                decoder_position_kwargs["position_ids"] = _compact_position_ids(
+                    attention_mask
+                )
             decoder_outputs = self.decoder(
                 inputs_embeds=decoder_input,
                 attention_mask=attention_mask,
                 labels=labels,
                 use_cache=False,
+                **decoder_position_kwargs,
             )
             loss = decoder_outputs.loss
             logits = decoder_outputs.logits  # None under fused-linear-CE
@@ -1206,10 +1243,16 @@ class CVLM(torch.nn.Module):
             # Eval: callers (eval_cvlm.py) need logits for per-token loss and
             # argmax accuracy. Skip fused-CE here; eval runs in no_grad so
             # there is no activation pressure to save.
+            decoder_position_kwargs = {}
+            if bool(getattr(self, "compact_decoder_positions", False)):
+                decoder_position_kwargs["position_ids"] = _compact_position_ids(
+                    attention_mask
+                )
             decoder_outputs = self.decoder(
                 inputs_embeds=decoder_input,
                 attention_mask=attention_mask,
                 use_cache=False,
+                **decoder_position_kwargs,
             )
             logits = decoder_outputs.logits
             effective_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))

@@ -309,6 +309,15 @@ def parse_args() -> argparse.Namespace:
         "Env: VIT_APPLY_FINAL_LAYERNORM.",
     )
     p.add_argument(
+        "--compact_decoder_positions",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("COMPACT_DECODER_POSITIONS", "0") == "1",
+        help="Build decoder position_ids from attention_mask.cumsum so masked "
+        "latent slots do not shift answer positions. False reproduces legacy "
+        "teacher forcing; generation already compacts positions. Must match eval. "
+        "Env: COMPACT_DECODER_POSITIONS.",
+    )
+    p.add_argument(
         "--gate_lr_mult",
         type=float,
         default=float(os.environ.get("GATE_LR_MULT", "1.0")),
@@ -633,6 +642,7 @@ def _initialization_manifest(model: CVLM, args: argparse.Namespace) -> dict:
             "mixer_depth_map": str(args.mixer_depth_map or ""),
             "mask_vit_padding": bool(args.mask_vit_padding),
             "vit_apply_final_layernorm": bool(args.vit_apply_final_layernorm),
+            "compact_decoder_positions": bool(args.compact_decoder_positions),
             "num_pool_latents": int(args.num_pool_latents),
         },
         "models": {
@@ -775,6 +785,7 @@ def main() -> None:
     model_args.mixer_depth_map = str(args.mixer_depth_map or "")
     model_args.mask_vit_padding = bool(args.mask_vit_padding)
     model_args.vit_apply_final_layernorm = bool(args.vit_apply_final_layernorm)
+    model_args.compact_decoder_positions = bool(args.compact_decoder_positions)
     # Bit-identical shared-module init across ablation branches (see ModelArguments).
     model_args.shared_init_seed = int(args.seed) + 10000
 
@@ -1040,6 +1051,7 @@ def main() -> None:
             "mixer_depth_map": model_args.mixer_depth_map,
             "mask_vit_padding": bool(model_args.mask_vit_padding),
             "vit_apply_final_layernorm": bool(model_args.vit_apply_final_layernorm),
+            "compact_decoder_positions": bool(model_args.compact_decoder_positions),
             "gate_lr_mult": float(args.gate_lr_mult),
             "mixed_cr_set": str(args.mixed_cr_set or ""),
             "max_source_len": args.max_source_len,
@@ -1369,6 +1381,9 @@ def main() -> None:
                             "mask_vit_padding": bool(model_args.mask_vit_padding),
                             "vit_apply_final_layernorm": bool(
                                 model_args.vit_apply_final_layernorm
+                            ),
+                            "compact_decoder_positions": bool(
+                                model_args.compact_decoder_positions
                             ),
                             "mixer_gates": mixer_gates_full,
                             "mixer_gate_grads": gate_grads_for_log,

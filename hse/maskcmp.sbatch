@@ -30,6 +30,7 @@ export VIT_INIT=random FREEZE_VIT=0 NO_VIT=0 MASK_VIT_PADDING=0 MIXER_DEPTH_MAP=
 # ViTModel final LayerNorm, so keeping it here would be a second architectural
 # difference besides the 12 post-bottleneck blocks.
 export VIT_APPLY_FINAL_LAYERNORM=0
+export COMPACT_DECODER_POSITIONS=0
 case "$ARM" in
   novit)    export NO_VIT=1 ;;
   unmasked) export MASK_VIT_PADDING=0 ;;
@@ -62,6 +63,7 @@ export EVAL_MAX_SAMPLES="${MASKCMP_SANITY_SAMPLES:-64}"
   echo "NO_VIT=${NO_VIT}"
   echo "VIT_INIT=${VIT_INIT}"
   echo "VIT_APPLY_FINAL_LAYERNORM=${VIT_APPLY_FINAL_LAYERNORM}"
+  echo "COMPACT_DECODER_POSITIONS=${COMPACT_DECODER_POSITIONS}"
   echo "MASKCMP_EVAL_MAX_SAMPLES=${MASKCMP_EVAL_MAX_SAMPLES}"
   echo "MASKCMP_GEN_CRS=${MASKCMP_GEN_CRS}"
   echo "SEED=${SEED}"
@@ -97,6 +99,7 @@ for CR in 1 2 4 8 16 32; do
     --vit_init "${VIT_INIT}" --freeze_vit "${FREEZE_VIT}" --no_vit "${NO_VIT}"
     --mask_vit_padding "${MASK_VIT_PADDING}"
     --vit_apply_final_layernorm "${VIT_APPLY_FINAL_LAYERNORM}"
+    --compact_decoder_positions "${COMPACT_DECODER_POSITIONS}"
     --output_json "${OUTPUT_DIR}/eval_maskcmp_cr${CR}.json"
     --dump_per_sample "${OUTPUT_DIR}/eval_maskcmp_cr${CR}_dump.jsonl"
   )

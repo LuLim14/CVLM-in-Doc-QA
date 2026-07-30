@@ -49,6 +49,7 @@ fi
 ARM="${ARM:?set ARM=novit|fixed12direct|fixed12unmasked|fixed12anchor|ratedepth}"
 export MIXER_DEPTH_MAP="" VIT_INIT=pretrained FREEZE_VIT=0 NO_VIT=0
 export MASK_VIT_PADDING=1 VIT_APPLY_FINAL_LAYERNORM=1
+export COMPACT_DECODER_POSITIONS=0
 case "${ARM}" in
   novit)         export NO_VIT=1 ;;
   fixed12direct) export VIT_INIT=random VIT_APPLY_FINAL_LAYERNORM=0 ;;
@@ -87,6 +88,7 @@ sha256sum \
   echo "MIXED_CR_SET=${MIXED_CR_SET}"
   echo "MASK_VIT_PADDING=${MASK_VIT_PADDING}"
   echo "VIT_APPLY_FINAL_LAYERNORM=${VIT_APPLY_FINAL_LAYERNORM}"
+  echo "COMPACT_DECODER_POSITIONS=${COMPACT_DECODER_POSITIONS}"
   echo "GATE_LR_MULT=${GATE_LR_MULT:-1.0}"
   echo "MECHANISTIC_PROBE_SAMPLES=${MECHANISTIC_PROBE_SAMPLES:-16}"
   echo "SAVE_MECHANISTIC_INIT=${SAVE_MECHANISTIC_INIT:-1}"
@@ -112,6 +114,7 @@ for CR in 1 2 4 8 16 32; do
     --vit_init "${VIT_INIT}" --freeze_vit "${FREEZE_VIT}" --no_vit "${NO_VIT}" \
     --mask_vit_padding "${MASK_VIT_PADDING}" \
     --vit_apply_final_layernorm "${VIT_APPLY_FINAL_LAYERNORM}" \
+    --compact_decoder_positions "${COMPACT_DECODER_POSITIONS}" \
     --output_json "${OUTPUT_DIR}/eval_rd_cr${CR}.json" \
     --dump_per_sample "${OUTPUT_DIR}/eval_rd_cr${CR}_dump.jsonl" \
   )

@@ -151,6 +151,7 @@ def test_initialization_artifacts_are_exact_and_resume_checked(tmp_path):
         mixer_depth_map="1:1",
         mask_vit_padding=True,
         vit_apply_final_layernorm=True,
+        compact_decoder_positions=False,
         num_pool_latents=2,
         model_name_or_path="decoder",
         text_encoder_name="encoder",
@@ -234,4 +235,80 @@ def test_partial_checkpoint_validation_rejects_architecture_mismatch():
         unexpected=[],
         checkpoint_path="legacy.safetensors",
         allowed_missing_trainable={"0.weight"},
+    )
+
+
+def test_compact_position_ids_ignore_internal_masked_slots():
+    from modeling import _compact_position_ids
+
+    mask = torch.tensor(
+        [
+            [0, 0, 1, 1, 0, 0, 1, 1],
+            [1, 1, 1, 0, 1, 0, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    positions = _compact_position_ids(mask)
+    assert positions.tolist() == [
+        [1, 1, 0, 1, 1, 1, 2, 3],
+        [0, 1, 2, 1, 3, 1, 1, 1],
+    ]
+
+
+def test_compact_positions_make_llama_invariant_to_masked_holes():
+    from transformers import LlamaConfig, LlamaModel
+
+    from modeling import _compact_position_ids
+
+    config = LlamaConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=64,
+        attention_dropout=0.0,
+    )
+    torch.manual_seed(1234)
+    model = LlamaModel(config).eval()
+    prefix = torch.randn(1, 4, 32)
+    answer = torch.randn(1, 2, 32)
+    holes = torch.randn(1, 3, 32)
+    base = torch.cat([prefix, answer], dim=1)
+    padded = torch.cat([prefix, holes, answer], dim=1)
+    base_mask = torch.ones(1, 6, dtype=torch.long)
+    padded_mask = torch.tensor([[1, 1, 1, 1, 0, 0, 0, 1, 1]])
+
+    with torch.no_grad():
+        compact_base = model(
+            inputs_embeds=base,
+            attention_mask=base_mask,
+            position_ids=_compact_position_ids(base_mask),
+        ).last_hidden_state
+        compact_padded = model(
+            inputs_embeds=padded,
+            attention_mask=padded_mask,
+            position_ids=_compact_position_ids(padded_mask),
+        ).last_hidden_state
+        legacy_base = model(
+            inputs_embeds=base,
+            attention_mask=base_mask,
+        ).last_hidden_state
+        legacy_padded = model(
+            inputs_embeds=padded,
+            attention_mask=padded_mask,
+        ).last_hidden_state
+
+    assert torch.allclose(
+        compact_base[:, -2:],
+        compact_padded[:, -2:],
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    assert not torch.allclose(
+        legacy_base[:, -2:],
+        legacy_padded[:, -2:],
+        atol=1e-5,
+        rtol=1e-5,
     )

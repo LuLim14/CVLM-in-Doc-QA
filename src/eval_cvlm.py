@@ -191,6 +191,14 @@ def parse_args() -> argparse.Namespace:
         "Env: VIT_APPLY_FINAL_LAYERNORM.",
     )
     p.add_argument(
+        "--compact_decoder_positions",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("COMPACT_DECODER_POSITIONS", "0") == "1",
+        help="Must match training. Derive decoder position_ids from the cumulative "
+        "attention mask so internal masked latent slots do not shift the answer. "
+        "Env: COMPACT_DECODER_POSITIONS.",
+    )
+    p.add_argument(
         "--force_zero_gates",
         action="store_true",
         default=os.environ.get("FORCE_ZERO_GATES", "0") == "1",
@@ -1143,6 +1151,7 @@ def main() -> None:
     model_args.mixer_depth_map = str(args.mixer_depth_map or "")
     model_args.mask_vit_padding = bool(args.mask_vit_padding)
     model_args.vit_apply_final_layernorm = bool(args.vit_apply_final_layernorm)
+    model_args.compact_decoder_positions = bool(args.compact_decoder_positions)
 
     training_args = TrainingArguments(output_dir="/tmp/eval_cvlm_dummy")
     training_args.bf16 = bool(use_bf16)
@@ -1310,6 +1319,7 @@ def main() -> None:
             "mixer_depth_map": str(args.mixer_depth_map or ""),
             "mask_vit_padding": bool(args.mask_vit_padding),
             "vit_apply_final_layernorm": bool(args.vit_apply_final_layernorm),
+            "compact_decoder_positions": bool(args.compact_decoder_positions),
             "force_zero_gates": bool(args.force_zero_gates),
         }
         run = TrackioRun(
@@ -1506,6 +1516,7 @@ def main() -> None:
             "mixer_depth_map": str(args.mixer_depth_map or ""),
             "mask_vit_padding": bool(args.mask_vit_padding),
             "vit_apply_final_layernorm": bool(args.vit_apply_final_layernorm),
+            "compact_decoder_positions": bool(args.compact_decoder_positions),
             "force_zero_gates": bool(args.force_zero_gates),
         }
         last_results = results

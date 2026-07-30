@@ -128,6 +128,7 @@ for BRANCH in novit randomvit vit; do
         --no_vit "${NO_VIT}" \
         --mask_vit_padding "${MASK_MODE}" \
         --vit_apply_final_layernorm true \
+        --compact_decoder_positions false \
         --attention_batches "${PAD_DIAG_ATTENTION_BATCHES:-2}" \
         --attention_query_chunk "${PAD_DIAG_ATTENTION_QUERY_CHUNK:-128}" \
         --pad_fractions "${PAD_DIAG_PAD_FRACTIONS:-0,0.25,0.5,0.75}" \

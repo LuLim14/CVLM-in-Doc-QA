@@ -58,6 +58,7 @@ def parse_args():
     parser.add_argument("--legacy_projector", type=_as_bool, default=False)
     parser.add_argument("--mask_vit_padding", type=_as_bool, default=False)
     parser.add_argument("--vit_apply_final_layernorm", type=_as_bool, default=True)
+    parser.add_argument("--compact_decoder_positions", type=_as_bool, default=False)
     parser.add_argument("--pad_fractions", default="0,0.25,0.5,0.75")
     parser.add_argument(
         "--attention_batches",
@@ -98,6 +99,7 @@ def build_model(args):
     model_args.mixer_depth_map = args.mixer_depth_map
     model_args.mask_vit_padding = args.mask_vit_padding
     model_args.vit_apply_final_layernorm = args.vit_apply_final_layernorm
+    model_args.compact_decoder_positions = args.compact_decoder_positions
 
     training_args = TrainingArguments(output_dir="/tmp/_pad_diag")
     training_args.bf16 = torch.cuda.is_available()
@@ -343,6 +345,7 @@ def main():
         "vit_init": args.vit_init,
         "mask_vit_padding": args.mask_vit_padding,
         "vit_apply_final_layernorm": args.vit_apply_final_layernorm,
+        "compact_decoder_positions": args.compact_decoder_positions,
         "max_samples": len(dataset),
         "batch_invariance_samples": min(
             max(args.batch1_samples, 1),
@@ -390,6 +393,11 @@ def main():
         args.mask_vit_padding
     )
     results["batch_size_8_full"] = full_metrics
+    # Convenience mirror: `attention_batches` above is only the sampling
+    # budget, while this is the actual measured per-layer PAD attention mass.
+    results["padding_attention_mass_by_layer"] = full_metrics[
+        "padding_attention_mass_by_layer"
+    ]
 
     # 2. Length bucketing: same full set, only batch composition changes.
     lengths = [(index, int(dataset[index]["source_ids"].numel())) for index in range(len(dataset))]

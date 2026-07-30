@@ -90,6 +90,9 @@ MASK_VIT_PADDING="${MASK_VIT_PADDING:-0}"
 # Plain ViTModel applies a final LayerNorm after encoder.layer; the bare mixer
 # stack does not. Set 0 for a direct-vs-zero-gated control with matched blocks.
 VIT_APPLY_FINAL_LAYERNORM="${VIT_APPLY_FINAL_LAYERNORM:-1}"
+# Compact decoder positions across left-padding and internal masked latent
+# slots. Generation already does this; enabling it aligns teacher forcing.
+COMPACT_DECODER_POSITIONS="${COMPACT_DECODER_POSITIONS:-0}"
 # MIXED-CR training: non-empty whitespace-separated cr set (e.g. "1 2 4 8 16")
 # samples one cr per optimizer step from a balanced deterministic sequence.
 # Replaces the CR_SCHEDULE curriculum (an empty --cr_schedule is forced below).
@@ -170,6 +173,7 @@ echo "  NO_VIT            = ${NO_VIT}"
 echo "  MIXER_DEPTH_MAP   = ${MIXER_DEPTH_MAP:-<off>}"
 echo "  MASK_VIT_PADDING  = ${MASK_VIT_PADDING}"
 echo "  VIT_APPLY_FINAL_LAYERNORM = ${VIT_APPLY_FINAL_LAYERNORM}"
+echo "  COMPACT_DECODER_POSITIONS = ${COMPACT_DECODER_POSITIONS}"
 echo "  MIXED_CR_SET      = ${MIXED_CR_SET:-<off>}"
 echo "  RESUME_DIR        = ${RESUME_DIR:-<none>}"
 echo "  LEGACY_PROJECTOR  = ${LEGACY_PROJECTOR}"
@@ -228,6 +232,7 @@ run_train() {
     --no_vit "${NO_VIT}"
     --mask_vit_padding "${MASK_VIT_PADDING}"
     --vit_apply_final_layernorm "${VIT_APPLY_FINAL_LAYERNORM}"
+    --compact_decoder_positions "${COMPACT_DECODER_POSITIONS}"
     --seed "${SEED:-42}"
   )
   if [[ -n "${MIXED_CR_SET}" ]]; then
@@ -313,6 +318,7 @@ for MODE in ${EVAL_MODES}; do
     --no_vit "${NO_VIT}"
     --mask_vit_padding "${MASK_VIT_PADDING}"
     --vit_apply_final_layernorm "${VIT_APPLY_FINAL_LAYERNORM}"
+    --compact_decoder_positions "${COMPACT_DECODER_POSITIONS}"
     --seed "${SEED:-42}"
   )
   if [[ -n "${MIXER_DEPTH_MAP}" ]]; then

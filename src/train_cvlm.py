@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import transformers
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Sampler
@@ -24,6 +24,8 @@ from cvlm_dataset import CvlmTrainDataset, make_collate_fn
 from modeling import CVLM, ModelArguments, TrainingArguments
 from train_utils import (
     AverageMeter,
+    MasterWeightAdamW,
+    build_optimizer,
     cleanup_distributed,
     find_latest_checkpoint,
     load_cvlm_checkpoint,
@@ -147,6 +149,128 @@ def _build_param_groups(model: torch.nn.Module, lr: float, gate_lr_mult: float) 
         {"params": base_params, "lr": lr},
         {"params": gate_params, "lr": lr * gate_lr_mult},
     ]
+
+
+_BITWISE_VIEW_DTYPES = {
+    torch.bfloat16: torch.int16,
+    torch.float16: torch.int16,
+    torch.float32: torch.int32,
+    torch.float64: torch.int64,
+}
+
+
+def _bitwise_unchanged(current: torch.Tensor, previous: torch.Tensor) -> int:
+    """Count elements that are BIT-for-BIT identical in the two tensors.
+
+    Compared through an integer view rather than with ``==`` so the answer is
+    about the stored bit pattern (the thing an AdamW update either changes or
+    rounds away) and not about float equality semantics.
+    """
+    view = _BITWISE_VIEW_DTYPES.get(current.dtype)
+    if view is None or current.dtype != previous.dtype:
+        return int(torch.eq(current, previous).sum())
+    return int(
+        torch.eq(
+            current.detach().contiguous().view(view),
+            previous.detach().contiguous().view(view),
+        ).sum()
+    )
+
+
+class VitDriftTracker:
+    """Measures whether the post-bottleneck ViT/mixer stack is LEARNING AT ALL.
+
+    Two numbers per log interval, over every trainable parameter of the ViT
+    encoder layer stack (+ its final LayerNorm) or, with the rate-depth mixer,
+    of the mixer layers (+ gates):
+
+      * ``vit_frozen_frac`` — fraction of individual weights whose bit pattern
+        is identical to the previous log step. Under bf16 in-place AdamW this
+        is the direct measurement of updates being destroyed by rounding: an
+        update smaller than half an ULP of the weight leaves the bits alone.
+        Pretrained ViT weights are ~4x larger in magnitude than the random-init
+        ones, hence ~4x coarser ULP, hence a much larger frozen fraction at the
+        same LR — a numerical-precision confounder that is collinear with the
+        pretrained-vs-random treatment.
+      * ``vit_drift`` — global relative L2 distance from initialization,
+        ``||W - W_0||_2 / ||W_0||_2`` over the same parameter set.
+
+    ``W_0`` is taken from ``mechanistic_init.safetensors`` when available (the
+    exact step-0 weights, written by ``_write_or_verify_initialization_artifacts``),
+    so drift stays measured from the true initialization ACROSS RESUMES; the
+    parameter names used here deliberately match the prefixes written by
+    ``_compression_path_initial_state``. Without that file it falls back to the
+    weights present when the tracker is constructed.
+
+    Snapshot cost: two clones of the tracked stack (~2 x 170 MB for ViT-Base in
+    bf16), kept on the parameters' own device.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        init_state: Optional[dict] = None,
+    ) -> None:
+        core = unwrap_model(model)
+        named: List[Tuple[str, torch.nn.Parameter]] = []
+        if getattr(core, "mixer_layers", None) is not None:
+            named.extend(core.mixer_layers.named_parameters(prefix="mixer_layers"))
+            gates = getattr(core, "mixer_gates", None)
+            if gates is not None:
+                named.append(("mixer_gates", gates))
+            self.branch = "mixer"
+        elif getattr(core, "vision_encoder", None) is not None:
+            named.extend(
+                core.vision_encoder.encoder.layer.named_parameters(
+                    prefix="vision_encoder_layers"
+                )
+            )
+            named.extend(
+                core.vision_encoder.layernorm.named_parameters(
+                    prefix="vision_encoder_final_layernorm"
+                )
+            )
+            self.branch = "vit"
+        else:
+            self.branch = "none"
+        self.params = [(name, p) for name, p in named if p.requires_grad]
+        self.enabled = bool(self.params)
+        self.numel = sum(p.numel() for _, p in self.params)
+        self._prev = [p.detach().clone() for _, p in self.params]
+        state = init_state or {}
+        self._init: List[torch.Tensor] = []
+        self.init_from_file = 0
+        for name, param in self.params:
+            reference = state.get(name)
+            if reference is not None and tuple(reference.shape) == tuple(param.shape):
+                self._init.append(
+                    reference.detach().to(device=param.device, dtype=param.dtype).clone()
+                )
+                self.init_from_file += 1
+            else:
+                self._init.append(param.detach().clone())
+        init_sq = 0.0
+        for reference in self._init:
+            init_sq += float(torch.linalg.vector_norm(reference.float(), dtype=torch.float32) ** 2)
+        self._init_norm = init_sq**0.5
+
+    def measure(self) -> Optional[dict]:
+        """Stats since the previous ``measure()`` call; advances the snapshot."""
+        if not self.enabled:
+            return None
+        unchanged = 0
+        delta_sq = 0.0
+        for (_, param), previous, reference in zip(self.params, self._prev, self._init):
+            current = param.detach()
+            unchanged += _bitwise_unchanged(current, previous)
+            delta = current.float() - reference.float()
+            delta_sq += float(torch.linalg.vector_norm(delta, dtype=torch.float32) ** 2)
+            previous.copy_(current)
+        return {
+            "vit_frozen_frac": unchanged / max(self.numel, 1),
+            "vit_drift": (delta_sq**0.5) / self._init_norm if self._init_norm > 0 else 0.0,
+            "vit_tracked_params": int(self.numel),
+        }
 
 
 class MixedCrSampler:
@@ -328,6 +452,20 @@ def parse_args() -> argparse.Namespace:
         "'the gates just learn too slowly' — e.g. --gate_lr_mult 100. Requires "
         "--mixer_depth_map. Resuming a run must reuse the same value (the group count is "
         "part of the optimizer state). Env: GATE_LR_MULT.",
+    )
+    p.add_argument(
+        "--fp32_master_weights",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("FP32_MASTER_WEIGHTS", "0") == "1",
+        help="NUMERICAL-PRECISION CONTROL: keep fp32 master copies of the bf16 trainable "
+        "parameters inside AdamW (params stay bf16 for forward/backward; the optimizer "
+        "steps the fp32 masters with fp32 moments and rounds back). Without it an update "
+        "of size ~lr=1e-4 is BELOW half an ULP of a ~1.0-magnitude pretrained ViT weight "
+        "and is silently discarded every step, while the ~4x smaller random-init weights "
+        "still move — a precision artifact collinear with the pretrained-vs-random "
+        "treatment. 0 (default) = legacy in-place bf16 AdamW, byte-for-byte. Costs ~12 "
+        "bytes per low-precision trainable parameter. A resumed run must reuse the same "
+        "value (the master copies live in the optimizer state). Env: FP32_MASTER_WEIGHTS.",
     )
     p.add_argument(
         "--mixed_cr_set",
@@ -946,12 +1084,22 @@ def main() -> None:
         )
 
     param_groups = _build_param_groups(model, args.lr, float(args.gate_lr_mult))
-    optimizer = torch.optim.AdamW(
+    optimizer = build_optimizer(
         param_groups,
         lr=args.lr,
         betas=(args.adamw_beta1, args.adamw_beta2),
         weight_decay=0.0,
+        fp32_master_weights=bool(args.fp32_master_weights),
     )
+    if is_master and isinstance(optimizer, MasterWeightAdamW):
+        mastered = optimizer.mastered_numel
+        print(
+            f"[fp32-master] fp32 MASTER WEIGHTS enabled: {len(optimizer.master_pairs)} bf16/fp16 "
+            f"tensor(s) / {mastered} params get an fp32 master copy "
+            f"(+{mastered * 12 / (1024**3):.2f} GB of optimizer state: master + fp32 grad + "
+            f"fp32 moments). Model params stay bf16; updates below half a bf16 ULP now "
+            f"accumulate instead of being rounded away."
+        )
     if is_master and len(param_groups) > 1:
         print(
             f"[gate-lr] mixer_gates in a separate AdamW group: "
@@ -1011,6 +1159,30 @@ def main() -> None:
         if is_master:
             print(f"[mixed-cr] step {global_step}: cr={current_cr}")
 
+    # ---- ViT/mixer learnability diagnostic ------------------------------
+    # Built AFTER any resume so the "unchanged since last log" window starts at
+    # the weights this process actually trains from; drift stays anchored to the
+    # true step-0 weights via mechanistic_init.safetensors when it exists.
+    vit_tracker: Optional[VitDriftTracker] = None
+    if is_master:
+        init_state = None
+        init_path = os.path.join(args.output_dir, "mechanistic_init.safetensors")
+        if os.path.exists(init_path):
+            init_state = load_file(init_path)
+        vit_tracker = VitDriftTracker(model, init_state=init_state)
+        if vit_tracker.enabled:
+            print(
+                f"[vit-drift] tracking {vit_tracker.numel} trainable {vit_tracker.branch} "
+                f"params in {len(vit_tracker.params)} tensor(s); init from "
+                f"{'mechanistic_init.safetensors' if vit_tracker.init_from_file else 'current weights'} "
+                f"({vit_tracker.init_from_file}/{len(vit_tracker.params)} tensors matched). "
+                f"Logs vit_frozen_frac (bitwise-unchanged since last log) + vit_drift "
+                f"(relative L2 from init) every --log_interval."
+            )
+        else:
+            vit_tracker = None
+            print("[vit-drift] no trainable ViT/mixer parameters; diagnostic disabled")
+
     if is_master:
         print(optimizer)
         print("init_lrs:", init_lrs)
@@ -1053,6 +1225,7 @@ def main() -> None:
             "vit_apply_final_layernorm": bool(model_args.vit_apply_final_layernorm),
             "compact_decoder_positions": bool(model_args.compact_decoder_positions),
             "gate_lr_mult": float(args.gate_lr_mult),
+            "fp32_master_weights": bool(args.fp32_master_weights),
             "mixed_cr_set": str(args.mixed_cr_set or ""),
             "max_source_len": args.max_source_len,
             "epochs": args.epochs,
@@ -1290,6 +1463,17 @@ def main() -> None:
                     mx,
                     f"data: {data_time:>7.5f}s batch: {batch_time:>6.3f}s",
                 )
+                # NUMERICAL-PRECISION diagnostic: is the ViT/mixer stack moving
+                # at all, or is AdamW's update being rounded away by bf16?
+                # Advances the tracker's window, so call it exactly once per log.
+                vit_stats = vit_tracker.measure() if vit_tracker is not None else None
+                if vit_stats is not None:
+                    print(
+                        f"    vit_frozen_frac={vit_stats['vit_frozen_frac']:.4f} "
+                        f"vit_drift={vit_stats['vit_drift']:.4f} "
+                        f"(tracked={vit_stats['vit_tracked_params']} params, "
+                        f"window={args.log_interval} steps)"
+                    )
                 # RATE-DEPTH MIXER ablation telemetry: gate values show how much
                 # of each ViTLayer the model actually uses.
                 mixer_gates_now = None
@@ -1324,6 +1508,9 @@ def main() -> None:
                     }
                     if grad_norm > 0:
                         metrics["train/grad_norm"] = grad_norm
+                    if vit_stats is not None:
+                        metrics["train/vit_frozen_frac"] = vit_stats["vit_frozen_frac"]
+                        metrics["train/vit_drift"] = vit_stats["vit_drift"]
                     if args.mixed_fidelity_p > 0 and running_avg_raw_frac.count > 0:
                         metrics["train/mixed_raw_frac"] = running_avg_raw_frac.avg
                         metrics["train/mixed_input_len"] = running_avg_input_len.avg
@@ -1385,6 +1572,17 @@ def main() -> None:
                             "compact_decoder_positions": bool(
                                 model_args.compact_decoder_positions
                             ),
+                            "fp32_master_weights": bool(args.fp32_master_weights),
+                            "vit_frozen_frac": (
+                                vit_stats["vit_frozen_frac"] if vit_stats is not None else None
+                            ),
+                            "vit_drift": (
+                                vit_stats["vit_drift"] if vit_stats is not None else None
+                            ),
+                            "vit_tracked_params": (
+                                vit_stats["vit_tracked_params"] if vit_stats is not None else None
+                            ),
+                            "vit_drift_window_steps": int(args.log_interval),
                             "mixer_gates": mixer_gates_full,
                             "mixer_gate_grads": gate_grads_for_log,
                             "mixer_contrib": (

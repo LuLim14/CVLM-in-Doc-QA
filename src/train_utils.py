@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import random
 import re
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -14,6 +14,11 @@ from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.optimizer import Optimizer
+
+# Parameter dtypes whose ULP is too coarse for a raw AdamW update at our LRs.
+LOW_PRECISION_DTYPES = (torch.bfloat16, torch.float16)
+# Extra key stored inside the AdamW state_dict by MasterWeightAdamW.
+MASTER_WEIGHTS_KEY = "fp32_master_weights"
 
 
 class AverageMeter:
@@ -70,6 +75,201 @@ def cleanup_distributed(use_ddp: bool) -> None:
 
 def unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
+
+
+class MasterWeightAdamW(torch.optim.AdamW):
+    """AdamW that keeps an fp32 MASTER copy of every low-precision parameter.
+
+    WHY THIS EXISTS. The whole model is built in bf16 and (until this class)
+    AdamW updated those bf16 tensors in place, with bf16 moments. bf16 keeps 8
+    mantissa bits, so a weight of magnitude ~1.0 has ULP 2**-7 = 7.8e-3 and a
+    weight of magnitude ~0.02 has ULP ~1.2e-4. An AdamW update is ~lr in size
+    (the moment ratio is O(1)), i.e. 1e-4 in this campaign. For the small
+    random-init weights that is above half an ULP and lands; for the ~4x larger
+    PRETRAINED ViT weights it is below half an ULP and is silently rounded
+    away — every step, forever. Measured on the rd5/rd6 run: 63.6% of the
+    pretrained ViT weights were BIT-for-BIT unchanged between step 1000 and
+    step 11326 (drift 2.77%) versus 19.5% drift for the random-init arm. Any
+    "the pretrained visual prior hurts" claim is therefore confounded with a
+    pure floating-point artifact that is COLLINEAR with the treatment.
+
+    WHAT IT DOES. Parameters stay bf16 for forward/backward (activation memory
+    and speed are untouched, and the model/checkpoint dtype does not change),
+    but the optimizer owns an fp32 clone of each of them:
+
+        master.grad <- p.grad        (upcast copy, after clipping)
+        AdamW.step() on the fp32 masters, with fp32 moments
+        p <- master                  (round-to-nearest back into bf16)
+
+    Sub-ULP updates now ACCUMULATE in the master instead of being destroyed, so
+    a pretrained weight moves as soon as the accumulated update crosses half an
+    ULP. fp32 parameters already in the group (pool_queries, mixer_gates) are
+    used directly with no master copy.
+
+    STATE / RESUME. ``self.param_groups`` holds the MASTER tensors, so
+    LR schedulers, ``check_optimizer_groups_match`` and the AdamW state machine
+    all work unchanged, and the moments are created fp32 (``zeros_like(master)``)
+    rather than bf16. ``state_dict()`` additionally stores the master tensors
+    themselves under ``MASTER_WEIGHTS_KEY``; ``load_state_dict()`` restores them
+    in place, so a resumed run continues from the FULL-precision weights instead
+    of re-seeding from the rounded bf16 checkpoint.
+
+    MEMORY. +4 bytes/param for the master, +4 for its fp32 grad buffer, and
+    fp32 (8B) instead of bf16 (4B) moments == +12 bytes per low-precision
+    trainable parameter (~2.5 GB for this campaign's ~211M trainable params).
+    """
+
+    def __init__(self, params: Any, **kwargs: Any) -> None:
+        groups = list(params)
+        if not groups:
+            raise ValueError("MasterWeightAdamW got an empty parameter list")
+        if not isinstance(groups[0], dict):
+            groups = [{"params": groups}]
+        master_groups: List[dict] = []
+        pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for group in groups:
+            group = dict(group)
+            master_params: List[torch.Tensor] = []
+            for param in list(group["params"]):
+                if param.dtype in LOW_PRECISION_DTYPES:
+                    master = param.detach().clone().to(torch.float32)
+                    master.requires_grad_(param.requires_grad)
+                    pairs.append((param, master))
+                    master_params.append(master)
+                else:
+                    # Already full precision: optimize the live tensor itself.
+                    master_params.append(param)
+            group["params"] = master_params
+            master_groups.append(group)
+        super().__init__(master_groups, **kwargs)
+        self._master_pairs = pairs
+
+    # -- introspection -----------------------------------------------------
+    @property
+    def master_pairs(self) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """(model_param, fp32_master) for every mastered (bf16/fp16) tensor."""
+        return list(self._master_pairs)
+
+    @property
+    def mastered_numel(self) -> int:
+        return sum(master.numel() for _, master in self._master_pairs)
+
+    def _flat_master_params(self) -> List[torch.Tensor]:
+        """Optimizer params in the exact order ``state_dict`` indexes them."""
+        return [p for group in self.param_groups for p in group["params"]]
+
+    # -- optimization ------------------------------------------------------
+    def step(self, closure: Any = None) -> Any:  # type: ignore[override]
+        with torch.no_grad():
+            for model_param, master in self._master_pairs:
+                grad = model_param.grad
+                if grad is None:
+                    # Mirror plain-AdamW semantics: no grad => not updated.
+                    master.grad = None
+                    continue
+                if master.grad is None:
+                    master.grad = torch.zeros_like(master)
+                master.grad.copy_(grad)
+        loss = super().step(closure)
+        with torch.no_grad():
+            for model_param, master in self._master_pairs:
+                model_param.copy_(master)
+        return loss
+
+    def zero_grad(self, set_to_none: bool = True) -> None:  # type: ignore[override]
+        # The base call clears the MASTER grads; the live model params have
+        # their own grads (produced by backward) and must be cleared too.
+        super().zero_grad(set_to_none=set_to_none)
+        for model_param, _ in self._master_pairs:
+            if model_param.grad is None:
+                continue
+            if set_to_none:
+                model_param.grad = None
+            else:
+                model_param.grad.detach_()
+                model_param.grad.zero_()
+
+    # -- checkpointing -----------------------------------------------------
+    def state_dict(self) -> Dict[str, Any]:
+        state = super().state_dict()
+        mastered_ids = {id(master) for _, master in self._master_pairs}
+        payload: Dict[int, torch.Tensor] = {}
+        for index, param in enumerate(self._flat_master_params()):
+            if id(param) in mastered_ids:
+                payload[index] = param.detach().cpu().clone()
+        state[MASTER_WEIGHTS_KEY] = {"version": 1, "params": payload}
+        return state
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        payload = state_dict.get(MASTER_WEIGHTS_KEY)
+        base = {k: v for k, v in state_dict.items() if k != MASTER_WEIGHTS_KEY}
+        super().load_state_dict(base)
+        if payload is None:
+            # Legacy (pre-master-weights) checkpoint: the masters keep the
+            # values they were seeded with, i.e. the rounded bf16 weights that
+            # were just loaded into the model. Correct, but the sub-ULP history
+            # of that run is gone — say so instead of pretending otherwise.
+            print(
+                "[fp32-master] WARNING: checkpoint carries no fp32 master weights; "
+                "seeding masters from the rounded bf16 parameters."
+            )
+            return
+        saved = payload.get("params", {})
+        if len(saved) != len(self._master_pairs):
+            raise RuntimeError(
+                f"fp32 master-weight resume mismatch: checkpoint has {len(saved)} master "
+                f"tensor(s), the current optimizer needs {len(self._master_pairs)}. The "
+                "trainable-parameter set or the parameter dtypes changed since the "
+                "checkpoint was written."
+            )
+        flat = self._flat_master_params()
+        with torch.no_grad():
+            for index, value in saved.items():
+                index = int(index)
+                if index >= len(flat):
+                    raise RuntimeError(
+                        f"fp32 master-weight resume mismatch: saved index {index} is out of "
+                        f"range for {len(flat)} optimizer tensor(s)."
+                    )
+                master = flat[index]
+                if tuple(value.shape) != tuple(master.shape):
+                    raise RuntimeError(
+                        f"fp32 master-weight resume mismatch at index {index}: checkpoint "
+                        f"shape {tuple(value.shape)} != model shape {tuple(master.shape)}."
+                    )
+                master.copy_(value.to(device=master.device, dtype=master.dtype))
+            # The bf16 weights loaded from the safetensors are round(master), so
+            # this is a no-op bit-wise; do it anyway so the live model can never
+            # silently disagree with the state the optimizer will step from.
+            for model_param, master in self._master_pairs:
+                model_param.copy_(master)
+
+
+def build_optimizer(
+    param_groups: Iterable[dict],
+    lr: float,
+    betas: Tuple[float, float],
+    weight_decay: float = 0.0,
+    fp32_master_weights: bool = False,
+) -> Optimizer:
+    """AdamW, optionally with fp32 master weights (see ``MasterWeightAdamW``).
+
+    ``fp32_master_weights=False`` returns a plain ``torch.optim.AdamW`` built
+    exactly as before, so the legacy trajectory is reproduced byte for byte.
+    """
+    if not fp32_master_weights:
+        return torch.optim.AdamW(
+            param_groups,
+            lr=lr,
+            betas=betas,
+            weight_decay=weight_decay,
+        )
+    return MasterWeightAdamW(
+        param_groups,
+        lr=lr,
+        betas=betas,
+        weight_decay=weight_decay,
+    )
 
 
 def state_dict_for_safetensors(module: nn.Module) -> Dict[str, torch.Tensor]:
@@ -241,6 +441,35 @@ def check_optimizer_groups_match(
             )
 
 
+def check_master_weights_match(
+    optimizer: Optimizer,
+    saved_state: Dict[str, Any],
+    trainer_path: str = "",
+) -> None:
+    """Refuse to silently drop fp32 master weights on resume.
+
+    ``Optimizer.load_state_dict`` ignores unknown top-level keys, so resuming a
+    ``--fp32_master_weights`` run with the flag OFF would quietly throw the
+    full-precision weights away AND downcast the moments back to bf16 — the run
+    would keep going and look fine while the thing under test disappeared.
+    """
+    where = f" (from {trainer_path})" if trainer_path else ""
+    saved_has = MASTER_WEIGHTS_KEY in saved_state
+    live_has = isinstance(optimizer, MasterWeightAdamW)
+    if saved_has and not live_has:
+        raise RuntimeError(
+            f"Optimizer resume mismatch{where}: the checkpoint stores fp32 master weights but "
+            "the current optimizer is a plain AdamW. Resume with --fp32_master_weights true "
+            "(env FP32_MASTER_WEIGHTS=1), or start a fresh run — continuing without them would "
+            "discard the full-precision weights and silently change the numerics mid-run."
+        )
+    if live_has and not saved_has:
+        print(
+            f"[fp32-master] NOTE: checkpoint{where} was written WITHOUT fp32 master weights; "
+            "masters are seeded from the rounded bf16 parameters (mid-run precision change)."
+        )
+
+
 def load_cvlm_checkpoint(
     model_path: str,
     trainer_path: str,
@@ -266,6 +495,7 @@ def load_cvlm_checkpoint(
     except TypeError:
         payload = torch.load(trainer_path, map_location=device)
     check_optimizer_groups_match(optimizer, payload["optimizer"], trainer_path)
+    check_master_weights_match(optimizer, payload["optimizer"], trainer_path)
     optimizer.load_state_dict(payload["optimizer"])
     scheduler.load_state_dict(payload["scheduler"])
     rng_state = payload.get("rng_state")

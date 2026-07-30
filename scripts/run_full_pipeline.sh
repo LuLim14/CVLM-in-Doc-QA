@@ -75,6 +75,13 @@ export LEGACY_PROJECTOR
 CR_SCHEDULE="${CR_SCHEDULE:-1:6000,2:12000,4:18000,8:24000,16:0}"   # empty = static cr from COMPRESSION_RATE
 DISABLE_LR_SCHEDULE="${DISABLE_LR_SCHEDULE:-1}"   # 1 = constant LR after warmup (no cosine decay)
 
+# NUMERICAL-PRECISION control. 1 = AdamW keeps fp32 master copies of the bf16
+# trainable weights (params stay bf16 for forward/backward; updates smaller than
+# half a bf16 ULP accumulate in the master instead of being rounded away). With
+# 0 (legacy) an update of size ~lr=1e-4 cannot move a ~1.0-magnitude pretrained
+# ViT weight at all, which confounds the pretrained-vs-random comparison.
+FP32_MASTER_WEIGHTS="${FP32_MASTER_WEIGHTS:-0}"
+
 # ViT ablation branch (prior study): VIT_INIT=pretrained|random, FREEZE_VIT=0|1, NO_VIT=0|1.
 VIT_INIT="${VIT_INIT:-pretrained}"
 FREEZE_VIT="${FREEZE_VIT:-0}"
@@ -175,6 +182,7 @@ echo "  MASK_VIT_PADDING  = ${MASK_VIT_PADDING}"
 echo "  VIT_APPLY_FINAL_LAYERNORM = ${VIT_APPLY_FINAL_LAYERNORM}"
 echo "  COMPACT_DECODER_POSITIONS = ${COMPACT_DECODER_POSITIONS}"
 echo "  MIXED_CR_SET      = ${MIXED_CR_SET:-<off>}"
+echo "  FP32_MASTER_WEIGHTS = ${FP32_MASTER_WEIGHTS}"
 echo "  RESUME_DIR        = ${RESUME_DIR:-<none>}"
 echo "  LEGACY_PROJECTOR  = ${LEGACY_PROJECTOR}"
 echo "  CR_SCHEDULE       = ${CR_SCHEDULE:-<static>}"
@@ -233,6 +241,7 @@ run_train() {
     --mask_vit_padding "${MASK_VIT_PADDING}"
     --vit_apply_final_layernorm "${VIT_APPLY_FINAL_LAYERNORM}"
     --compact_decoder_positions "${COMPACT_DECODER_POSITIONS}"
+    --fp32_master_weights "${FP32_MASTER_WEIGHTS}"
     --seed "${SEED:-42}"
   )
   if [[ -n "${MIXED_CR_SET}" ]]; then

@@ -53,6 +53,11 @@ MAX_SAMPLES="${MAX_SAMPLES:-0}"            # cap HF dataset rows; 0 = all
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
 LOG_INTERVAL="${LOG_INTERVAL:-10}"
 SAVE_INTERVAL_STEPS="${SAVE_INTERVAL_STEPS:-0}"
+# Mechanistic audit artifacts: a fixed tokenized probe and the exact step-0
+# compression-path weights. These make CKA/weight-drift analysis possible from
+# saved checkpoints without recreating the dataset or random initialization.
+MECHANISTIC_PROBE_SAMPLES="${MECHANISTIC_PROBE_SAMPLES:-16}"
+SAVE_MECHANISTIC_INIT="${SAVE_MECHANISTIC_INIT:-1}"
 NPROC="${NPROC:-1}"
 # Linear warmup stabilises the first ~100 optimizer steps. With the projectors
 # + ViT freshly initialised, early grad norms can spike above 100; without
@@ -153,6 +158,8 @@ echo "  MAX_VISION_LEN    = ${MAX_VISION_LEN}"
 echo "  MAX_SOURCE_LEN    = ${MAX_SOURCE_LEN} (0 = cr*max_vision_len)"
 echo "  COMPRESSION_RATE  = ${COMPRESSION_RATE}"
 echo "  MAX_SAMPLES       = ${MAX_SAMPLES} (0 = all)"
+echo "  MECHANISTIC_PROBE_SAMPLES = ${MECHANISTIC_PROBE_SAMPLES}"
+echo "  SAVE_MECHANISTIC_INIT = ${SAVE_MECHANISTIC_INIT}"
 echo "  ENABLE_WARMUP     = ${ENABLE_WARMUP} (steps=${WARMUP_STEPS})"
 echo "  GRADIENT_CHECKPOINTING = ${GRADIENT_CHECKPOINTING}"
 echo "  UNFREEZE_ENCODER_TOP_K = ${UNFREEZE_ENCODER_TOP_K}"
@@ -209,6 +216,8 @@ run_train() {
     --gradient_accumulation_steps "${GRAD_ACCUM}"
     --log_interval "${LOG_INTERVAL}"
     --save_interval_steps "${SAVE_INTERVAL_STEPS}"
+    --mechanistic_probe_samples "${MECHANISTIC_PROBE_SAMPLES}"
+    --save_mechanistic_init "${SAVE_MECHANISTIC_INIT}"
     --tensorboard_dir "${TB_DIR}/train"
     --gradient_checkpointing "${GRADIENT_CHECKPOINTING}"
     --unfreeze_encoder_top_k "${UNFREEZE_ENCODER_TOP_K}"

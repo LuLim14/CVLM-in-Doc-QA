@@ -15,8 +15,10 @@
 # из MIXED_CR_SET) с битово одинаковыми общими модулями (shared_init_seed).
 # Арм задаётся картой глубины пост-bottleneck миксера (zero-gated ViT-слои):
 #   ARM=novit          : NO_VIT=1 (pooling-only, без миксера)
-#   ARM=fixed12direct  : VIT_INIT=random (12 слоёв БЕЗ гейтов и БЕЗ final LN,
-#                        чтобы блоки совпадали с bare mixer stack)
+#   ARM=fixed12direct  : VIT_INIT=random (12 mask-safe слоёв БЕЗ гейтов и БЕЗ
+#                        final LN, чтобы блоки совпадали с bare mixer stack)
+#   ARM=fixed12unmasked: тот же direct-контроль, но legacy attention без padding
+#                        mask — причинный контроль для Bottleneck-Safe Mixer
 #   ARM=fixed12anchor  : MIXER_DEPTH_MAP="1:12,2:12,4:12,8:12,16:12" (zero-gated residual)
 #   ARM=ratedepth      : MIXER_DEPTH_MAP="1:0,2:1,4:3,8:6,16:12"    (условная глубина)
 # Пары сравнения: direct-vs-anchor использует одинаковые 12 ViTLayer blocks
@@ -43,12 +45,15 @@ if [ "${SMOKE}" = "1" ]; then
   export MAX_SAMPLES=8000 EPOCHS=1 EVAL_MAX_SAMPLES=64
 fi
 
-ARM="${ARM:?set ARM=novit|fixed12direct|fixed12anchor|ratedepth}"
+ARM="${ARM:?set ARM=novit|fixed12direct|fixed12unmasked|fixed12anchor|ratedepth}"
 export MIXER_DEPTH_MAP="" VIT_INIT=pretrained FREEZE_VIT=0 NO_VIT=0
 export MASK_VIT_PADDING=1 VIT_APPLY_FINAL_LAYERNORM=1
 case "${ARM}" in
   novit)         export NO_VIT=1 ;;
   fixed12direct) export VIT_INIT=random VIT_APPLY_FINAL_LAYERNORM=0 ;;
+  fixed12unmasked)
+    export VIT_INIT=random VIT_APPLY_FINAL_LAYERNORM=0 MASK_VIT_PADDING=0
+    ;;
   fixed12anchor) export MIXER_DEPTH_MAP="1:12,2:12,4:12,8:12,16:12" ;;
   ratedepth)     export MIXER_DEPTH_MAP="1:0,2:1,4:3,8:6,16:12" ;;
   *) echo "unknown ARM=${ARM}"; exit 1 ;;
@@ -71,7 +76,8 @@ cd "${CVLM_ROOT}"
 mkdir -p "${OUTPUT_DIR}"
 cp VERSION "${OUTPUT_DIR}/CODE_VERSION"
 sha256sum \
-  src/modeling.py src/train_cvlm.py src/train_utils.py src/eval_cvlm.py \
+  src/modeling.py src/train_cvlm.py src/train_utils.py src/train_logging.py src/eval_cvlm.py \
+  tools/measure_padding_contamination.py tools/block_bootstrap_train.py \
   scripts/run_full_pipeline.sh hse/ratedepth.sbatch hse/protocol.env \
   > "${OUTPUT_DIR}/CODE_SHA256"
 {
@@ -81,6 +87,9 @@ sha256sum \
   echo "MASK_VIT_PADDING=${MASK_VIT_PADDING}"
   echo "VIT_APPLY_FINAL_LAYERNORM=${VIT_APPLY_FINAL_LAYERNORM}"
   echo "GATE_LR_MULT=${GATE_LR_MULT:-1.0}"
+  echo "MECHANISTIC_PROBE_SAMPLES=${MECHANISTIC_PROBE_SAMPLES:-16}"
+  echo "SAVE_MECHANISTIC_INIT=${SAVE_MECHANISTIC_INIT:-1}"
+  echo "SAVE_INTERVAL_STEPS=${SAVE_INTERVAL_STEPS}"
   echo "SEED=${SEED}"
 } > "${OUTPUT_DIR}/EXPERIMENT_FLAGS"
 bash scripts/run_full_pipeline.sh

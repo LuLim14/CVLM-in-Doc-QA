@@ -153,7 +153,15 @@ def ppl_over(model, loader, device):
 
 
 class PaddingAttentionCollector:
-    """Forward-hook collector for legacy unmasked ViTSelfAttention modules."""
+    """Measure legacy attention mass assigned to padded latent keys.
+
+    Native ``ViTLayer`` calls self-attention with ``output_attentions=False``,
+    so a forward hook cannot read the probabilities from its output. A
+    pre-forward hook instead recomputes only QK + softmax from the exact
+    normalized hidden states about to enter each attention module. This is an
+    offline diagnostic: the recomputation never enters the model graph and
+    cannot affect predictions.
+    """
 
     def __init__(self, model):
         self.model = model
@@ -168,20 +176,34 @@ class PaddingAttentionCollector:
         self.handles = []
         for index, layer in enumerate(layers):
             self.handles.append(
-                layer.attention.attention.register_forward_hook(self._make_hook(index))
+                layer.attention.attention.register_forward_pre_hook(
+                    self._make_hook(index)
+                )
             )
 
     def _make_hook(self, index):
-        def hook(_module, _inputs, output):
+        def hook(module, inputs):
             import torch
 
-            if not isinstance(output, tuple) or len(output) < 2 or output[1] is None:
+            if not inputs:
                 return
-            probabilities = output[1].detach()
+            hidden_states = inputs[0].detach()
             valid = getattr(self.model, "_current_vision_attention_mask", None)
-            if valid is None or probabilities.size(-1) != valid.size(1):
+            if valid is None or hidden_states.size(1) != valid.size(1):
                 return
-            valid = valid.to(device=probabilities.device, dtype=torch.bool)
+            valid = valid.to(device=hidden_states.device, dtype=torch.bool)
+
+            batch_size = hidden_states.size(0)
+            n_heads = int(module.num_attention_heads)
+            head_dim = int(module.attention_head_size)
+            qkv_shape = (batch_size, -1, n_heads, head_dim)
+            with torch.no_grad():
+                key = module.key(hidden_states).view(*qkv_shape).transpose(1, 2)
+                query = module.query(hidden_states).view(*qkv_shape).transpose(1, 2)
+                scaling = float(getattr(module, "scaling", head_dim**-0.5))
+                scores = torch.matmul(query, key.transpose(-1, -2)) * scaling
+                probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32)
+
             padded_keys = (~valid)[:, None, None, :]
             pad_mass = (probabilities * padded_keys).sum(dim=-1)
             valid_queries = valid[:, None, :].expand_as(pad_mass)

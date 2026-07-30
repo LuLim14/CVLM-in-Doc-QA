@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import random
 import time
@@ -12,6 +13,8 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+import transformers
+from safetensors.torch import save_file
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Sampler
@@ -416,6 +419,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--mechanistic_probe_samples",
+        type=int,
+        default=int(os.environ.get("MECHANISTIC_PROBE_SAMPLES", "16")),
+        help="Save the first N fully tokenized training examples as "
+        "<output_dir>/mechanistic_probe.pt for checkpoint-level CKA/activation "
+        "analysis without reloading a mutable dataset. 0 disables. "
+        "Env: MECHANISTIC_PROBE_SAMPLES.",
+    )
+    p.add_argument(
+        "--save_mechanistic_init",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("SAVE_MECHANISTIC_INIT", "1") != "0",
+        help="Save the exact initial compression-path weights as "
+        "<output_dir>/mechanistic_init.safetensors. This makes later weight-drift "
+        "analysis independent of reconstructing random initialization. "
+        "Env: SAVE_MECHANISTIC_INIT.",
+    )
+    p.add_argument(
         "--resume_dir",
         type=str,
         default="",
@@ -517,6 +538,194 @@ def move_batch(batch: dict, device: torch.device, dtype: torch.dtype) -> dict:
     return out
 
 
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    """Stable hash over dtype, shape and exact tensor bytes."""
+    value = tensor.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(value.dtype).encode("utf-8"))
+    digest.update(str(tuple(value.shape)).encode("utf-8"))
+    digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _module_sha256(module: torch.nn.Module) -> str:
+    digest = hashlib.sha256()
+    for name, value in sorted(module.state_dict().items()):
+        digest.update(name.encode("utf-8"))
+        digest.update(_tensor_sha256(value).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _compression_path_initial_state(model: CVLM) -> dict:
+    """Exact step-0 weights needed by post-hoc compressor analyses.
+
+    This intentionally excludes the decoder and text encoder: the former is
+    frozen, while this campaign's mechanistic question concerns capacity after
+    pooling. The text/projector/pooling/position modules are included because
+    they define the interface into the post-bottleneck stack.
+    """
+    state = {}
+
+    def add_module(prefix: str, module: Optional[torch.nn.Module]) -> None:
+        if module is None:
+            return
+        for name, value in module.state_dict().items():
+            state[f"{prefix}.{name}"] = value.detach().cpu().clone().contiguous()
+
+    add_module("text_projector", model.text_projector)
+    add_module("vision_projector", model.vision_projector)
+    add_module("vision_pos_embed", model.vision_pos_embed)
+    state["pool_queries"] = model.pool_queries.detach().cpu().clone().contiguous()
+    if model.mixer_layers is not None:
+        add_module("mixer_layers", model.mixer_layers)
+        state["mixer_gates"] = model.mixer_gates.detach().cpu().clone().contiguous()
+    elif model.vision_encoder is not None:
+        add_module("vision_encoder_layers", model.vision_encoder.encoder.layer)
+        add_module("vision_encoder_final_layernorm", model.vision_encoder.layernorm)
+    return state
+
+
+def _initialization_manifest(model: CVLM, args: argparse.Namespace) -> dict:
+    if model.mixer_layers is not None:
+        branch_kind = "zero_gated_mixer"
+        branch_layers = model.mixer_layers
+    elif model.vision_encoder is not None:
+        branch_kind = f"vit_{args.vit_init}"
+        branch_layers = model.vision_encoder.encoder.layer
+    else:
+        branch_kind = "no_vit"
+        branch_layers = None
+
+    layer_hashes = (
+        [_module_sha256(layer) for layer in branch_layers]
+        if branch_layers is not None
+        else []
+    )
+    hashes = {
+        "text_projector": _module_sha256(model.text_projector),
+        "vision_projector": _module_sha256(model.vision_projector),
+        "vision_pos_embed": _module_sha256(model.vision_pos_embed),
+        "pool_queries": _tensor_sha256(model.pool_queries),
+        "post_bottleneck_stack": (
+            _module_sha256(branch_layers) if branch_layers is not None else None
+        ),
+        "post_bottleneck_layers": layer_hashes,
+        "post_bottleneck_final_layernorm": (
+            _module_sha256(model.vision_encoder.layernorm)
+            if model.vision_encoder is not None
+            else None
+        ),
+        "mixer_gates": (
+            _tensor_sha256(model.mixer_gates)
+            if model.mixer_gates is not None
+            else None
+        ),
+    }
+    return {
+        "schema_version": 1,
+        "seed": int(args.seed),
+        "shared_init_seed": int(args.seed) + 10000,
+        "branch_kind": branch_kind,
+        "architecture": {
+            "vit_init": str(args.vit_init),
+            "freeze_vit": bool(args.freeze_vit),
+            "no_vit": bool(args.no_vit),
+            "mixer_depth_map": str(args.mixer_depth_map or ""),
+            "mask_vit_padding": bool(args.mask_vit_padding),
+            "vit_apply_final_layernorm": bool(args.vit_apply_final_layernorm),
+            "num_pool_latents": int(args.num_pool_latents),
+        },
+        "models": {
+            "decoder": str(args.model_name_or_path or model.model_args.model_name_or_path),
+            "text_encoder": str(args.text_encoder_name or model.model_args.text_encoder_name),
+            "vision_encoder": str(
+                args.vision_encoder_name or model.model_args.vision_encoder_name
+            ),
+            "decoder_commit": getattr(model.decoder.config, "_commit_hash", None),
+            "text_encoder_commit": getattr(model.text_encoder.config, "_commit_hash", None),
+            "vision_encoder_commit": (
+                getattr(model.vision_encoder.config, "_commit_hash", None)
+                if model.vision_encoder is not None
+                else None
+            ),
+        },
+        "versions": {
+            "torch": str(torch.__version__),
+            "transformers": str(transformers.__version__),
+            "numpy": str(np.__version__),
+        },
+        "hashes": hashes,
+    }
+
+
+def _write_or_verify_initialization_artifacts(
+    model: CVLM,
+    args: argparse.Namespace,
+) -> None:
+    """Persist exact step-0 provenance, failing on an incompatible resume."""
+    os.makedirs(args.output_dir, exist_ok=True)
+    manifest = _initialization_manifest(model, args)
+    manifest_path = os.path.join(args.output_dir, "initialization_manifest.json")
+    if os.path.exists(manifest_path):
+        with open(manifest_path, encoding="utf-8") as handle:
+            recorded = json.load(handle)
+        for field in ("architecture", "hashes"):
+            if recorded.get(field) != manifest.get(field):
+                raise RuntimeError(
+                    f"Initialization mismatch in {manifest_path}: field {field!r} "
+                    "does not match the model reconstructed for resume. Refusing "
+                    "to mix trajectories from different initial states."
+                )
+        print(f"[init-manifest] verified existing {manifest_path}")
+    else:
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        print(f"[init-manifest] saved {manifest_path}")
+
+    if args.save_mechanistic_init:
+        init_path = os.path.join(args.output_dir, "mechanistic_init.safetensors")
+        if os.path.exists(init_path):
+            print(f"[mech-init] preserving existing {init_path}")
+        else:
+            save_file(_compression_path_initial_state(model), init_path)
+            print(f"[mech-init] saved exact compression-path initialization -> {init_path}")
+
+
+def _save_mechanistic_probe(
+    dataset,
+    collate,
+    output_dir: str,
+    sample_count: int,
+    metadata: dict,
+) -> None:
+    """Cache a fixed tokenized probe so CKA needs no dataset reload."""
+    count = min(max(int(sample_count), 0), len(dataset))
+    if count == 0:
+        return
+    path = os.path.join(output_dir, "mechanistic_probe.pt")
+    if os.path.exists(path):
+        print(f"[mech-probe] preserving existing {path}")
+        return
+    batch = collate([dataset[index] for index in range(count)])
+    keep = {
+        key: value.detach().cpu().contiguous()
+        for key, value in batch.items()
+        if torch.is_tensor(value) and not key.startswith("full_prompt")
+    }
+    payload = {
+        "schema_version": 1,
+        "dataset_indices": list(range(count)),
+        "metadata": metadata,
+        "batch": keep,
+    }
+    torch.save(payload, path)
+    source_hash = _tensor_sha256(keep["source_ids"])
+    print(
+        f"[mech-probe] saved {count} tokenized examples -> {path} "
+        f"(source_ids_sha256={source_hash})"
+    )
+
+
 def main() -> None:
     args = parse_args()
     rank, world_size, local_rank, device, use_ddp = setup_distributed()
@@ -556,18 +765,11 @@ def main() -> None:
 
     model = CVLM(model_args, training_args)
     if is_master:
-        # Audit: shared modules must hash identically across ablation branches.
-        def _sd_hash(mod):
-            h = hashlib.sha256()
-            for k, v in sorted(mod.state_dict().items()):
-                h.update(k.encode())
-                h.update(v.detach().cpu().to(torch.float32).numpy().tobytes())
-            return h.hexdigest()[:12]
-
+        _write_or_verify_initialization_artifacts(model, args)
         print(
-            f"[init-hash] text_projector={_sd_hash(model.text_projector)} "
-            f"vision_projector={_sd_hash(model.vision_projector)} "
-            f"vision_pos_embed={_sd_hash(model.vision_pos_embed)} "
+            f"[init-hash] text_projector={_module_sha256(model.text_projector)[:12]} "
+            f"vision_projector={_module_sha256(model.vision_projector)[:12]} "
+            f"vision_pos_embed={_module_sha256(model.vision_pos_embed)[:12]} "
             f"(shared_init_seed={model_args.shared_init_seed}; must match across branches)"
         )
     model.to(device)
@@ -657,6 +859,22 @@ def main() -> None:
         mixed_chunk_cr=args.compression_rate,
         mixed_max_chunks=args.max_vision_len,
     )
+    if is_master:
+        _save_mechanistic_probe(
+            dataset,
+            collate,
+            args.output_dir,
+            args.mechanistic_probe_samples,
+            {
+                "dataset_name": args.dataset_name,
+                "dataset_split": args.dataset_split,
+                "max_source_len": max_source_len,
+                "max_prompt_len": args.max_prompt_len,
+                "max_answer_len": args.max_answer_len,
+                "max_samples": args.max_samples,
+                "seed": args.seed,
+            },
+        )
 
     sampler = None
     if use_ddp:
@@ -863,6 +1081,7 @@ def main() -> None:
         last_mixer_contrib_cr: int = current_cr
         gate_grads_for_log = None
         mixer_layer_grad_norms_for_log = None
+        post_bottleneck_layer_grad_norms_for_log = None
 
         for local_step, batch_data in enumerate(loader, start=1):
             if local_epoch == start_epoch and local_step < start_batch:
@@ -952,8 +1171,13 @@ def main() -> None:
                                 _gates_for_grad.grad.detach().float().cpu().tolist()
                             )
                     _layers_for_grad = getattr(_core_for_grad, "mixer_layers", None)
+                    if (
+                        _layers_for_grad is None
+                        and getattr(_core_for_grad, "vision_encoder", None) is not None
+                    ):
+                        _layers_for_grad = _core_for_grad.vision_encoder.encoder.layer
                     if _layers_for_grad is not None:
-                        mixer_layer_grad_norms_for_log = []
+                        post_bottleneck_layer_grad_norms_for_log = []
                         for _layer in _layers_for_grad:
                             _norms = [
                                 torch.linalg.vector_norm(p.grad.detach(), dtype=torch.float32)
@@ -965,7 +1189,13 @@ def main() -> None:
                                 if _norms
                                 else torch.zeros((), device=device, dtype=torch.float32)
                             )
-                            mixer_layer_grad_norms_for_log.append(float(_layer_norm))
+                            post_bottleneck_layer_grad_norms_for_log.append(
+                                float(_layer_norm)
+                            )
+                        if getattr(_core_for_grad, "mixer_layers", None) is not None:
+                            mixer_layer_grad_norms_for_log = (
+                                post_bottleneck_layer_grad_norms_for_log
+                            )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 if global_step > warmup_steps and not args.disable_lr_schedule:
@@ -1010,7 +1240,7 @@ def main() -> None:
             curr_loss = loss.item() * grad_accum_steps
             running_avg_loss_value.update(curr_loss)
 
-            if is_master and global_step % args.log_interval == 0:
+            if is_master and sync_step and global_step % args.log_interval == 0:
                 rp = global_step / max(total_steps, 1) * 100
                 curr_lrs_str = " ' ".join(f"{lr:.10f}" for lr in curr_lrs)
                 gn = f"grad norm: {grad_norm:>6.3f} " if grad_norm > 0 else ""
@@ -1080,6 +1310,7 @@ def main() -> None:
                     trackio_run.log(metrics, step=global_step)
                 if mechanistic_writer is not None:
                     vision_mask_diag = out["vision_mask"].detach()
+                    vision_lens = vision_mask_diag.sum(dim=1)
                     real_slots = int(vision_mask_diag.sum().item())
                     total_slots = int(vision_mask_diag.numel())
                     source_lens = batch_cpu["source_attention_mask"].sum(dim=1)
@@ -1094,8 +1325,10 @@ def main() -> None:
                     mechanistic_writer.append(
                         {
                             "step": int(global_step),
+                            "optimizer_update": int(global_step - 1),
                             "epoch": int(local_epoch),
                             "local_batch": int(local_step),
+                            "batch_size": int(vision_mask_diag.size(0)),
                             "compression_rate": int(cr_used),
                             "active_depth": int(active_depth),
                             "loss": float(curr_loss),
@@ -1103,7 +1336,11 @@ def main() -> None:
                             "grad_norm_after_clip": float(grad_norm if grad_norm > 0 else 0.0),
                             "batch_hash": hashlib.sha256(hb.numpy().tobytes()).hexdigest(),
                             "source_len_mean": float(source_lens.float().mean()),
+                            "source_len_min": int(source_lens.min()),
+                            "source_len_max": int(source_lens.max()),
                             "vision_len_mean": float(real_slots / max(vision_mask_diag.size(0), 1)),
+                            "vision_len_min": int(vision_lens.min()),
+                            "vision_len_max": int(vision_lens.max()),
                             "latent_slots_total": total_slots,
                             "latent_slots_real": real_slots,
                             "latent_padding_fraction": float(
@@ -1121,10 +1358,14 @@ def main() -> None:
                                 else None
                             ),
                             "mixer_layer_grad_norms": mixer_layer_grad_norms_for_log,
+                            "post_bottleneck_layer_grad_norms": (
+                                post_bottleneck_layer_grad_norms_for_log
+                            ),
                         }
                     )
                     gate_grads_for_log = None
                     mixer_layer_grad_norms_for_log = None
+                    post_bottleneck_layer_grad_norms_for_log = None
                 if csv_writer is not None:
                     csv_writer.append(
                         step=global_step,

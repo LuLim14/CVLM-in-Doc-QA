@@ -1,6 +1,6 @@
+import math
 import os
 import random
-import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -725,6 +725,7 @@ class CVLM(torch.nn.Module):
         # It appends masked latent slots AFTER pooling so the real content is
         # unchanged while the unmasked ViT sees extra projected+positioned pads.
         self.synthetic_latent_pad_fraction = 0.0
+        self._last_synthetic_pad_slots = 0
         # Per-layer contribution ratios of the most recent mixer forward
         # (diagnostic; None when the mixer is disabled — nothing is computed).
         self._last_mixer_contrib = None
@@ -1013,43 +1014,41 @@ class CVLM(torch.nn.Module):
         synthetic_pad_fraction = float(
             getattr(self, "synthetic_latent_pad_fraction", 0.0) or 0.0
         )
+        self._last_synthetic_pad_slots = 0
         if synthetic_pad_fraction < 0.0:
             raise ValueError(
                 f"synthetic_latent_pad_fraction must be >= 0, got {synthetic_pad_fraction}"
             )
         if synthetic_pad_fraction > 0.0:
-            extra_slots = max(
+            requested_extra_slots = max(
                 int(math.ceil(pooled.size(1) * synthetic_pad_fraction)),
                 1,
             )
-            if pooled.size(1) + extra_slots > self.max_vision_len:
-                raise ValueError(
-                    "Synthetic latent padding exceeds max_vision_len: "
-                    f"{pooled.size(1)} + {extra_slots} > {self.max_vision_len}. "
-                    "Use a higher compression rate, smaller --pad_fractions, "
-                    "or larger --max_vision_len."
+            available_slots = max(self.max_vision_len - pooled.size(1), 0)
+            extra_slots = min(requested_extra_slots, available_slots)
+            self._last_synthetic_pad_slots = int(extra_slots)
+            if extra_slots > 0:
+                pooled = torch.cat(
+                    [
+                        pooled,
+                        pooled.new_zeros(
+                            pooled.size(0),
+                            extra_slots,
+                            pooled.size(2),
+                        ),
+                    ],
+                    dim=1,
                 )
-            pooled = torch.cat(
-                [
-                    pooled,
-                    pooled.new_zeros(
-                        pooled.size(0),
-                        extra_slots,
-                        pooled.size(2),
-                    ),
-                ],
-                dim=1,
-            )
-            vision_attention_mask = torch.cat(
-                [
-                    vision_attention_mask,
-                    vision_attention_mask.new_zeros(
-                        vision_attention_mask.size(0),
-                        extra_slots,
-                    ),
-                ],
-                dim=1,
-            )
+                vision_attention_mask = torch.cat(
+                    [
+                        vision_attention_mask,
+                        vision_attention_mask.new_zeros(
+                            vision_attention_mask.size(0),
+                            extra_slots,
+                        ),
+                    ],
+                    dim=1,
+                )
         # Exposed only for read-only forward hooks in the padding-contamination
         # diagnostic. Detached to avoid retaining the training graph.
         self._current_vision_attention_mask = vision_attention_mask.detach()

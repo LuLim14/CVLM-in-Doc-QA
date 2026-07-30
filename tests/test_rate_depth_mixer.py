@@ -11,7 +11,9 @@ Campaign boundary arms covered explicitly: the all-0 map (byte-for-byte
 identical to the no-ViT path) and the all-12 map (full-depth ANCHORED arm).
 """
 from collections import Counter
+import random
 
+import numpy as np
 import pytest
 import torch
 
@@ -333,6 +335,155 @@ def test_encode_vision_mixer_open_gates_diverge_from_novit(tiny_vit_layers):
         m.mixer_gates.fill_(0.5)
     out_mixer, _ = m._encode_vision(ids, mask)
     assert not torch.allclose(out_mixer, out_novit)
+
+
+# ---------------------------------------------------------------------------
+# Padding-safe ViT/mixer attention
+# ---------------------------------------------------------------------------
+
+
+def test_masked_vit_layer_matches_native_when_all_slots_valid(tiny_vit_layers):
+    from modeling import _vit_layer_forward_with_padding_mask
+
+    layer = tiny_vit_layers[0].eval()
+    torch.manual_seed(40)
+    x = torch.randn(2, 5, 32)
+    mask = torch.ones(2, 5, dtype=torch.long)
+    native = layer(x)
+    masked = _vit_layer_forward_with_padding_mask(layer, x, mask)
+    assert torch.allclose(native, masked, atol=1e-6, rtol=1e-6)
+
+
+def test_direct_without_final_layernorm_matches_open_mixer():
+    """The fixed12direct control must match the bare mixer stack at gates=1;
+    applying ViTModel.layernorm would reintroduce the original confound."""
+    from transformers import ViTConfig, ViTModel
+    from modeling import _mixer_forward
+
+    config = ViTConfig(
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        image_size=16,
+        patch_size=8,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    torch.manual_seed(401)
+    direct = ViTModel(config).eval()
+    torch.manual_seed(401)
+    anchored = ViTModel(config).eval()
+    x = torch.randn(2, 5, 32)
+    direct_no_final_norm = direct.encoder(x).last_hidden_state
+    mixer_open = _mixer_forward(
+        x,
+        anchored.encoder.layer,
+        torch.ones(2),
+        depth=2,
+    )
+    assert torch.equal(direct_no_final_norm, mixer_open)
+    assert not torch.allclose(direct.layernorm(direct_no_final_norm), mixer_open)
+
+
+def test_masked_vit_layer_is_invariant_to_appended_padding(tiny_vit_layers):
+    from modeling import _vit_layer_forward_with_padding_mask
+
+    layer = tiny_vit_layers[0].eval()
+    torch.manual_seed(41)
+    real = torch.randn(1, 3, 32)
+    padded = torch.cat([real, torch.randn(1, 4, 32) * 20], dim=1)
+    out_real = _vit_layer_forward_with_padding_mask(
+        layer, real, torch.ones(1, 3, dtype=torch.long)
+    )
+    out_padded = _vit_layer_forward_with_padding_mask(
+        layer,
+        padded,
+        torch.tensor([[1, 1, 1, 0, 0, 0, 0]], dtype=torch.long),
+    )
+    assert torch.allclose(out_real, out_padded[:, :3], atol=1e-6, rtol=1e-6)
+    # The native ViTLayer has no key-padding mask, so the same padded values
+    # contaminate real-token outputs.
+    assert not torch.allclose(layer(real), layer(padded)[:, :3], atol=1e-5, rtol=1e-5)
+
+
+def test_masked_mixer_is_invariant_to_appended_padding(tiny_vit_layers):
+    from modeling import _mixer_forward
+
+    for layer in tiny_vit_layers:
+        layer.eval()
+    torch.manual_seed(42)
+    real = torch.randn(1, 3, 32)
+    padded = torch.cat([real, torch.randn(1, 2, 32) * 10], dim=1)
+    gates = torch.tensor([0.2, -0.3, 0.4])
+    out_real = _mixer_forward(
+        real,
+        tiny_vit_layers,
+        gates,
+        depth=3,
+        valid_mask=torch.ones(1, 3, dtype=torch.long),
+        mask_padding=True,
+    )
+    out_padded = _mixer_forward(
+        padded,
+        tiny_vit_layers,
+        gates,
+        depth=3,
+        valid_mask=torch.tensor([[1, 1, 1, 0, 0]], dtype=torch.long),
+        mask_padding=True,
+    )
+    assert torch.allclose(out_real, out_padded[:, :3], atol=1e-6, rtol=1e-6)
+
+
+def test_encode_vision_synthetic_padding_intervention(tiny_vit_layers):
+    """Production diagnostic knob appends slots after pooling. Mask-safe mixing
+    leaves real outputs invariant; legacy unmasked mixing is contaminated."""
+    m = _build_stub_cvlm(tiny_vit_layers)
+    m.mixer_depth_map = {4: len(tiny_vit_layers)}
+    m.mask_vit_padding = True
+    with torch.no_grad():
+        m.mixer_gates.fill_(0.5)
+    m.eval()
+    torch.manual_seed(44)
+    ids = torch.randint(0, 50, (2, 16))
+    mask = torch.ones(2, 16, dtype=torch.long)
+
+    m.synthetic_latent_pad_fraction = 0.0
+    base, base_mask = m._encode_vision(ids, mask)
+    m.synthetic_latent_pad_fraction = 0.5
+    padded_safe, padded_mask = m._encode_vision(ids, mask)
+    real_width = base_mask.size(1)
+    assert padded_mask.size(1) > real_width
+    assert torch.allclose(base, padded_safe[:, :real_width], atol=1e-6, rtol=1e-6)
+
+    m.mask_vit_padding = False
+    padded_legacy, _ = m._encode_vision(ids, mask)
+    assert not torch.allclose(base, padded_legacy[:, :real_width], atol=1e-5, rtol=1e-5)
+
+
+def test_mixer_contribution_ignores_padding_slots():
+    from modeling import _mixer_forward
+
+    torch.manual_seed(43)
+    layer = torch.nn.Linear(4, 4, bias=True)
+    x = torch.randn(1, 5, 4)
+    x[:, 3:] *= 100
+    gate = torch.tensor([0.7])
+    mask = torch.tensor([[1, 1, 1, 0, 0]], dtype=torch.long)
+    _, contrib = _mixer_forward(
+        x,
+        [layer],
+        gate,
+        depth=1,
+        return_contrib=True,
+        valid_mask=mask,
+    )
+    delta = gate[0] * (layer(x) - x)
+    valid = mask.unsqueeze(-1)
+    expected = torch.linalg.vector_norm(delta * valid) / torch.linalg.vector_norm(x * valid)
+    whole = torch.linalg.vector_norm(delta) / torch.linalg.vector_norm(x)
+    assert torch.allclose(contrib[0], expected, atol=1e-6)
+    assert not torch.allclose(contrib[0], whole, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -788,8 +939,10 @@ def test_load_cvlm_checkpoint_raises_on_group_mismatch(tmp_path):
     m2 = _GatedStub()
     opt_ok = torch.optim.AdamW([{"params": [p for p in m2.parameters() if p.requires_grad], "lr": 1e-4}])
     sch_ok = CosineAnnealingLR(opt_ok, T_max=10)
-    nxt, gstep = load_cvlm_checkpoint(model_path, trainer_path, m2, opt_ok, sch_ok, torch.device("cpu"))
-    assert (nxt, gstep) == (2, 5)
+    nxt, gstep, next_batch = load_cvlm_checkpoint(
+        model_path, trainer_path, m2, opt_ok, sch_ok, torch.device("cpu")
+    )
+    assert (nxt, gstep, next_batch) == (2, 5, 1)
 
     # Split layout must fail loudly.
     m3 = _GatedStub()
@@ -803,6 +956,88 @@ def test_load_cvlm_checkpoint_raises_on_group_mismatch(tmp_path):
     with pytest.raises(RuntimeError) as exc:
         load_cvlm_checkpoint(model_path, trainer_path, m3, opt_bad, sch_bad, torch.device("cpu"))
     assert "gate_lr_mult" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Exact mid-epoch resume
+# ---------------------------------------------------------------------------
+
+
+def test_epoch_random_sampler_recreates_epoch_and_resume_suffix():
+    from train_cvlm import EpochRandomSampler
+
+    data = list(range(31))
+    a = EpochRandomSampler(data, seed=123)
+    b = EpochRandomSampler(data, seed=123)
+    a.set_epoch(4)
+    b.set_epoch(4)
+    seq = list(a)
+    assert seq == list(b)
+    assert sorted(seq) == data
+    assert list(EpochRandomSampler(data, seed=124)) != seq
+    # A resumed iterator recreates the same epoch; skipping the consumed prefix
+    # yields exactly the uninterrupted suffix.
+    b.set_epoch(4)
+    assert list(b)[11:] == seq[11:]
+
+
+@pytest.mark.parametrize(
+    "epoch,step,n_batches,expected",
+    [
+        (2, 1, 10, (2, 2)),
+        (2, 9, 10, (2, 10)),
+        (2, 10, 10, (3, 1)),
+    ],
+)
+def test_next_resume_position(epoch, step, n_batches, expected):
+    from train_cvlm import _next_resume_position
+
+    assert _next_resume_position(epoch, step, n_batches) == expected
+
+
+def test_checkpoint_restores_batch_position_and_rng(tmp_path):
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+
+    from train_utils import load_cvlm_checkpoint, save_cvlm_checkpoint
+
+    random.seed(51)
+    np.random.seed(52)
+    torch.manual_seed(53)
+    model = _GatedStub()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=10)
+    save_cvlm_checkpoint(
+        str(tmp_path),
+        model,
+        optimizer,
+        scheduler,
+        next_start_epoch=3,
+        next_start_batch=17,
+        global_step=99,
+        is_master=True,
+    )
+    expected = (random.random(), float(np.random.rand()), torch.rand(4))
+    for _ in range(5):
+        random.random()
+        np.random.rand()
+        torch.rand(4)
+
+    model2 = _GatedStub()
+    optimizer2 = torch.optim.AdamW(model2.parameters(), lr=1e-4)
+    scheduler2 = CosineAnnealingLR(optimizer2, T_max=10)
+    epoch, step, batch = load_cvlm_checkpoint(
+        str(tmp_path / "model_step_99.safetensors"),
+        str(tmp_path / "trainer_step_99.pt"),
+        model2,
+        optimizer2,
+        scheduler2,
+        torch.device("cpu"),
+    )
+    actual = (random.random(), float(np.random.rand()), torch.rand(4))
+    assert (epoch, step, batch) == (3, 99, 17)
+    assert actual[0] == expected[0]
+    assert actual[1] == expected[1]
+    assert torch.equal(actual[2], expected[2])
 
 
 # ---------------------------------------------------------------------------

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import random
 import re
 from typing import Any, Dict, Optional, Set, Tuple
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from safetensors.torch import load_file, save_file
@@ -108,6 +110,7 @@ def save_cvlm_checkpoint(
     next_start_epoch: int,
     global_step: int,
     is_master: bool,
+    next_start_batch: int = 1,
 ) -> None:
     if not is_master:
         return
@@ -121,7 +124,14 @@ def save_cvlm_checkpoint(
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "next_start_epoch": next_start_epoch,
+            "next_start_batch": int(next_start_batch),
             "global_step": global_step,
+            "rng_state": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch_cpu": torch.get_rng_state(),
+                "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            },
         },
         trainer_path,
     )
@@ -193,8 +203,13 @@ def load_cvlm_checkpoint(
     optimizer: Optimizer,
     scheduler: Any,
     device: torch.device,
-) -> Tuple[int, int]:
-    """Load weights and trainer state. Returns (local_epoch, global_step) from checkpoint."""
+) -> Tuple[int, int, int]:
+    """Load weights/trainer/RNG state.
+
+    Returns ``(local_epoch, global_step, next_start_batch)``. New checkpoints
+    resume at the exact next DataLoader batch; legacy checkpoints without the
+    batch field fall back to batch 1 of their recorded epoch.
+    """
     state = load_file(model_path)
     # strict=False because the checkpoint only contains trainable params;
     # frozen sub-modules (decoder, text_encoder) were re-loaded from HF at init.
@@ -208,9 +223,22 @@ def load_cvlm_checkpoint(
     check_optimizer_groups_match(optimizer, payload["optimizer"], trainer_path)
     optimizer.load_state_dict(payload["optimizer"])
     scheduler.load_state_dict(payload["scheduler"])
+    rng_state = payload.get("rng_state")
+    if rng_state:
+        random.setstate(rng_state["python"])
+        np.random.set_state(rng_state["numpy"])
+        torch.set_rng_state(rng_state["torch_cpu"])
+        cuda_state = rng_state.get("torch_cuda")
+        if cuda_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(cuda_state)
     gstep = int(payload["global_step"])
     if "next_start_epoch" in payload:
         nxt = int(payload["next_start_epoch"])
     else:
         nxt = int(payload.get("local_epoch", 0)) + 1
-    return nxt, gstep
+    next_batch = int(payload.get("next_start_batch", 1))
+    if next_batch < 1:
+        raise RuntimeError(
+            f"Invalid next_start_batch={next_batch} in checkpoint {trainer_path}; expected >= 1"
+        )
+    return nxt, gstep, next_batch

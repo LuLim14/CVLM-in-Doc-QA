@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
 from cvlm_dataset import CvlmTrainDataset, make_collate_fn
@@ -178,6 +178,39 @@ class MixedCrSampler:
         return self._seq[step - 1]
 
 
+class EpochRandomSampler(Sampler[int]):
+    """Deterministic single-process shuffle with explicit epoch control.
+
+    Unlike DataLoader(shuffle=True), the permutation is a pure function of
+    ``seed + epoch``. A resumed run can therefore recreate the current epoch
+    and skip exactly the batches already consumed without serialising an opaque
+    RandomSampler generator state.
+    """
+
+    def __init__(self, data_source, seed: int) -> None:
+        self.data_source = data_source
+        self.seed = int(seed)
+        self.epoch = 1
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        yield from torch.randperm(len(self.data_source), generator=generator).tolist()
+
+    def __len__(self) -> int:
+        return len(self.data_source)
+
+
+def _next_resume_position(local_epoch: int, local_step: int, loader_len: int) -> Tuple[int, int]:
+    """Epoch/batch coordinates of the next batch after ``local_step``."""
+    if local_step >= loader_len:
+        return int(local_epoch) + 1, 1
+    return int(local_epoch), int(local_step) + 1
+
+
 def _active_cr(schedule: List[Tuple[int, int]], step: int) -> int:
     """Return the cr for the bucket containing `step`.
 
@@ -254,6 +287,23 @@ def parse_args() -> argparse.Namespace:
         "current compression rate (exact key; else nearest lower key; else smallest key). Incompatible "
         "with --no_vit / --freeze_vit / --vit_init random. Must also be passed to eval. "
         "Empty (default) = legacy ViT branching. Env: MIXER_DEPTH_MAP.",
+    )
+    p.add_argument(
+        "--mask_vit_padding",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("MASK_VIT_PADDING", "0") == "1",
+        help="Apply vision_attention_mask inside every ViT/mixer self-attention layer. "
+        "Enable for new controlled experiments; keep disabled only to reproduce legacy "
+        "checkpoints that mixed real latents with batch padding. Must match eval. "
+        "Env: MASK_VIT_PADDING.",
+    )
+    p.add_argument(
+        "--vit_apply_final_layernorm",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("VIT_APPLY_FINAL_LAYERNORM", "1") == "1",
+        help="Apply the plain ViT encoder's final LayerNorm. Set false for the fixed-depth "
+        "direct control compared with the bare mixer layer stack. Must match eval. "
+        "Env: VIT_APPLY_FINAL_LAYERNORM.",
     )
     p.add_argument(
         "--gate_lr_mult",
@@ -494,6 +544,8 @@ def main() -> None:
     model_args.vit_freeze = bool(args.freeze_vit)
     model_args.vit_skip = bool(args.no_vit)
     model_args.mixer_depth_map = str(args.mixer_depth_map or "")
+    model_args.mask_vit_padding = bool(args.mask_vit_padding)
+    model_args.vit_apply_final_layernorm = bool(args.vit_apply_final_layernorm)
     # Bit-identical shared-module init across ablation branches (see ModelArguments).
     model_args.shared_init_seed = int(args.seed) + 10000
 
@@ -606,23 +658,30 @@ def main() -> None:
         mixed_max_chunks=args.max_vision_len,
     )
 
-    sampler: Optional[DistributedSampler] = None
+    sampler = None
     if use_ddp:
-        sampler = DistributedSampler(dataset, shuffle=True, drop_last=False)
+        sampler = DistributedSampler(
+            dataset,
+            shuffle=True,
+            drop_last=False,
+            seed=int(args.seed) + 20000,
+        )
+    else:
+        sampler = EpochRandomSampler(dataset, seed=int(args.seed) + 20000)
 
-    # Dedicated generator: batch order must not depend on how much global RNG
-    # the model construction consumed (it differs across ablation branches).
+    # Dedicated generator for DataLoader internals. Sample order itself comes
+    # from the explicit epoch-addressable sampler above.
     loader_gen = torch.Generator()
-    loader_gen.manual_seed(int(args.seed) + 20000)
+    loader_gen.manual_seed(int(args.seed) + 21000)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=sampler is None,
+        shuffle=False,
         sampler=sampler,
         num_workers=0,
         collate_fn=collate,
         drop_last=False,
-        generator=loader_gen if sampler is None else None,
+        generator=loader_gen,
     )
 
     if use_ddp:
@@ -668,6 +727,7 @@ def main() -> None:
     lr_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.min_lr)
 
     start_epoch = 1
+    start_batch = 1
     global_step = 1
     resume_from_dir = args.resume_dir.strip()
     if resume_from_dir:
@@ -677,11 +737,21 @@ def main() -> None:
         if found is None:
             raise FileNotFoundError(f"No model_step_*.safetensors + trainer_step_*.pt pair in {resume_from_dir}")
         mp, tp, _ = found
-        start_epoch, global_step = load_cvlm_checkpoint(mp, tp, model, optimizer, lr_scheduler, device)
+        start_epoch, global_step, start_batch = load_cvlm_checkpoint(
+            mp,
+            tp,
+            model,
+            optimizer,
+            lr_scheduler,
+            device,
+        )
         if use_ddp:
             dist.barrier()
         if is_master:
-            print(f"Resumed from {resume_from_dir} next_start_epoch={start_epoch} global_step={global_step}")
+            print(
+                f"Resumed from {resume_from_dir} next_start_epoch={start_epoch} "
+                f"next_start_batch={start_batch} global_step={global_step}"
+            )
 
     if mixed_cr_sampler is not None:
         # cr for the upcoming optimizer step, set BEFORE its first micro-batch.
@@ -711,8 +781,9 @@ def main() -> None:
     trackio_run = None
     csv_writer = None
     plotter = None
+    mechanistic_writer = None
     if is_master:
-        from train_logging import TrackioRun, make_logger
+        from train_logging import MechanisticJsonlWriter, TrackioRun, make_logger
 
         run_name = args.trackio_run_name.strip() or os.path.basename(args.output_dir.rstrip("/"))
         config_payload = {
@@ -729,6 +800,8 @@ def main() -> None:
             "vit_freeze": bool(model_args.vit_freeze),
             "vit_skip": bool(model_args.vit_skip),
             "mixer_depth_map": model_args.mixer_depth_map,
+            "mask_vit_padding": bool(model_args.mask_vit_padding),
+            "vit_apply_final_layernorm": bool(model_args.vit_apply_final_layernorm),
             "gate_lr_mult": float(args.gate_lr_mult),
             "mixed_cr_set": str(args.mixed_cr_set or ""),
             "max_source_len": args.max_source_len,
@@ -747,6 +820,9 @@ def main() -> None:
             disable=args.trackio_disable,
         )
         csv_writer, plotter = make_logger(args.output_dir, args.csv_path, args.plot_interval)
+        mechanistic_writer = MechanisticJsonlWriter(
+            os.path.join(args.output_dir, "mechanistic.jsonl")
+        )
 
     model.train()
     # Frozen sub-modules must stay in eval mode (no dropout noise on frozen weights).
@@ -785,8 +861,14 @@ def main() -> None:
         # were measured at (the vector length == the mixer depth for that cr).
         last_mixer_contrib: Optional[torch.Tensor] = None
         last_mixer_contrib_cr: int = current_cr
+        gate_grads_for_log = None
+        mixer_layer_grad_norms_for_log = None
 
         for local_step, batch_data in enumerate(loader, start=1):
+            if local_epoch == start_epoch and local_step < start_batch:
+                # Recreate the deterministic epoch permutation and consume
+                # already-finished batches without touching model/global RNG.
+                continue
             data_time = time.perf_counter() - t0
             batch_cpu = batch_data
             if is_master and not batch_hash_logged:
@@ -797,6 +879,9 @@ def main() -> None:
                 print(f"[batch-hash] step={global_step} hash={hashlib.sha256(hb.numpy().tobytes()).hexdigest()}")
                 batch_hash_logged = True
             batch_data = move_batch(batch_cpu, device, dtype)
+            # Pin the rate that THIS forward/update uses. `current_cr` is
+            # advanced to the next optimizer step inside the sync branch.
+            cr_used = int(current_cr)
 
             # LR schedule: warmup (if any) uses linear on global_step, else read
             # current group LR. The scheduler itself is stepped *after*
@@ -838,7 +923,7 @@ def main() -> None:
                 # Pin the cr THIS forward ran at: `current_cr` is advanced to the
                 # next step's value inside the sync branch below, so the cr shown
                 # on a log line can otherwise be one step ahead of the ratios.
-                last_mixer_contrib_cr = current_cr
+                last_mixer_contrib_cr = cr_used
             loss = loss / grad_accum_steps
 
             sync_step = local_step % grad_accum_steps == 0 or local_step == len(loader)
@@ -853,6 +938,34 @@ def main() -> None:
                 if grad_clip > 0.0:
                     params = unwrap_model(model).parameters()
                     grad_norm = float(torch.nn.utils.clip_grad_norm_(params, grad_clip))
+                # Capture gradients BEFORE optimizer.step()/zero_grad so the
+                # mechanistic JSONL can show when gates/layers begin learning.
+                diag_due = is_master and (global_step + 1) % args.log_interval == 0
+                if diag_due:
+                    _core_for_grad = unwrap_model(model)
+                    _gates_for_grad = getattr(_core_for_grad, "mixer_gates", None)
+                    if _gates_for_grad is not None:
+                        if _gates_for_grad.grad is None:
+                            gate_grads_for_log = [0.0] * int(_gates_for_grad.numel())
+                        else:
+                            gate_grads_for_log = (
+                                _gates_for_grad.grad.detach().float().cpu().tolist()
+                            )
+                    _layers_for_grad = getattr(_core_for_grad, "mixer_layers", None)
+                    if _layers_for_grad is not None:
+                        mixer_layer_grad_norms_for_log = []
+                        for _layer in _layers_for_grad:
+                            _norms = [
+                                torch.linalg.vector_norm(p.grad.detach(), dtype=torch.float32)
+                                for p in _layer.parameters()
+                                if p.grad is not None
+                            ]
+                            _layer_norm = (
+                                torch.linalg.vector_norm(torch.stack(_norms))
+                                if _norms
+                                else torch.zeros((), device=device, dtype=torch.float32)
+                            )
+                            mixer_layer_grad_norms_for_log.append(float(_layer_norm))
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 if global_step > warmup_steps and not args.disable_lr_schedule:
@@ -864,14 +977,20 @@ def main() -> None:
                         unwrap_model(model).set_compression_rate(cr_now)
                         if is_master:
                             print(f"[step {global_step}] cr {current_cr} -> {cr_now}")
+                            next_epoch, next_batch = _next_resume_position(
+                                local_epoch,
+                                local_step,
+                                len(loader),
+                            )
                             save_cvlm_checkpoint(
                                 args.output_dir,
                                 model,
                                 optimizer,
                                 lr_scheduler,
-                                next_start_epoch=local_epoch,
+                                next_start_epoch=next_epoch,
                                 global_step=global_step,
                                 is_master=True,
+                                next_start_batch=next_batch,
                             )
                         current_cr = cr_now
                 elif mixed_cr_sampler is not None:
@@ -883,7 +1002,7 @@ def main() -> None:
                         unwrap_model(model).set_compression_rate(cr_next)
                     current_cr = cr_next
                 if trackio_run is not None and is_master:
-                    trackio_run.log({"train/compression_rate": float(current_cr)}, step=global_step)
+                    trackio_run.log({"train/compression_rate": float(cr_used)}, step=global_step)
 
             t1 = time.perf_counter()
             batch_time = t1 - t0
@@ -900,7 +1019,7 @@ def main() -> None:
                     if args.mixed_fidelity_p > 0
                     else ""
                 )
-                crs = f"cr: {current_cr} " if mixed_cr_sampler is not None else ""
+                crs = f"cr: {cr_used} " if mixed_cr_sampler is not None else ""
                 print(
                     f"epoch: {local_epoch} step: {global_step} ({total_steps}) | {rp:5.2f}% ",
                     f"lr: {curr_lrs_str} loss: {curr_loss:>6.3f} ({running_avg_loss_value.avg:>6.3f}) ",
@@ -912,9 +1031,11 @@ def main() -> None:
                 # RATE-DEPTH MIXER ablation telemetry: gate values show how much
                 # of each ViTLayer the model actually uses.
                 mixer_gates_now = None
+                mixer_gates_full = None
                 _core = unwrap_model(model)
                 if getattr(_core, "mixer_gates", None) is not None:
-                    mixer_gates_now = [round(float(g), 4) for g in _core.mixer_gates.detach().float().cpu().tolist()]
+                    mixer_gates_full = _core.mixer_gates.detach().float().cpu().tolist()
+                    mixer_gates_now = [round(float(g), 4) for g in mixer_gates_full]
                     print(f"    mixer_gates={mixer_gates_now}")
                 # CONTRIBUTION RATIO: ||g_i*(Layer_i(h)-h)||_F / ||h||_F per
                 # applied layer (see modeling._mixer_forward). Unlike the raw
@@ -957,6 +1078,53 @@ def main() -> None:
                         for ci, cv in enumerate(mixer_contrib_now):
                             metrics[f"train/mixer_contrib_{ci:02d}"] = cv
                     trackio_run.log(metrics, step=global_step)
+                if mechanistic_writer is not None:
+                    vision_mask_diag = out["vision_mask"].detach()
+                    real_slots = int(vision_mask_diag.sum().item())
+                    total_slots = int(vision_mask_diag.numel())
+                    source_lens = batch_cpu["source_attention_mask"].sum(dim=1)
+                    n_h = min(8, batch_cpu["source_ids"].size(0))
+                    hb = batch_cpu["source_ids"][:n_h].detach().to(torch.long).contiguous()
+                    if getattr(_core, "mixer_depth_map", None) is not None:
+                        active_depth = int(_core._mixer_depth_for(cr_used))
+                    elif getattr(_core, "vision_encoder", None) is not None:
+                        active_depth = len(_core.vision_encoder.encoder.layer)
+                    else:
+                        active_depth = 0
+                    mechanistic_writer.append(
+                        {
+                            "step": int(global_step),
+                            "epoch": int(local_epoch),
+                            "local_batch": int(local_step),
+                            "compression_rate": int(cr_used),
+                            "active_depth": int(active_depth),
+                            "loss": float(curr_loss),
+                            "loss_avg": float(running_avg_loss_value.avg),
+                            "grad_norm_after_clip": float(grad_norm if grad_norm > 0 else 0.0),
+                            "batch_hash": hashlib.sha256(hb.numpy().tobytes()).hexdigest(),
+                            "source_len_mean": float(source_lens.float().mean()),
+                            "vision_len_mean": float(real_slots / max(vision_mask_diag.size(0), 1)),
+                            "latent_slots_total": total_slots,
+                            "latent_slots_real": real_slots,
+                            "latent_padding_fraction": float(
+                                (total_slots - real_slots) / max(total_slots, 1)
+                            ),
+                            "mask_vit_padding": bool(model_args.mask_vit_padding),
+                            "vit_apply_final_layernorm": bool(
+                                model_args.vit_apply_final_layernorm
+                            ),
+                            "mixer_gates": mixer_gates_full,
+                            "mixer_gate_grads": gate_grads_for_log,
+                            "mixer_contrib": (
+                                last_mixer_contrib.detach().float().cpu().tolist()
+                                if last_mixer_contrib is not None
+                                else None
+                            ),
+                            "mixer_layer_grad_norms": mixer_layer_grad_norms_for_log,
+                        }
+                    )
+                    gate_grads_for_log = None
+                    mixer_layer_grad_norms_for_log = None
                 if csv_writer is not None:
                     csv_writer.append(
                         step=global_step,
@@ -978,14 +1146,20 @@ def main() -> None:
 
             if is_master and args.save_interval_steps > 0 and global_step % args.save_interval_steps == 0 and sync_step:
                 if global_step != pgs:
+                    next_epoch, next_batch = _next_resume_position(
+                        local_epoch,
+                        local_step,
+                        len(loader),
+                    )
                     save_cvlm_checkpoint(
                         args.output_dir,
                         model,
                         optimizer,
                         lr_scheduler,
-                        next_start_epoch=local_epoch,
+                        next_start_epoch=next_epoch,
                         global_step=global_step,
                         is_master=True,
+                        next_start_batch=next_batch,
                     )
                     pgs = global_step
 
@@ -1004,6 +1178,7 @@ def main() -> None:
                     next_start_epoch=local_epoch + 1,
                     global_step=global_step,
                     is_master=True,
+                    next_start_batch=1,
                 )
                 pgs = global_step
 
@@ -1016,6 +1191,7 @@ def main() -> None:
             next_start_epoch=args.epochs + 1,
             global_step=global_step,
             is_master=True,
+            next_start_batch=1,
         )
 
     if is_master:
@@ -1030,6 +1206,8 @@ def main() -> None:
         trackio_run.finish()
     if csv_writer is not None:
         csv_writer.close()
+    if mechanistic_writer is not None:
+        mechanistic_writer.close()
     if plotter is not None:
         plotter.refresh()
 

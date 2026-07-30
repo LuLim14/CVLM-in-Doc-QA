@@ -176,6 +176,20 @@ def parse_args() -> argparse.Namespace:
         "uses the cr=16 depth). Env: MIXER_DEPTH_MAP.",
     )
     p.add_argument(
+        "--mask_vit_padding",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("MASK_VIT_PADDING", "0") == "1",
+        help="Must match training. If true, real latent queries cannot attend to padded "
+        "latent slots inside ViT/mixer self-attention. Env: MASK_VIT_PADDING.",
+    )
+    p.add_argument(
+        "--vit_apply_final_layernorm",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("VIT_APPLY_FINAL_LAYERNORM", "1") == "1",
+        help="Must match training. Apply the plain ViT encoder's final LayerNorm. "
+        "Env: VIT_APPLY_FINAL_LAYERNORM.",
+    )
+    p.add_argument(
         "--force_zero_gates",
         action="store_true",
         default=os.environ.get("FORCE_ZERO_GATES", "0") == "1",
@@ -1126,6 +1140,8 @@ def main() -> None:
     model_args.vit_freeze = bool(args.freeze_vit)
     model_args.vit_skip = bool(args.no_vit)
     model_args.mixer_depth_map = str(args.mixer_depth_map or "")
+    model_args.mask_vit_padding = bool(args.mask_vit_padding)
+    model_args.vit_apply_final_layernorm = bool(args.vit_apply_final_layernorm)
 
     training_args = TrainingArguments(output_dir="/tmp/eval_cvlm_dummy")
     training_args.bf16 = bool(use_bf16)
@@ -1284,6 +1300,8 @@ def main() -> None:
             "global_step": int(args.global_step),
             "all_checkpoints": bool(args.all_checkpoints),
             "mixer_depth_map": str(args.mixer_depth_map or ""),
+            "mask_vit_padding": bool(args.mask_vit_padding),
+            "vit_apply_final_layernorm": bool(args.vit_apply_final_layernorm),
             "force_zero_gates": bool(args.force_zero_gates),
         }
         run = TrackioRun(
@@ -1471,6 +1489,8 @@ def main() -> None:
             "doc_selection_file": args.doc_selection_file,
             "oracle_hit_rate": oracle_hit_rate,
             "mixer_depth_map": str(args.mixer_depth_map or ""),
+            "mask_vit_padding": bool(args.mask_vit_padding),
+            "vit_apply_final_layernorm": bool(args.vit_apply_final_layernorm),
             "force_zero_gates": bool(args.force_zero_gates),
         }
         last_results = results

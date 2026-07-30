@@ -1,5 +1,6 @@
 import os
 import random
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -715,6 +716,15 @@ class CVLM(torch.nn.Module):
         self.mixer_layers = None
         self.mixer_gates = None
         self._mixer_grad_ckpt = False
+        self._masked_vit_grad_ckpt = False
+        self.mask_vit_padding = bool(getattr(model_args, "mask_vit_padding", False))
+        self.vit_apply_final_layernorm = bool(
+            getattr(model_args, "vit_apply_final_layernorm", True)
+        )
+        # Diagnostic-only knob used by tools/measure_padding_contamination.py.
+        # It appends masked latent slots AFTER pooling so the real content is
+        # unchanged while the unmasked ViT sees extra projected+positioned pads.
+        self.synthetic_latent_pad_fraction = 0.0
         # Per-layer contribution ratios of the most recent mixer forward
         # (diagnostic; None when the mixer is disabled — nothing is computed).
         self._last_mixer_contrib = None
@@ -749,7 +759,8 @@ class CVLM(torch.nn.Module):
             print(
                 f"[modeling] RATE-DEPTH MIXER enabled: depth_map={self.mixer_depth_map} "
                 f"layers={len(self.mixer_layers)} params={n_mixer} "
-                f"(zero-gated; depth 0 == no-ViT path byte-for-byte)"
+                f"(zero-gated; depth 0 == no-ViT path byte-for-byte; "
+                f"mask_vit_padding={self.mask_vit_padding})"
             )
         elif getattr(model_args, "vit_skip", False):
             # no-ViT ablation: keep projector/pos_embed geometry via the ViT config,
@@ -761,13 +772,25 @@ class CVLM(torch.nn.Module):
             vit_cfg = AutoConfig.from_pretrained(model_args.vision_encoder_name)
             self.vision_encoder = ViTModel(vit_cfg)
             vit_hidden = self.vision_encoder.config.hidden_size
-            print(f"[modeling] vit_init=random: ViT built from config ({model_args.vision_encoder_name}), no pretrained weights")
+            print(
+                f"[modeling] vit_init=random: ViT built from config "
+                f"({model_args.vision_encoder_name}), no pretrained weights; "
+                f"mask_vit_padding={self.mask_vit_padding}; "
+                f"final_layernorm={self.vit_apply_final_layernorm}"
+            )
         else:
             self.vision_encoder = ViTModel.from_pretrained(
                 model_args.vision_encoder_name,
                 use_safetensors=True,
             )
             vit_hidden = self.vision_encoder.config.hidden_size
+            print(
+                f"[modeling] vit_init=pretrained: mask_vit_padding={self.mask_vit_padding}; "
+                f"final_layernorm={self.vit_apply_final_layernorm}"
+            )
+        if self.vision_encoder is not None and not self.vit_apply_final_layernorm:
+            for parameter in self.vision_encoder.layernorm.parameters():
+                parameter.requires_grad = False
         if shared_seed:
             # CRITICAL for ablation fairness: the three ViT paths above consume
             # different amounts of global RNG. Re-seed so every shared module
@@ -928,6 +951,11 @@ class CVLM(torch.nn.Module):
                 self.vision_encoder.gradient_checkpointing_enable(
                     gradient_checkpointing_kwargs={"use_reentrant": False},
                 )
+                if self.mask_vit_padding:
+                    # The mask-safe path bypasses ViTEncoder.forward and walks
+                    # its layer stack directly, so checkpoint those layers in
+                    # our custom loop instead of relying on the HF wrapper.
+                    self._masked_vit_grad_ckpt = True
                 msg += " + vision_encoder"
             if self.mixer_layers is not None:
                 # Mixer layers are a bare ModuleList (no HF PreTrainedModel
@@ -982,6 +1010,50 @@ class CVLM(torch.nn.Module):
             pool_queries=self.pool_queries,
         )  # [B, V_max, H_enc], [B, V_max]
 
+        synthetic_pad_fraction = float(
+            getattr(self, "synthetic_latent_pad_fraction", 0.0) or 0.0
+        )
+        if synthetic_pad_fraction < 0.0:
+            raise ValueError(
+                f"synthetic_latent_pad_fraction must be >= 0, got {synthetic_pad_fraction}"
+            )
+        if synthetic_pad_fraction > 0.0:
+            extra_slots = max(
+                int(math.ceil(pooled.size(1) * synthetic_pad_fraction)),
+                1,
+            )
+            if pooled.size(1) + extra_slots > self.max_vision_len:
+                raise ValueError(
+                    "Synthetic latent padding exceeds max_vision_len: "
+                    f"{pooled.size(1)} + {extra_slots} > {self.max_vision_len}. "
+                    "Use a higher compression rate, smaller --pad_fractions, "
+                    "or larger --max_vision_len."
+                )
+            pooled = torch.cat(
+                [
+                    pooled,
+                    pooled.new_zeros(
+                        pooled.size(0),
+                        extra_slots,
+                        pooled.size(2),
+                    ),
+                ],
+                dim=1,
+            )
+            vision_attention_mask = torch.cat(
+                [
+                    vision_attention_mask,
+                    vision_attention_mask.new_zeros(
+                        vision_attention_mask.size(0),
+                        extra_slots,
+                    ),
+                ],
+                dim=1,
+            )
+        # Exposed only for read-only forward hooks in the padding-contamination
+        # diagnostic. Detached to avoid retaining the training graph.
+        self._current_vision_attention_mask = vision_attention_mask.detach()
+
         vit_input = self.text_projector(pooled)  # [B, V_max, vit_dim]
         V = vit_input.size(1)
         if V > self.max_vision_len:
@@ -1004,6 +1076,8 @@ class CVLM(torch.nn.Module):
                 depth,
                 use_checkpoint=self._mixer_grad_ckpt and self.training and torch.is_grad_enabled(),
                 return_contrib=True,
+                valid_mask=vision_attention_mask,
+                mask_padding=bool(getattr(self, "mask_vit_padding", False)),
             )
             # Diagnostic only (detached, no graph): stashed for forward() to
             # surface. Kept as a device tensor so no CUDA sync happens here —
@@ -1013,8 +1087,21 @@ class CVLM(torch.nn.Module):
             # no-ViT ablation: identical pipeline minus the ViT block itself.
             vit_output = vit_input
         else:
-            vit_output = self.vision_encoder.encoder(vit_input).last_hidden_state  # [B, V, vit_dim]
-            vit_output = self.vision_encoder.layernorm(vit_output)
+            if bool(getattr(self, "mask_vit_padding", False)):
+                vit_output = _vit_encoder_forward_with_padding_mask(
+                    self.vision_encoder.encoder.layer,
+                    vit_input,
+                    vision_attention_mask,
+                    use_checkpoint=(
+                        self._masked_vit_grad_ckpt
+                        and self.training
+                        and torch.is_grad_enabled()
+                    ),
+                )
+            else:
+                vit_output = self.vision_encoder.encoder(vit_input).last_hidden_state
+            if bool(getattr(self, "vit_apply_final_layernorm", True)):
+                vit_output = self.vision_encoder.layernorm(vit_output)
         return self.vision_projector(vit_output), vision_attention_mask  # [B, V, llm_dim], [B, V]
 
     def forward(

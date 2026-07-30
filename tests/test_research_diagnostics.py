@@ -1,6 +1,8 @@
 import json
 import random
+from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -83,7 +85,7 @@ def test_padding_attention_collector_observes_native_pad_mass():
             )
 
     model = Stub()
-    collector = PaddingAttentionCollector(model)
+    collector = PaddingAttentionCollector(model, max_batches=1, query_chunk=2)
     hidden = torch.randn(1, 5, 32)
     native = layer(hidden)
     measured = collector.means(mask_safe=False)
@@ -91,5 +93,145 @@ def test_padding_attention_collector_observes_native_pad_mass():
     assert native.shape == hidden.shape
     assert measured[0] is not None
     assert 0.0 < measured[0] < 1.0
+    attention = layer.attention.attention
+    normalized = layer.layernorm_before(hidden)
+    heads = attention.num_attention_heads
+    head_dim = attention.attention_head_size
+    shape = (1, -1, heads, head_dim)
+    query = attention.query(normalized).view(*shape).transpose(1, 2)
+    key = attention.key(normalized).view(*shape).transpose(1, 2)
+    scaling = float(getattr(attention, "scaling", head_dim**-0.5))
+    probabilities = torch.softmax(
+        torch.matmul(query, key.transpose(-1, -2)) * scaling,
+        dim=-1,
+        dtype=torch.float32,
+    )
+    expected = probabilities[:, :, :3, 3:].sum(dim=-1).mean()
+    assert abs(measured[0] - float(expected.detach())) < 1e-7
+
+    # max_batches=1 means a second forward does not silently reweight the
+    # diagnostic toward whichever condition happens to have more batches.
+    layer(torch.randn_like(hidden))
+    assert collector.means(mask_safe=False) == measured
     assert collector.means(mask_safe=True) == [0.0]
     collector.close()
+
+
+def test_initialization_artifacts_are_exact_and_resume_checked(tmp_path):
+    from safetensors.torch import load_file
+
+    from train_cvlm import _write_or_verify_initialization_artifacts
+
+    class TinyCompressionPath(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.text_projector = torch.nn.Linear(4, 4)
+            self.vision_projector = torch.nn.Linear(4, 4)
+            self.vision_pos_embed = torch.nn.Embedding(8, 4)
+            self.pool_queries = torch.nn.Parameter(torch.zeros(2, 4))
+            self.mixer_layers = torch.nn.ModuleList([torch.nn.Linear(4, 4)])
+            self.mixer_gates = torch.nn.Parameter(torch.zeros(1))
+            self.vision_encoder = None
+            config = SimpleNamespace(_commit_hash="fixed-revision")
+            self.decoder = SimpleNamespace(config=config)
+            self.text_encoder = SimpleNamespace(config=config)
+            self.model_args = SimpleNamespace(
+                model_name_or_path="decoder",
+                text_encoder_name="encoder",
+                vision_encoder_name="vision",
+            )
+
+    args = SimpleNamespace(
+        output_dir=str(tmp_path),
+        save_mechanistic_init=True,
+        seed=42,
+        vit_init="pretrained",
+        freeze_vit=False,
+        no_vit=False,
+        mixer_depth_map="1:1",
+        mask_vit_padding=True,
+        vit_apply_final_layernorm=True,
+        num_pool_latents=2,
+        model_name_or_path="decoder",
+        text_encoder_name="encoder",
+        vision_encoder_name="vision",
+    )
+    model = TinyCompressionPath()
+    _write_or_verify_initialization_artifacts(model, args)
+    manifest = json.loads(
+        (tmp_path / "initialization_manifest.json").read_text(encoding="utf-8")
+    )
+    initial = load_file(str(tmp_path / "mechanistic_init.safetensors"))
+
+    assert manifest["branch_kind"] == "zero_gated_mixer"
+    assert len(manifest["hashes"]["post_bottleneck_layers"]) == 1
+    assert torch.equal(
+        initial["mixer_layers.0.weight"],
+        model.mixer_layers[0].weight.detach(),
+    )
+
+    # An exact reconstruction verifies and preserves the original files.
+    _write_or_verify_initialization_artifacts(model, args)
+    with torch.no_grad():
+        model.text_projector.weight.add_(1.0)
+    with pytest.raises(RuntimeError, match="Initialization mismatch"):
+        _write_or_verify_initialization_artifacts(model, args)
+
+
+def test_mechanistic_probe_is_cached_and_data_checked(tmp_path):
+    from train_cvlm import _save_mechanistic_probe
+
+    dataset = [
+        {"source_ids": torch.tensor([index, index + 1])}
+        for index in range(4)
+    ]
+
+    def collate(samples):
+        source_ids = torch.stack([sample["source_ids"] for sample in samples])
+        return {
+            "source_ids": source_ids,
+            "source_attention_mask": torch.ones_like(source_ids),
+        }
+
+    metadata = {"dataset": "fixed", "split": "train"}
+    _save_mechanistic_probe(dataset, collate, str(tmp_path), 3, metadata)
+    _save_mechanistic_probe(dataset, collate, str(tmp_path), 3, metadata)
+
+    payload = torch.load(
+        tmp_path / "mechanistic_probe.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert payload["dataset_indices"] == [0, 1, 2]
+    assert payload["batch"]["source_ids"].shape == (3, 2)
+
+    dataset[0]["source_ids"][0] = 999
+    with pytest.raises(RuntimeError, match="Mechanistic probe mismatch"):
+        _save_mechanistic_probe(dataset, collate, str(tmp_path), 3, metadata)
+
+
+def test_partial_checkpoint_validation_rejects_architecture_mismatch():
+    from train_utils import validate_partial_checkpoint_load
+
+    model = torch.nn.Sequential(torch.nn.Linear(3, 4), torch.nn.Linear(4, 2))
+    with pytest.raises(RuntimeError, match="unexpected keys"):
+        validate_partial_checkpoint_load(
+            model,
+            missing=[],
+            unexpected=["vision_encoder.encoder.layer.0.weight"],
+            checkpoint_path="wrong.safetensors",
+        )
+    with pytest.raises(RuntimeError, match="missing trainable keys"):
+        validate_partial_checkpoint_load(
+            model,
+            missing=["0.weight"],
+            unexpected=[],
+            checkpoint_path="incomplete.safetensors",
+        )
+    validate_partial_checkpoint_load(
+        model,
+        missing=["0.weight"],
+        unexpected=[],
+        checkpoint_path="legacy.safetensors",
+        allowed_missing_trainable={"0.weight"},
+    )

@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 from cvlm_dataset import CvlmTrainDataset, make_collate_fn
 from modeling import CVLM, ModelArguments, TrainingArguments, _chunked_attention_pool
+from train_utils import validate_partial_checkpoint_load
 
 
 def parse_args() -> argparse.Namespace:
@@ -1177,6 +1178,13 @@ def main() -> None:
             print(f"Loading checkpoint: {args.checkpoint_path}")
             state_dict = load_file(args.checkpoint_path)
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            validate_partial_checkpoint_load(
+                model,
+                missing,
+                unexpected,
+                args.checkpoint_path,
+                allowed_missing_trainable={"pool_queries"},
+            )
             print(f"  loaded; missing={len(missing)} unexpected={len(unexpected)}")
 
         model.eval()
@@ -1337,6 +1345,13 @@ def main() -> None:
             assert model is not None
             state_dict = load_file(ckpt_path)
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            validate_partial_checkpoint_load(
+                model,
+                missing,
+                unexpected,
+                ckpt_path,
+                allowed_missing_trainable={"pool_queries"},
+            )
             print(f"  loaded; missing={len(missing)} unexpected={len(unexpected)}")
             model.eval()
 

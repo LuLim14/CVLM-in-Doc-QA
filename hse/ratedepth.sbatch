@@ -35,9 +35,10 @@ mkdir -p /home/aburlova/cvlm/runs/_logs
 module purge
 module load Python/Miniconda CUDA/12.4
 source activate /home/aburlova/conda_envs/cvlm
-source /home/aburlova/cvlm_rd2/hse/protocol.env
-# ИЗОЛЯЦИЯ КАМПАНИИ: RD живёт в замороженном снапшоте cvlm_rd2, боевую копию не трогаем.
-export CVLM_ROOT=/home/aburlova/cvlm_rd2
+SNAPSHOT_ROOT="${CVLM_SNAPSHOT_ROOT:-/home/aburlova/cvlm_rd5}"
+source "${SNAPSHOT_ROOT}/hse/protocol.env"
+# ИЗОЛЯЦИЯ КАМПАНИИ: RD живёт в замороженном снапшоте, боевую копию не трогаем.
+export CVLM_ROOT="${SNAPSHOT_ROOT}"
 test -s "${CVLM_ROOT}/VERSION" || { echo "ERROR: missing ${CVLM_ROOT}/VERSION"; exit 1; }
 echo "=== CODE VERSION: $(cat "${CVLM_ROOT}/VERSION")"
 SMOKE="${SMOKE:-0}"

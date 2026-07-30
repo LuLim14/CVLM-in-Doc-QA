@@ -102,6 +102,51 @@ def state_dict_for_safetensors(module: nn.Module) -> Dict[str, torch.Tensor]:
     return out
 
 
+def validate_partial_checkpoint_load(
+    module: nn.Module,
+    missing: list,
+    unexpected: list,
+    checkpoint_path: str,
+    allowed_missing_trainable: Optional[Set[str]] = None,
+) -> None:
+    """Reject architecture/flag mismatches hidden by ``strict=False``.
+
+    CVLM checkpoints intentionally omit frozen decoder/text-encoder weights, so
+    strict loading is impossible. Silently accepting unexpected keys or a
+    missing trainable compression-path parameter can nevertheless turn an
+    evaluation into a different architecture (for example, loading a ViT
+    checkpoint with ``--no_vit``).
+    """
+    allowed = allowed_missing_trainable or set()
+    trainable = {
+        name
+        for name, parameter in module.named_parameters()
+        if parameter.requires_grad
+    }
+    critical_missing = sorted(
+        name
+        for name in missing
+        if name in trainable and name not in allowed
+    )
+    if unexpected or critical_missing:
+        details = []
+        if unexpected:
+            details.append(
+                f"unexpected keys ({len(unexpected)}): {sorted(unexpected)[:8]}"
+            )
+        if critical_missing:
+            details.append(
+                f"missing trainable keys ({len(critical_missing)}): "
+                f"{critical_missing[:8]}"
+            )
+        raise RuntimeError(
+            f"Checkpoint/model architecture mismatch for {checkpoint_path}: "
+            + "; ".join(details)
+            + ". Reuse the exact training flags (vit_init/no_vit/mixer_depth_map/"
+            "final-layernorm/legacy-projector)."
+        )
+
+
 def save_cvlm_checkpoint(
     output_dir: str,
     model: nn.Module,

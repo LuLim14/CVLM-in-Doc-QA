@@ -669,7 +669,7 @@ def _write_or_verify_initialization_artifacts(
     if os.path.exists(manifest_path):
         with open(manifest_path, encoding="utf-8") as handle:
             recorded = json.load(handle)
-        for field in ("architecture", "hashes"):
+        for field in ("architecture", "models", "versions", "hashes"):
             if recorded.get(field) != manifest.get(field):
                 raise RuntimeError(
                     f"Initialization mismatch in {manifest_path}: field {field!r} "
@@ -703,9 +703,6 @@ def _save_mechanistic_probe(
     if count == 0:
         return
     path = os.path.join(output_dir, "mechanistic_probe.pt")
-    if os.path.exists(path):
-        print(f"[mech-probe] preserving existing {path}")
-        return
     batch = collate([dataset[index] for index in range(count)])
     keep = {
         key: value.detach().cpu().contiguous()
@@ -718,8 +715,31 @@ def _save_mechanistic_probe(
         "metadata": metadata,
         "batch": keep,
     }
-    torch.save(payload, path)
     source_hash = _tensor_sha256(keep["source_ids"])
+    if os.path.exists(path):
+        try:
+            recorded = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            recorded = torch.load(path, map_location="cpu")
+        recorded_batch = recorded.get("batch", {})
+        recorded_source = recorded_batch.get("source_ids")
+        if (
+            recorded.get("metadata") != metadata
+            or recorded.get("dataset_indices") != list(range(count))
+            or recorded_source is None
+            or _tensor_sha256(recorded_source) != source_hash
+        ):
+            raise RuntimeError(
+                f"Mechanistic probe mismatch in {path}: the current dataset/filter/"
+                "tokenizer no longer reproduces the cached probe. Refusing to resume "
+                "with silently changed data."
+            )
+        print(
+            f"[mech-probe] verified existing {path} "
+            f"(source_ids_sha256={source_hash})"
+        )
+        return
+    torch.save(payload, path)
     print(
         f"[mech-probe] saved {count} tokenized examples -> {path} "
         f"(source_ids_sha256={source_hash})"

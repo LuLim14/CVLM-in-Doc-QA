@@ -123,6 +123,23 @@ class ModelArguments:
             "Incompatible with vit_skip / vit_freeze / vit_init='random'. Empty (default) = legacy ViT branching."
         },
     )
+    mask_vit_padding: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, apply vision_attention_mask INSIDE every ViT/mixer self-attention "
+            "layer so real latent tokens cannot attend to batch-padding slots. False preserves "
+            "legacy checkpoints/behaviour. New controlled experiments should enable this flag "
+            "for every ViT/mixer arm and pass it to eval as well."
+        },
+    )
+    vit_apply_final_layernorm: bool = field(
+        default=True,
+        metadata={
+            "help": "Apply ViTModel.layernorm after the plain pretrained/random ViT encoder. "
+            "Set False only for the fixed-depth direct control that is compared with the bare "
+            "zero-gated mixer stack (which has no final layernorm)."
+        },
+    )
     shared_init_seed: int = field(
         default=0,
         metadata={
@@ -222,7 +239,10 @@ def _mixer_forward(
     gates: torch.Tensor,
     depth: int,
     use_checkpoint: bool = False,
-) -> torch.Tensor:
+    return_contrib: bool = False,
+    valid_mask: Optional[torch.Tensor] = None,
+    mask_padding: bool = False,
+):
     """Zero-gated interpolation stack over the first ``depth`` ViTLayer blocks.
 
     Each step is ``h <- h + g_i * (Layer_i(h) - h)``. ViTLayer already contains
@@ -234,17 +254,158 @@ def _mixer_forward(
     ``layers[i](h)`` returns a bare Tensor on transformers >= 4.56 and a
     ``(hidden, ...)`` tuple on older versions; both are handled — blindly
     indexing ``[0]`` on a Tensor would silently slice the batch dimension.
+
+    CONTRIBUTION RATIO (``return_contrib=True``) — the diagnostic that makes the
+    mixer readable. Per applied layer it measures how much the gated update
+    actually moves the representation, relative to the representation itself:
+
+        c_i = || g_i * (Layer_i(h) - h) ||_F / || h ||_F
+
+    computed over VALID latent slots only when ``valid_mask`` is supplied
+    (otherwise over the whole batch tensor), in float32, on DETACHED tensors —
+    no autograd graph, no effect on the update, no gradient path. ``h`` in the
+    denominator is the layer's INPUT (the running hidden state), so the ratios
+    are sequential, not independent. Returns
+    ``(h, contrib)`` with ``contrib`` a float32 tensor of shape [depth]
+    (empty at depth=0) living on ``h``'s device; the caller decides when to sync
+    it to CPU. ``||h|| == 0`` yields 0.0 rather than a NaN.
+
+    ``mask_padding=True`` additionally applies ``valid_mask`` as a KEY mask
+    inside self-attention. Merely zeroing padded outputs after a ViTLayer is not
+    sufficient: real queries would already have mixed padded keys/values into
+    their representations.
     """
+    if mask_padding and valid_mask is None:
+        raise ValueError("mask_padding=True requires valid_mask [B, V]")
+    if valid_mask is not None:
+        if valid_mask.ndim != 2 or tuple(valid_mask.shape) != tuple(h.shape[:2]):
+            raise ValueError(
+                f"valid_mask must have shape {tuple(h.shape[:2])}, got {tuple(valid_mask.shape)}"
+            )
+        valid_mask = valid_mask.to(device=h.device, dtype=torch.bool)
+    contribs: Optional[list] = [] if return_contrib else None
     for i in range(depth):
         layer = layers[i]
-        if use_checkpoint:
+        if mask_padding:
+            if use_checkpoint:
+                def _masked_forward(x, _layer=layer, _mask=valid_mask):
+                    return _vit_layer_forward_with_padding_mask(_layer, x, _mask)
+
+                out = _torch_checkpoint(_masked_forward, h, use_reentrant=False)
+            else:
+                out = _vit_layer_forward_with_padding_mask(layer, h, valid_mask)
+        elif use_checkpoint:
             out = _torch_checkpoint(layer, h, use_reentrant=False)
         else:
             out = layer(h)
         if isinstance(out, tuple):
             out = out[0]
-        h = h + gates[i].to(h.dtype) * (out - h)
-    return h
+        delta = gates[i].to(h.dtype) * (out - h)
+        if contribs is not None:
+            with torch.no_grad():
+                delta_for_norm = delta.detach()
+                h_for_norm = h.detach()
+                if valid_mask is not None:
+                    norm_mask = valid_mask.unsqueeze(-1).to(dtype=h.dtype)
+                    delta_for_norm = delta_for_norm * norm_mask
+                    h_for_norm = h_for_norm * norm_mask
+                # dtype=float32 accumulates the reduction in fp32 even for a
+                # bf16 hidden state, without an fp32 copy of the activations.
+                num = torch.linalg.vector_norm(delta_for_norm, dtype=torch.float32)
+                den = torch.linalg.vector_norm(h_for_norm, dtype=torch.float32)
+                contribs.append(
+                    torch.where(
+                        den > 0,
+                        num / torch.clamp(den, min=torch.finfo(torch.float32).tiny),
+                        torch.zeros_like(num),
+                    )
+                )
+        h = h + delta
+    if contribs is None:
+        return h
+    contrib = (
+        torch.stack(contribs) if contribs else torch.zeros(0, dtype=torch.float32, device=h.device)
+    )
+    return h, contrib
+
+
+def _vit_layer_forward_with_padding_mask(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """ViTLayer forward with a real key-padding mask.
+
+    Hugging Face ``ViTLayer`` accepts a *head* mask but no sequence padding
+    mask. CVLM batches variable-length pooled sequences, so calling the native
+    layer lets real latent queries attend to padded slots (which are non-zero
+    after projector biases + positional embeddings). This function reuses the
+    exact ViT parameters and residual/MLP structure while inserting the missing
+    key mask before the attention softmax.
+    """
+    if valid_mask.ndim != 2 or tuple(valid_mask.shape) != tuple(hidden_states.shape[:2]):
+        raise ValueError(
+            f"valid_mask must have shape {tuple(hidden_states.shape[:2])}, "
+            f"got {tuple(valid_mask.shape)}"
+        )
+    valid_mask = valid_mask.to(device=hidden_states.device, dtype=torch.bool)
+
+    hidden_states_norm = layer.layernorm_before(hidden_states)
+    self_attn = layer.attention.attention
+    batch_size = hidden_states_norm.shape[0]
+    n_heads = int(self_attn.num_attention_heads)
+    head_dim = int(self_attn.attention_head_size)
+    qkv_shape = (batch_size, -1, n_heads, head_dim)
+
+    key = self_attn.key(hidden_states_norm).view(*qkv_shape).transpose(1, 2)
+    value = self_attn.value(hidden_states_norm).view(*qkv_shape).transpose(1, 2)
+    query = self_attn.query(hidden_states_norm).view(*qkv_shape).transpose(1, 2)
+    scaling = float(getattr(self_attn, "scaling", head_dim**-0.5))
+
+    attention_scores = torch.matmul(query, key.transpose(-1, -2)) * scaling
+    key_mask = valid_mask[:, None, None, :]
+    attention_scores = attention_scores.masked_fill(
+        ~key_mask,
+        torch.finfo(attention_scores.dtype).min,
+    )
+    attention_probs = torch.softmax(attention_scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    dropout_value = getattr(self_attn, "dropout_prob", getattr(self_attn, "dropout", 0.0))
+    dropout_p = float(dropout_value.p if isinstance(dropout_value, nn.Dropout) else dropout_value)
+    attention_probs = torch.nn.functional.dropout(
+        attention_probs,
+        p=dropout_p,
+        training=self_attn.training,
+    )
+    context = torch.matmul(attention_probs, value)
+    context = context.transpose(1, 2).contiguous().reshape(
+        batch_size,
+        hidden_states_norm.size(1),
+        n_heads * head_dim,
+    )
+    attention_output = layer.attention.output(context, hidden_states_norm)
+
+    hidden_states = attention_output + hidden_states
+    layer_output = layer.layernorm_after(hidden_states)
+    layer_output = layer.intermediate(layer_output)
+    return layer.output(layer_output, hidden_states)
+
+
+def _vit_encoder_forward_with_padding_mask(
+    layers,
+    hidden_states: torch.Tensor,
+    valid_mask: torch.Tensor,
+    use_checkpoint: bool = False,
+) -> torch.Tensor:
+    """Run a ViT encoder stack with the missing sequence padding mask."""
+    for layer in layers:
+        if use_checkpoint:
+            def _masked_forward(x, _layer=layer, _mask=valid_mask):
+                return _vit_layer_forward_with_padding_mask(_layer, x, _mask)
+
+            hidden_states = _torch_checkpoint(_masked_forward, hidden_states, use_reentrant=False)
+        else:
+            hidden_states = _vit_layer_forward_with_padding_mask(layer, hidden_states, valid_mask)
+    return hidden_states
 
 
 class RMSNorm(nn.Module):
@@ -554,6 +715,9 @@ class CVLM(torch.nn.Module):
         self.mixer_layers = None
         self.mixer_gates = None
         self._mixer_grad_ckpt = False
+        # Per-layer contribution ratios of the most recent mixer forward
+        # (diagnostic; None when the mixer is disabled — nothing is computed).
+        self._last_mixer_contrib = None
         shared_seed = int(getattr(model_args, "shared_init_seed", 0) or 0)
         if shared_seed:
             # Reproducible branch-specific ViT init (matters for vit_init='random').
@@ -833,13 +997,18 @@ class CVLM(torch.nn.Module):
             # is byte-identical to the no-ViT branch below: vit_output is the
             # untouched vit_input — no final layernorm.
             depth = self._mixer_depth_for(self.compression_rate)
-            vit_output = _mixer_forward(
+            vit_output, contrib = _mixer_forward(
                 vit_input,
                 self.mixer_layers,
                 self.mixer_gates,
                 depth,
                 use_checkpoint=self._mixer_grad_ckpt and self.training and torch.is_grad_enabled(),
+                return_contrib=True,
             )
+            # Diagnostic only (detached, no graph): stashed for forward() to
+            # surface. Kept as a device tensor so no CUDA sync happens here —
+            # the training loop copies it to CPU at logging time only.
+            self._last_mixer_contrib = contrib
         elif self.vision_encoder is None:
             # no-ViT ablation: identical pipeline minus the ViT block itself.
             vit_output = vit_input
@@ -968,6 +1137,14 @@ class CVLM(torch.nn.Module):
         }
         if mixed_stats is not None:
             out["mixed_stats"] = mixed_stats
+        # RATE-DEPTH MIXER diagnostics (absent when the mixer is disabled):
+        # per-layer contribution ratios of THIS forward, plus their sum. Both
+        # are detached float32 device tensors — no sync until the caller reads
+        # them.
+        contrib = getattr(self, "_last_mixer_contrib", None)
+        if contrib is not None:
+            out["mixer_contrib"] = contrib
+            out["mixer_contrib_total"] = contrib.sum()
         return out
 
     @torch.no_grad()

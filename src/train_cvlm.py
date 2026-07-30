@@ -98,6 +98,54 @@ def _parse_mixed_cr_set(s: Optional[str]) -> Optional[List[int]]:
     return out
 
 
+def _build_param_groups(model: torch.nn.Module, lr: float, gate_lr_mult: float) -> List[dict]:
+    """AdamW param groups, optionally isolating the mixer gates at their own LR.
+
+    GATE-LR CONTROL. The zero-gated mixer is a diagnostic instrument: "given the
+    chance to add depth for free, does the model take it?". A near-zero gate is
+    ambiguous — it can mean "the depth is useless" OR "the gate is simply slow
+    to learn" (one scalar per layer, tiny gradient, shared LR with ~100M other
+    params). Training a control arm with ``gate_lr_mult`` >> 1 separates the two:
+    if the gates stay shut at 100x LR, slow optimisation is ruled out.
+
+    Group layout — deliberately a function of ``gate_lr_mult`` ONLY:
+      * ``gate_lr_mult == 1.0`` (default): ONE group with every trainable param
+        — byte-identical to the legacy optimizer, so old ``trainer_step_*.pt``
+        files still resume.
+      * ``gate_lr_mult != 1.0``: TWO groups, [0] = everything except
+        ``mixer_gates`` at ``lr``, [1] = ``mixer_gates`` alone at
+        ``lr * gate_lr_mult``. The order is fixed (base first, gates second) so
+        optimizer state maps back onto the same groups on resume.
+
+    Resuming across a change of ``gate_lr_mult`` therefore changes the group
+    count; ``load_cvlm_checkpoint`` detects that and fails with an explicit
+    message instead of silently mis-assigning optimizer state.
+    """
+    if gate_lr_mult <= 0.0:
+        raise ValueError(f"--gate_lr_mult must be > 0, got {gate_lr_mult}")
+    core = unwrap_model(model)
+    gate_param = getattr(core, "mixer_gates", None)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if gate_lr_mult == 1.0:
+        return [{"params": trainable, "lr": lr}]
+    if gate_param is None:
+        raise ValueError(
+            "--gate_lr_mult != 1.0 requires the rate-depth mixer (--mixer_depth_map); "
+            "there are no mixer_gates to give a separate learning rate to."
+        )
+    if not gate_param.requires_grad:
+        raise ValueError("mixer_gates is frozen; --gate_lr_mult would have no effect.")
+    gate_ids = {id(gate_param)}
+    base_params = [p for p in trainable if id(p) not in gate_ids]
+    gate_params = [p for p in trainable if id(p) in gate_ids]
+    if not gate_params:
+        raise ValueError("mixer_gates was not found among the trainable parameters.")
+    return [
+        {"params": base_params, "lr": lr},
+        {"params": gate_params, "lr": lr * gate_lr_mult},
+    ]
+
+
 class MixedCrSampler:
     """Balanced deterministic per-optimizer-step cr sequence for MIXED-CR training.
 
@@ -206,6 +254,18 @@ def parse_args() -> argparse.Namespace:
         "current compression rate (exact key; else nearest lower key; else smallest key). Incompatible "
         "with --no_vit / --freeze_vit / --vit_init random. Must also be passed to eval. "
         "Empty (default) = legacy ViT branching. Env: MIXER_DEPTH_MAP.",
+    )
+    p.add_argument(
+        "--gate_lr_mult",
+        type=float,
+        default=float(os.environ.get("GATE_LR_MULT", "1.0")),
+        help="RATE-DEPTH MIXER diagnostic: learning-rate multiplier for the mixer_gates "
+        "parameter. 1.0 (default) = single param group, legacy behaviour. Any other value "
+        "puts mixer_gates in its OWN AdamW group at lr*gate_lr_mult (group order: base, "
+        "gates), which is the control that separates 'the added depth is not useful' from "
+        "'the gates just learn too slowly' — e.g. --gate_lr_mult 100. Requires "
+        "--mixer_depth_map. Resuming a run must reuse the same value (the group count is "
+        "part of the optimizer state). Env: GATE_LR_MULT.",
     )
     p.add_argument(
         "--mixed_cr_set",
@@ -577,13 +637,19 @@ def main() -> None:
             find_unused_parameters=False,
         )
 
-    trainable = [p for p in model.parameters() if p.requires_grad]
+    param_groups = _build_param_groups(model, args.lr, float(args.gate_lr_mult))
     optimizer = torch.optim.AdamW(
-        trainable,
+        param_groups,
         lr=args.lr,
         betas=(args.adamw_beta1, args.adamw_beta2),
         weight_decay=0.0,
     )
+    if is_master and len(param_groups) > 1:
+        print(
+            f"[gate-lr] mixer_gates in a separate AdamW group: "
+            f"lr={args.lr} * gate_lr_mult={args.gate_lr_mult} = {args.lr * float(args.gate_lr_mult)} "
+            f"({len(param_groups[0]['params'])} base tensors + {len(param_groups[1]['params'])} gate tensor(s))"
+        )
     grad_clip = args.grad_clip
 
     grad_accum_steps = args.gradient_accumulation_steps
@@ -663,6 +729,7 @@ def main() -> None:
             "vit_freeze": bool(model_args.vit_freeze),
             "vit_skip": bool(model_args.vit_skip),
             "mixer_depth_map": model_args.mixer_depth_map,
+            "gate_lr_mult": float(args.gate_lr_mult),
             "mixed_cr_set": str(args.mixed_cr_set or ""),
             "max_source_len": args.max_source_len,
             "epochs": args.epochs,
@@ -713,6 +780,11 @@ def main() -> None:
         grad_norm = 0.0
         t0 = time.perf_counter()
         curr_lrs: List[float] = []
+        # Latest mixer contribution ratios (device tensor; None until the first
+        # forward, and always None when the mixer is disabled) + the cr they
+        # were measured at (the vector length == the mixer depth for that cr).
+        last_mixer_contrib: Optional[torch.Tensor] = None
+        last_mixer_contrib_cr: int = current_cr
 
         for local_step, batch_data in enumerate(loader, start=1):
             data_time = time.perf_counter() - t0
@@ -757,6 +829,16 @@ def main() -> None:
             if mixed_stats is not None:
                 running_avg_raw_frac.update(mixed_stats["raw_frac"])
                 running_avg_input_len.update(mixed_stats["input_len"])
+            # RATE-DEPTH MIXER diagnostics: keep the latest per-layer
+            # contribution ratios as a DEVICE tensor (detached, no sync); it is
+            # copied to CPU only inside the log_interval branch below.
+            mixer_contrib_t = out.get("mixer_contrib")
+            if mixer_contrib_t is not None:
+                last_mixer_contrib = mixer_contrib_t
+                # Pin the cr THIS forward ran at: `current_cr` is advanced to the
+                # next step's value inside the sync branch below, so the cr shown
+                # on a log line can otherwise be one step ahead of the ratios.
+                last_mixer_contrib_cr = current_cr
             loss = loss / grad_accum_steps
 
             sync_step = local_step % grad_accum_steps == 0 or local_step == len(loader)
@@ -834,6 +916,22 @@ def main() -> None:
                 if getattr(_core, "mixer_gates", None) is not None:
                     mixer_gates_now = [round(float(g), 4) for g in _core.mixer_gates.detach().float().cpu().tolist()]
                     print(f"    mixer_gates={mixer_gates_now}")
+                # CONTRIBUTION RATIO: ||g_i*(Layer_i(h)-h)||_F / ||h||_F per
+                # applied layer (see modeling._mixer_forward). Unlike the raw
+                # gate value this is scale-aware — it says how much the gated
+                # update actually moves the representation. Length == the ACTIVE
+                # depth for the current cr, so it shrinks/grows under mixed-cr.
+                mixer_contrib_now = None
+                mixer_contrib_total = None
+                if last_mixer_contrib is not None:
+                    _contrib_raw = last_mixer_contrib.detach().float().cpu().tolist()
+                    mixer_contrib_now = [round(float(c), 4) for c in _contrib_raw]
+                    mixer_contrib_total = float(sum(_contrib_raw))
+                    print(
+                        f"    mixer_contrib={mixer_contrib_now} "
+                        f"mixer_contrib_total={mixer_contrib_total:.4f} "
+                        f"(cr={last_mixer_contrib_cr}, depth={len(mixer_contrib_now)})"
+                    )
                 if trackio_run is not None:
                     metrics = {
                         "train/loss": curr_loss,
@@ -849,6 +947,15 @@ def main() -> None:
                     if mixer_gates_now is not None:
                         for gi, gv in enumerate(mixer_gates_now):
                             metrics[f"train/mixer_gate_{gi:02d}"] = gv
+                    if mixer_contrib_now is not None:
+                        metrics["train/mixer_contrib_total"] = mixer_contrib_total
+                        # cr the ratios were measured at — under mixed-cr the
+                        # depth (== len of the vector) is a function of it, so
+                        # any per-cr analysis must group on this, not on
+                        # train/compression_rate (which is the NEXT step's cr).
+                        metrics["train/mixer_contrib_cr"] = float(last_mixer_contrib_cr)
+                        for ci, cv in enumerate(mixer_contrib_now):
+                            metrics[f"train/mixer_contrib_{ci:02d}"] = cv
                     trackio_run.log(metrics, step=global_step)
                 if csv_writer is not None:
                     csv_writer.append(

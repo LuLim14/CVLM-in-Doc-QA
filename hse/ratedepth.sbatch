@@ -31,7 +31,14 @@ mkdir -p /home/aburlova/cvlm/runs/_logs
 module purge
 module load Python/Miniconda CUDA/12.4
 source activate /home/aburlova/conda_envs/cvlm
-source /home/aburlova/cvlm/hse/protocol.env
+source /home/aburlova/cvlm_rd2/hse/protocol.env
+# ИЗОЛЯЦИЯ КАМПАНИИ: RD живёт в замороженном снапшоте cvlm_rd, боевую копию не трогаем.
+export CVLM_ROOT=/home/aburlova/cvlm_rd2
+echo "=== CODE VERSION: $(cat /home/aburlova/cvlm_rd2/VERSION 2>/dev/null || echo unknown)"
+SMOKE="${SMOKE:-0}"
+if [ "${SMOKE}" = "1" ]; then
+  export MAX_SAMPLES=8000 EPOCHS=1 EVAL_MAX_SAMPLES=64
+fi
 
 ARM="${ARM:?set ARM=novit|fixed12direct|fixed12anchor|ratedepth}"
 export MIXER_DEPTH_MAP="" VIT_INIT=pretrained FREEZE_VIT=0 NO_VIT=0
@@ -72,6 +79,23 @@ for CR in 1 2 4 8 16 32; do
     --output_json "${OUTPUT_DIR}/eval_rd_cr${CR}.json" \
     --dump_per_sample "${OUTPUT_DIR}/eval_rd_cr${CR}_dump.jsonl" \
     --compute_generation_metrics
+  # Парный zero-gate прогон: если метрики НЕ ухудшаются при занулённых гейтах,
+  # модель фактически не пользуется добавленной глубиной (диагностика, не метод).
+  if [ -n "${MIXER_DEPTH_MAP}" ]; then
+    python src/eval_cvlm.py --mode cvlm \
+      --checkpoint_path "${LAST}" --compression_rate "${CR}" \
+      --dataset_name sggetao/PwC --dataset_split "${EVAL_SPLIT}" \
+      --model_name_or_path "${MODEL_NAME}" --text_encoder_name "${TEXT_ENCODER_NAME}" \
+      --vision_encoder_name "${VISION_ENCODER_NAME}" \
+      --num_pool_latents "${NUM_POOL_LATENTS}" --max_prompt_len "${MAX_PROMPT_LEN}" \
+      --max_answer_len "${MAX_ANSWER_LEN}" --max_vision_len "${MAX_VISION_LEN}" \
+      --max_source_len "${MAX_SOURCE_LEN}" --max_samples "${EVAL_MAX_SAMPLES}" \
+      --batch_size "${EVAL_BATCH_SIZE}" --seed "${SEED}" --global_step "${STEP}" \
+      --mixer_depth_map "${MIXER_DEPTH_MAP}" --force_zero_gates \
+      --output_json "${OUTPUT_DIR}/eval_rd_cr${CR}_zerogate.json" \
+      --dump_per_sample "${OUTPUT_DIR}/eval_rd_cr${CR}_zerogate_dump.jsonl" \
+      --compute_generation_metrics
+  fi
 done
 ls -1 "${OUTPUT_DIR}"/trainer_step_*.pt 2>/dev/null | sort -t_ -k3 -n | head -n -1 | xargs -r rm -f
 echo "=== RD ARM DONE: ${ARM}"

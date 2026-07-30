@@ -147,6 +147,45 @@ def find_latest_checkpoint(checkpoint_dir: str) -> Optional[Tuple[str, str, int]
     return (mp, tp, best[0])
 
 
+def check_optimizer_groups_match(
+    optimizer: Optimizer,
+    saved_state: Dict[str, Any],
+    trainer_path: str = "",
+) -> None:
+    """Fail loudly when a saved optimizer state does not fit the live optimizer.
+
+    ``Optimizer.load_state_dict`` matches param groups POSITIONALLY and only
+    checks that the total parameter count lines up; a run whose group layout
+    changed between save and resume (e.g. ``--gate_lr_mult`` added or dropped,
+    which splits ``mixer_gates`` into its own group) would either raise an
+    opaque "loaded state dict has a different number of parameter groups" or —
+    worse, when the counts coincidentally match — silently graft Adam moments
+    onto the wrong tensors and the wrong LR onto the wrong group. This check
+    turns both into one explicit message.
+    """
+    saved_groups = saved_state.get("param_groups", [])
+    cur_groups = optimizer.param_groups
+    where = f" (from {trainer_path})" if trainer_path else ""
+    if len(saved_groups) != len(cur_groups):
+        raise RuntimeError(
+            f"Optimizer resume mismatch{where}: checkpoint has {len(saved_groups)} param group(s), "
+            f"the current optimizer has {len(cur_groups)}. The param-group layout is decided by "
+            f"--gate_lr_mult (1.0 -> 1 group; anything else -> 2 groups: base, mixer_gates). "
+            f"Resume with the SAME --gate_lr_mult (env GATE_LR_MULT) the run was started with, "
+            f"or start a fresh run."
+        )
+    for i, (sg, cg) in enumerate(zip(saved_groups, cur_groups)):
+        n_saved = len(sg.get("params", []))
+        n_cur = len(cg["params"])
+        if n_saved != n_cur:
+            raise RuntimeError(
+                f"Optimizer resume mismatch{where}: param group {i} has {n_saved} tensor(s) in the "
+                f"checkpoint but {n_cur} in the current optimizer. The trainable-parameter set or "
+                f"the group split (--gate_lr_mult) changed since the checkpoint was written; "
+                f"resume with the same model/optimizer flags or start a fresh run."
+            )
+
+
 def load_cvlm_checkpoint(
     model_path: str,
     trainer_path: str,
@@ -166,6 +205,7 @@ def load_cvlm_checkpoint(
         payload = torch.load(trainer_path, map_location=device, weights_only=False)
     except TypeError:
         payload = torch.load(trainer_path, map_location=device)
+    check_optimizer_groups_match(optimizer, payload["optimizer"], trainer_path)
     optimizer.load_state_dict(payload["optimizer"])
     scheduler.load_state_dict(payload["scheduler"])
     gstep = int(payload["global_step"])

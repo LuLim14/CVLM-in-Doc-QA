@@ -175,6 +175,17 @@ def parse_args() -> argparse.Namespace:
         "(exact key; else nearest LOWER key; else smallest key — e.g. cr=32 with a map up to 16 "
         "uses the cr=16 depth). Env: MIXER_DEPTH_MAP.",
     )
+    p.add_argument(
+        "--force_zero_gates",
+        action="store_true",
+        default=os.environ.get("FORCE_ZERO_GATES", "0") == "1",
+        help="RATE-DEPTH MIXER diagnostic: after loading each checkpoint, zero mixer_gates "
+        "in place so the mixer collapses to the exact depth-0 (no-ViT) path. Compare the "
+        "held-out metrics of the SAME checkpoint with and without this flag: if they do not "
+        "get worse, the trained model was not actually using the extra depth. Requires "
+        "--mixer_depth_map (errors out when the model has no mixer). The output JSON records "
+        "force_zero_gates; the file name is the caller's job. Env: FORCE_ZERO_GATES=1.",
+    )
     p.add_argument("--global_step", type=int, default=0)
     p.add_argument("--no_bf16", action="store_true")
     p.add_argument("--seed", type=int, default=42)
@@ -212,6 +223,31 @@ def _encode_source_for_baseline(model: CVLM, source_ids, source_mask):
         pool_queries=model.pool_queries,
     )
     return pooled, vmask
+
+
+def force_zero_mixer_gates(model: Optional[CVLM]) -> int:
+    """Zero the rate-depth mixer's gates IN PLACE; returns how many were zeroed.
+
+    Collapses ``h <- h + g_i*(Layer_i(h)-h)`` to the identity at every depth, so
+    the vision path becomes byte-for-byte the depth-0 / no-ViT path while every
+    other trained weight (projectors, pool queries, pos-embed, mixer layers)
+    stays exactly as the checkpoint left it. Evaluating one checkpoint both ways
+    answers "does this model actually USE the depth it was given?" without
+    having to interpret the gate magnitudes themselves.
+
+    Raises ValueError when the model has no mixer — silently doing nothing here
+    would produce an eval JSON claiming an ablation that never happened.
+    """
+    gates = getattr(model, "mixer_gates", None) if model is not None else None
+    if gates is None:
+        raise ValueError(
+            "--force_zero_gates requires a model built with the rate-depth mixer "
+            "(pass --mixer_depth_map exactly as used at training time); this model has no "
+            "mixer_gates, so there is nothing to zero."
+        )
+    with torch.no_grad():
+        gates.zero_()
+    return int(gates.numel())
 
 
 class PerSampleDumper:
@@ -1041,6 +1077,19 @@ def main() -> None:
         raise ValueError("--doc_budget_cr > 0 requires --doc_truncation != none")
     if args.doc_selection_file and args.doc_truncation != "file":
         raise ValueError("--doc_selection_file is only valid with --doc_truncation=file")
+    if args.force_zero_gates:
+        # Fail before loading anything: the flag is only meaningful for the modes
+        # that actually run the mixer, and only for mixer-built models.
+        if args.mode not in ("cvlm", "cvlm_shuffle"):
+            raise ValueError(
+                f"--force_zero_gates only applies to modes that run the vision path through the "
+                f"rate-depth mixer (cvlm / cvlm_shuffle); got --mode {args.mode}"
+            )
+        if not str(args.mixer_depth_map or "").strip():
+            raise ValueError(
+                "--force_zero_gates requires --mixer_depth_map (the same map used at training "
+                "time); without it the model is built with a plain ViT and has no gates."
+            )
 
     # Optional per-checkpoint cr lookup: when --cr_schedule is set, each ckpt
     # is evaluated at the cr that produced its weights. Requires --all_checkpoints
@@ -1235,6 +1284,7 @@ def main() -> None:
             "global_step": int(args.global_step),
             "all_checkpoints": bool(args.all_checkpoints),
             "mixer_depth_map": str(args.mixer_depth_map or ""),
+            "force_zero_gates": bool(args.force_zero_gates),
         }
         run = TrackioRun(
             project=args.trackio_project,
@@ -1271,6 +1321,12 @@ def main() -> None:
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
             print(f"  loaded; missing={len(missing)} unexpected={len(unexpected)}")
             model.eval()
+
+        if args.force_zero_gates:
+            # AFTER the checkpoint load (the checkpoint carries the trained
+            # gates), and re-applied for every checkpoint in --all_checkpoints.
+            n_gates = force_zero_mixer_gates(model)
+            print(f"  [force_zero_gates] zeroed {n_gates} mixer gate(s) -> exact depth-0 (no-ViT) path")
 
         # Per-ckpt cr: look up training cr from schedule, set model accordingly,
         # and pull (or compute) compression stats for this cr.
@@ -1414,6 +1470,8 @@ def main() -> None:
             "doc_budget_cr": int(args.doc_budget_cr),
             "doc_selection_file": args.doc_selection_file,
             "oracle_hit_rate": oracle_hit_rate,
+            "mixer_depth_map": str(args.mixer_depth_map or ""),
+            "force_zero_gates": bool(args.force_zero_gates),
         }
         last_results = results
 

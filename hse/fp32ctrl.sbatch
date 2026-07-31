@@ -103,12 +103,12 @@ export COMPRESSION_RATE=16     # только для финального eval: 
                                # (в трейне cr берётся из CR_SCHEDULE)
 export SAVE_INTERVAL_STEPS=1000  # как в protocol.env: ckpt ~3.7 GB каждый
 export LOG_INTERVAL=10         # окно vit_frozen_frac == LOG_INTERVAL шагов
-export SEED=42                 # те же батчи, что у legacy-армов
+export SEED="${FP32_CONTROL_SEED:-43}"                 # те же батчи, что у legacy-армов
 
 # --- eval: только финальный чекпоинт, только cvlm --------------------------
 export EVAL_ALL_CHECKPOINTS=0
 export EVAL_MODES="cvlm"
-export EVAL_COMPUTE_GEN=1
+export EVAL_COMPUTE_GEN=0
 # EVAL_CR_SCHEDULE не нужен: пер-чекпоинтная привязка cr работает ТОЛЬКО при
 # EVAL_ALL_CHECKPOINTS=1. (Пустое значение всё равно подменяется дефолтом в
 # run_full_pipeline.sh через ${VAR:-...}, но при 0 оно нигде не используется.)

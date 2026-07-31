@@ -442,7 +442,7 @@ def parse_args() -> argparse.Namespace:
         "--model_name_or_path",
         type=str,
         default=None,
-        help="HF id for the frozen decoder (e.g. HuggingFaceTB/SmolLM-135M-Instruct).",
+        help="HF id for the decoder (trained end-to-end here; e.g. HuggingFaceTB/SmolLM-135M-Instruct).",
     )
     p.add_argument("--vision_encoder_name", type=str, default=None)
     p.add_argument(

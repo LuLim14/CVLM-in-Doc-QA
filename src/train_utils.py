@@ -311,7 +311,10 @@ def state_dict_for_safetensors(module: nn.Module) -> Dict[str, torch.Tensor]:
     - Keeps only parameters whose ``requires_grad`` is True. Frozen sub-modules
       (decoder, text_encoder) are reloaded from their HF checkpoints at
       `from_pretrained` time and don't need to live in our per-step ckpts.
-      This shrinks a 500+ MB checkpoint down to ~100 MB of trainable weights.
+      NOTE: the decoder IS trainable in this project (97.9% of params), so this
+      filter removes only the frozen ModernBERT embeddings; a checkpoint is
+      ~3.4 GiB, not ~100 MB. The stale '100 MB' figure once caused a wrong
+      memory estimate -- do not reintroduce it.
     - Clones any later tensor that shares storage with an earlier one (tied
       LM heads, etc.), which ``safetensors.save_file`` cannot represent.
     """
@@ -344,7 +347,7 @@ def validate_partial_checkpoint_load(
 ) -> None:
     """Reject architecture/flag mismatches hidden by ``strict=False``.
 
-    CVLM checkpoints intentionally omit frozen decoder/text-encoder weights, so
+    CVLM checkpoints intentionally omit trainable decoder/text-encoder weights, so
     strict loading is impossible. Silently accepting unexpected keys or a
     missing trainable compression-path parameter can nevertheless turn an
     evaluation into a different architecture (for example, loading a ViT

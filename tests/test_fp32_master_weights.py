@@ -88,8 +88,8 @@ def test_master_weights_land_sub_ulp_updates():
     assert float(big.detach()[0]) < 1.0
     assert float(big.detach()[0]) == pytest.approx(0.995, abs=4e-3)
     assert big.dtype == torch.bfloat16, "parameters must stay bf16 for forward/backward"
-    # fp32 masters => fp32 moments (the bf16 exp_avg_sq of the legacy path
-    # squares gradients into ~3 decimal digits).
+    # fp32 masters => fp32 moments (the legacy bf16 exp_avg_sq stores squared
+    # gradients at bf16's 0.39%-0.78% relative granularity).
     assert optimizer.state[master]["exp_avg"].dtype == torch.float32
 
 
@@ -185,6 +185,118 @@ def test_master_weights_change_the_trajectory_but_keep_the_dtype():
     # zero_grad must clear the MODEL grads too, not only the master ones.
     master_opt.zero_grad(set_to_none=True)
     assert all(p.grad is None for p in mastered.parameters())
+
+
+# --------------------------------------------------------------------------
+# 2b. Scope: only the selected tensors change; everything else is legacy.
+# --------------------------------------------------------------------------
+
+
+class _ScopedModel(torch.nn.Module):
+    """A ViT-ish stack (in scope) next to decoder/projector-ish tensors."""
+
+    def __init__(self, seed: int):
+        super().__init__()
+        torch.manual_seed(seed)
+        self.vision_encoder = torch.nn.Sequential(torch.nn.Linear(6, 6), torch.nn.Linear(6, 6))
+        self.decoder = torch.nn.Linear(6, 6)
+        self.text_projector = torch.nn.Linear(6, 6)
+        self.mixer_layers = None
+        self.mixer_gates = None
+        self.to(torch.bfloat16)
+        with torch.no_grad():
+            # Pretrained-scale magnitudes: their bf16 ULP swallows an lr=1e-4 step.
+            for parameter in self.parameters():
+                parameter.fill_(1.0)
+
+    def loss(self, batch):
+        hidden = self.vision_encoder(batch)
+        return (self.decoder(hidden) + self.text_projector(hidden)).square().mean()
+
+
+def _run_scoped(fp32_master_weights: bool, scope: str, steps: int = 40, foreach=None):
+    from train_cvlm import _vision_scope_params
+    from train_utils import build_optimizer
+
+    model = _ScopedModel(seed=0)
+    master_params = _vision_scope_params(model) if scope == "vision" else None
+    kwargs = {} if foreach is None else {"foreach": foreach}
+    optimizer = build_optimizer(
+        [{"params": [p for p in model.parameters() if p.requires_grad], "lr": 1e-4}],
+        lr=1e-4,
+        betas=(0.9, 0.999),
+        fp32_master_weights=fp32_master_weights,
+        master_params=master_params,
+        **kwargs,
+    )
+    torch.manual_seed(4)
+    batches = [torch.randn(3, 6).to(torch.bfloat16) for _ in range(steps)]
+    for batch in batches:
+        optimizer.zero_grad(set_to_none=True)
+        model.loss(batch).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+    return model, optimizer
+
+
+def test_vision_scope_selects_only_the_vit_stack():
+    from train_cvlm import _vision_scope_params
+
+    model = _ScopedModel(seed=0)
+    selected = {id(p) for p in _vision_scope_params(model)}
+    assert selected == {id(p) for p in model.vision_encoder.parameters()}
+    assert id(model.decoder.weight) not in selected
+    assert id(model.text_projector.weight) not in selected
+
+
+@pytest.mark.parametrize("foreach", [None, True])
+def test_vision_scope_leaves_non_vision_params_bit_identical(foreach):
+    legacy, legacy_opt = _run_scoped(False, "all", foreach=foreach)
+    scoped, scoped_opt = _run_scoped(True, "vision", foreach=foreach)
+
+    assert len(scoped_opt.master_pairs) == len(list(scoped.vision_encoder.parameters()))
+
+    for name in ("decoder", "text_projector"):
+        for legacy_p, scoped_p in zip(
+            getattr(legacy, name).parameters(), getattr(scoped, name).parameters()
+        ):
+            assert torch.equal(_bits(legacy_p), _bits(scoped_p)), (
+                f"{name} must follow the legacy bf16 path bit-for-bit under scope=vision"
+            )
+    # ...and their optimizer state is still the legacy bf16 one.
+    for parameter in scoped.decoder.parameters():
+        assert scoped_opt.state[parameter]["exp_avg"].dtype == torch.bfloat16
+
+    # The ViT stack, which legacy cannot move at all, does move.
+    assert all(
+        torch.equal(_bits(a), _bits(b))
+        for a, b in zip(legacy.vision_encoder.parameters(), _ScopedModel(seed=0).vision_encoder.parameters())
+    ), "sanity: the legacy run must leave the 1.0-magnitude ViT weights untouched"
+    assert any(
+        not torch.equal(_bits(a), _bits(b))
+        for a, b in zip(legacy.vision_encoder.parameters(), scoped.vision_encoder.parameters())
+    )
+    for parameter, master in scoped_opt.master_pairs:
+        assert scoped_opt.state[master]["exp_avg"].dtype == torch.float32
+        assert parameter.dtype == torch.bfloat16
+
+
+def test_scope_all_masters_everything_including_the_decoder():
+    _, all_opt = _run_scoped(True, "all", steps=2)
+    model = _ScopedModel(seed=0)
+    assert all_opt.mastered_numel == sum(p.numel() for p in model.parameters())
+
+
+def test_scope_mismatch_on_resume_is_rejected():
+    from train_utils import MasterWeightAdamW
+
+    _, scoped_opt = _run_scoped(True, "vision", steps=2)
+    _, all_opt = _run_scoped(True, "all", steps=2)
+    assert isinstance(scoped_opt, MasterWeightAdamW)
+    with pytest.raises(RuntimeError, match="master SCOPE"):
+        scoped_opt.load_state_dict(
+            {**all_opt.state_dict(), "param_groups": scoped_opt.state_dict()["param_groups"]}
+        )
 
 
 # --------------------------------------------------------------------------
@@ -417,6 +529,49 @@ def test_drift_tracker_counts_bitwise_unchanged_weights():
     assert third["vit_drift"] == pytest.approx(second["vit_drift"])
 
 
+def test_drift_tracker_reports_master_drift_and_hidden_residual():
+    """The live bf16 weights understate what the optimizer has learned."""
+    from train_cvlm import VitDriftTracker
+    from train_utils import build_optimizer
+
+    torch.manual_seed(17)
+    model = _StubVit(layers=1, width=4)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(1.0)
+    model = model.to(torch.bfloat16)
+
+    optimizer = build_optimizer(
+        [{"params": [p for p in model.parameters() if p.requires_grad], "lr": 1e-4}],
+        lr=1e-4,
+        betas=(0.9, 0.999),
+        fp32_master_weights=True,
+    )
+    tracker = VitDriftTracker(
+        model,
+        master_lookup={id(p): m for p, m in optimizer.master_pairs},
+    )
+    assert tracker.has_masters
+    assert tracker.mastered_tensors == len(tracker.params)
+
+    _const_grad_steps([p for p in model.parameters()], optimizer, steps=5)
+    stats = tracker.measure()
+
+    # bf16 has not budged yet, but the masters have — and the gap is reported.
+    assert stats["vit_frozen_frac"] == 1.0
+    assert stats["vit_drift"] == 0.0
+    assert stats["vit_master_drift"] > 0.0
+    assert stats["vit_master_resid"] > 0.0
+    assert stats["vit_master_resid_max"] == pytest.approx(5e-4, rel=0.2)
+
+    # Without masters the extra fields are absent (None), not silently zero.
+    plain = VitDriftTracker(model)
+    plain_stats = plain.measure()
+    assert plain_stats["vit_master_drift"] is None
+    assert plain_stats["vit_master_resid"] is None
+    assert plain_stats["vit_master_resid_max"] is None
+
+
 def test_drift_tracker_relative_l2_matches_manual_computation():
     from train_cvlm import VitDriftTracker
 
@@ -637,3 +792,22 @@ def test_cli_flag_defaults_off_and_reads_env(monkeypatch):
         ["train_cvlm.py", "--output_dir", "/tmp/x", "--fp32_master_weights", "0"],
     )
     assert train_cvlm.parse_args().fp32_master_weights is False
+
+
+def test_cli_scope_defaults_to_all_and_reads_env(monkeypatch):
+    import train_cvlm
+
+    monkeypatch.delenv("FP32_MASTER_SCOPE", raising=False)
+    monkeypatch.setattr("sys.argv", ["train_cvlm.py", "--output_dir", "/tmp/x"])
+    assert train_cvlm.parse_args().fp32_master_scope == "all"
+
+    monkeypatch.setenv("FP32_MASTER_SCOPE", "vision")
+    monkeypatch.setattr("sys.argv", ["train_cvlm.py", "--output_dir", "/tmp/x"])
+    assert train_cvlm.parse_args().fp32_master_scope == "vision"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["train_cvlm.py", "--output_dir", "/tmp/x", "--fp32_master_scope", "bogus"],
+    )
+    with pytest.raises(SystemExit):
+        train_cvlm.parse_args()

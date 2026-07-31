@@ -78,24 +78,25 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 
 
 class MasterWeightAdamW(torch.optim.AdamW):
-    """AdamW that keeps an fp32 MASTER copy of every low-precision parameter.
+    """AdamW that keeps an fp32 MASTER copy of SELECTED low-precision parameters.
 
     WHY THIS EXISTS. The whole model is built in bf16 and (until this class)
     AdamW updated those bf16 tensors in place, with bf16 moments. bf16 keeps 8
-    mantissa bits, so a weight of magnitude ~1.0 has ULP 2**-7 = 7.8e-3 and a
-    weight of magnitude ~0.02 has ULP ~1.2e-4. An AdamW update is ~lr in size
-    (the moment ratio is O(1)), i.e. 1e-4 in this campaign. For the small
-    random-init weights that is above half an ULP and lands; for the ~4x larger
-    PRETRAINED ViT weights it is below half an ULP and is silently rounded
-    away — every step, forever. Measured on the rd5/rd6 run: 63.6% of the
-    pretrained ViT weights were BIT-for-BIT unchanged between step 1000 and
-    step 11326 (drift 2.77%) versus 19.5% drift for the random-init arm. Any
-    "the pretrained visual prior hurts" claim is therefore confounded with a
-    pure floating-point artifact that is COLLINEAR with the treatment.
+    mantissa bits, so its RELATIVE granularity is 2**-8..2**-7 == 0.39%..0.78%
+    of the weight's own magnitude: ULP is 7.8e-3 at magnitude ~1.0 and ~1.2e-4
+    at magnitude ~0.02. An AdamW update is ~lr in size (the moment ratio is
+    O(1)), i.e. 1e-4 in this campaign. For the small random-init weights that
+    is above half an ULP and lands; for the ~4x larger PRETRAINED ViT weights
+    it is below half an ULP and is silently rounded away — every step, forever.
+    Measured on the rd5/rd6 run: 63.6% of the pretrained ViT weights were
+    BIT-for-BIT unchanged between step 1000 and step 11326 (drift 2.77%) versus
+    19.5% drift for the random-init arm. Any "the pretrained visual prior
+    hurts" (or "post-bottleneck depth hurts") claim is therefore confounded
+    with a floating-point artifact COLLINEAR with the treatment.
 
     WHAT IT DOES. Parameters stay bf16 for forward/backward (activation memory
     and speed are untouched, and the model/checkpoint dtype does not change),
-    but the optimizer owns an fp32 clone of each of them:
+    but the optimizer owns an fp32 clone of each SELECTED one:
 
         master.grad <- p.grad        (upcast copy, after clipping)
         AdamW.step() on the fp32 masters, with fp32 moments
@@ -103,43 +104,66 @@ class MasterWeightAdamW(torch.optim.AdamW):
 
     Sub-ULP updates now ACCUMULATE in the master instead of being destroyed, so
     a pretrained weight moves as soon as the accumulated update crosses half an
-    ULP. fp32 parameters already in the group (pool_queries, mixer_gates) are
-    used directly with no master copy.
+    ULP.
 
-    STATE / RESUME. ``self.param_groups`` holds the MASTER tensors, so
-    LR schedulers, ``check_optimizer_groups_match`` and the AdamW state machine
-    all work unchanged, and the moments are created fp32 (``zeros_like(master)``)
-    rather than bf16. ``state_dict()`` additionally stores the master tensors
-    themselves under ``MASTER_WEIGHTS_KEY``; ``load_state_dict()`` restores them
-    in place, so a resumed run continues from the FULL-precision weights instead
-    of re-seeding from the rounded bf16 checkpoint.
+    SCOPE (``master_params``). None = every low-precision parameter in the
+    groups. Otherwise ONLY the listed tensors are mastered — the decoder,
+    text encoder and projectors then keep the exact legacy bf16-in-place AdamW
+    path, BIT-for-BIT, so a scope-limited run changes the numerics of the ViT/
+    mixer stack and of nothing else. That matters both for memory (this model
+    trains ~1.84B parameters: mastering all of them costs ~20.5 GiB, mastering
+    the ViT costs ~1.0 GiB) and for the experiment (a run that simultaneously
+    changes the optimization of decoder + encoder + projectors + ViT is not a
+    test of "ViT update quantization explains the gap"). fp32 parameters
+    (pool_queries, mixer_gates) are always used directly, with no master copy —
+    they already are their own master.
+
+    STATE / RESUME. ``self.param_groups`` holds the master tensors in place of
+    the mastered parameters (everything else is the live tensor), so LR
+    schedulers, ``check_optimizer_groups_match`` and the AdamW state machine all
+    work unchanged, and the mastered tensors' moments are created fp32
+    (``zeros_like(master)``) while the untouched ones stay bf16.
+    ``state_dict()`` additionally stores the master tensors themselves under
+    ``MASTER_WEIGHTS_KEY``; ``load_state_dict()`` restores them in place, so a
+    resumed run continues from the FULL-precision weights instead of re-seeding
+    from the rounded bf16 checkpoint (and a scope change is rejected, because
+    the number of stored masters no longer matches).
 
     MEMORY. +4 bytes/param for the master, +4 for its fp32 grad buffer, and
-    fp32 (8B) instead of bf16 (4B) moments == +12 bytes per low-precision
-    trainable parameter (~2.5 GB for this campaign's ~211M trainable params).
+    fp32 (8B) instead of bf16 (4B) moments == +12 bytes per MASTERED parameter.
     """
 
-    def __init__(self, params: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        params: Any,
+        master_params: Optional[Iterable[torch.Tensor]] = None,
+        **kwargs: Any,
+    ) -> None:
         groups = list(params)
         if not groups:
             raise ValueError("MasterWeightAdamW got an empty parameter list")
         if not isinstance(groups[0], dict):
             groups = [{"params": groups}]
+        selected: Optional[Set[int]] = (
+            None if master_params is None else {id(p) for p in master_params}
+        )
         master_groups: List[dict] = []
         pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
         for group in groups:
             group = dict(group)
-            master_params: List[torch.Tensor] = []
+            group_params: List[torch.Tensor] = []
             for param in list(group["params"]):
-                if param.dtype in LOW_PRECISION_DTYPES:
+                wanted = selected is None or id(param) in selected
+                if wanted and param.dtype in LOW_PRECISION_DTYPES:
                     master = param.detach().clone().to(torch.float32)
                     master.requires_grad_(param.requires_grad)
                     pairs.append((param, master))
-                    master_params.append(master)
+                    group_params.append(master)
                 else:
-                    # Already full precision: optimize the live tensor itself.
-                    master_params.append(param)
-            group["params"] = master_params
+                    # Out of scope, or already full precision: optimize the
+                    # live tensor itself on the untouched legacy path.
+                    group_params.append(param)
+            group["params"] = group_params
             master_groups.append(group)
         super().__init__(master_groups, **kwargs)
         self._master_pairs = pairs
@@ -219,8 +243,9 @@ class MasterWeightAdamW(torch.optim.AdamW):
             raise RuntimeError(
                 f"fp32 master-weight resume mismatch: checkpoint has {len(saved)} master "
                 f"tensor(s), the current optimizer needs {len(self._master_pairs)}. The "
-                "trainable-parameter set or the parameter dtypes changed since the "
-                "checkpoint was written."
+                "master SCOPE (--fp32_master_scope / FP32_MASTER_SCOPE), the trainable-"
+                "parameter set or the parameter dtypes changed since the checkpoint was "
+                "written; resume with the same flags or start a fresh run."
             )
         flat = self._flat_master_params()
         with torch.no_grad():
@@ -251,11 +276,16 @@ def build_optimizer(
     betas: Tuple[float, float],
     weight_decay: float = 0.0,
     fp32_master_weights: bool = False,
+    master_params: Optional[Iterable[torch.Tensor]] = None,
+    **adamw_kwargs: Any,
 ) -> Optimizer:
     """AdamW, optionally with fp32 master weights (see ``MasterWeightAdamW``).
 
     ``fp32_master_weights=False`` returns a plain ``torch.optim.AdamW`` built
     exactly as before, so the legacy trajectory is reproduced byte for byte.
+    ``master_params`` restricts the fp32 treatment to those tensors (everything
+    else keeps the legacy bf16-in-place path); None means "every low-precision
+    trainable parameter".
     """
     if not fp32_master_weights:
         return torch.optim.AdamW(
@@ -263,12 +293,15 @@ def build_optimizer(
             lr=lr,
             betas=betas,
             weight_decay=weight_decay,
+            **adamw_kwargs,
         )
     return MasterWeightAdamW(
         param_groups,
+        master_params=master_params,
         lr=lr,
         betas=betas,
         weight_decay=weight_decay,
+        **adamw_kwargs,
     )
 
 

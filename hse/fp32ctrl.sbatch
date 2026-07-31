@@ -2,7 +2,7 @@
 #SBATCH --job-name=cvlm_fp32
 #SBATCH --partition=rocky
 #SBATCH --constraint=type_e
-#SBATCH --time=12:00:00
+#SBATCH --time=1-00:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -11,38 +11,55 @@
 #SBATCH --error=/home/aburlova/cvlm/runs/_logs/%x_%j.err
 
 # ============================================================================
-# РЕШАЮЩИЙ КОНТРОЛЬ ЧИСЛЕННОЙ ТОЧНОСТИ (fp32 master weights)
+# РЕШАЮЩИЙ КОНТРОЛЬ ЧИСЛЕННОЙ ТОЧНОСТИ (fp32 master weights, scope=vision)
 # ============================================================================
 # ПРОБЛЕМА. Вся модель живёт в bf16, AdamW обновлял bf16-параметры НА МЕСТЕ
-# (без autocast, без GradScaler, без мастер-весов). У bf16 8 бит мантиссы:
-# ULP веса величины ~1.0 равен 2^-7 = 7.8e-3, веса величины ~0.02 — ~1.2e-4.
-# Апдейт AdamW по модулю ~lr = 1e-4. Для КРУПНЫХ предобученных весов ViT это
-# МЕНЬШЕ половины ULP => округление стирает апдейт на каждом шаге; для мелких
-# случайных весов — не стирает. Замер на прогоне rd5/rd6: 63.6% весов
-# предобученного ViT ПОБИТОВО не изменились между шагом 1000 и 11326 (дрейф
-# 2.77%) против 19.5% дрейфа у random-init арма. Значит клейм «предобученный
-# визуальный приор вредит» КОНФАУНДЕН с чисто численным артефактом, причём
-# конфаундер КОЛЛИНЕАРЕН лечению (pretrained <=> крупные веса <=> крупный ULP).
+# (без autocast, без GradScaler, без мастер-весов). bf16 хранит 8 бит мантиссы,
+# т.е. ОТНОСИТЕЛЬНАЯ гранулярность ~0.39-0.78% (2^-8..2^-7) от величины самого
+# веса: ULP = 7.8e-3 при |w|~1.0 и ~1.2e-4 при |w|~0.02. Апдейт AdamW по модулю
+# ~lr = 1e-4. Для КРУПНЫХ предобученных весов ViT это МЕНЬШЕ половины ULP =>
+# округление стирает апдейт на каждом шаге; для мелких случайных весов — не
+# стирает. Замер на прогоне rd5/rd6: 63.6% весов предобученного ViT ПОБИТОВО не
+# изменились между шагом 1000 и 11326 (дрейф 2.77%) против 19.5% дрейфа у
+# random-init арма. Значит и клейм «предобученный приор вредит», и ЦЕНТРАЛЬНЫЙ
+# клейм «пост-ботлнек глубина вредит» конфаундены с численным артефактом,
+# коллинеарным лечению.
 #
-# КОНТРОЛЬ. Те же два арма, но с FP32_MASTER_WEIGHTS=1: параметры остаются
-# bf16 для forward/backward, а AdamW ведёт fp32-мастер-копии, считает моменты
-# в fp32 и округляет обратно в bf16 после шага. Суб-ULP апдейты НАКАПЛИВАЮТСЯ,
-# а не стираются. Если разрыв vit-vs-randomvit сохраняется — эффект настоящий;
-# если исчезает/переворачивается — это была арифметика.
+# КОНТРОЛЬ. Те же армы, но FP32_MASTER_WEIGHTS=1 + FP32_MASTER_SCOPE=vision:
+# fp32-мастера и fp32-моменты создаются ТОЛЬКО для ViT/mixer (~86M параметров).
+# Декодер, текстовый энкодер, проекторы, pos_embed и pool_queries остаются на
+# ПОБИТОВО прежнем bf16-пути. Это критично:
+#   * научно — иначе прогон меняет численную оптимизацию ЧЕТЫРЁХ подмодулей
+#     сразу и перестаёт быть тестом гипотезы «квантование апдейтов ViT
+#     объясняет разрыв»;
+#   * по памяти — ДЕКОДЕР ОБУЧАЕМЫЙ (реальный лог: trainable 1,835,876,608 из
+#     1,874,560,000, 97.94%), scope=all стоил бы +20.5 GiB стейта оптимизатора
+#     и почти наверняка OOM; scope=vision стоит +1.0 GiB.
 #
-# ДИАГНОСТИКА (пишется в лог/CSV/mechanistic.jsonl каждые LOG_INTERVAL шагов):
-#   vit_frozen_frac=0.XXXX  доля весов ViT/mixer, ПОБИТОВО не изменившихся с
-#                           прошлого лог-шага;
-#   vit_drift=0.XXXX        относительный L2-дрейф от инициализации
-#                           (||W-W0||/||W0||, W0 из mechanistic_init.safetensors).
+# ПРОТОКОЛ — ПОЛНЫЙ ИСХОДНЫЙ, без сокращений: то же расписание cr, те же
+# EPOCHS=3, тот же seed=42, те же батчи, что у legacy-армов (abl_vit /
+# abl_randomvit). Любое укорочение сделало бы сравнение с ними невалидным.
 #
-# ЗАПУСК (два арма — две джобы; ничего не запускается автоматически):
-#   STAMP=$(date +%Y%m%d_%H%M%S)
-#   sbatch --job-name=fp32_vit       --export=ALL,ARM=vit,STAMP=${STAMP}       fp32ctrl.sbatch
-#   sbatch --job-name=fp32_randomvit --export=ALL,ARM=randomvit,STAMP=${STAMP} fp32ctrl.sbatch
-# Повторный запуск с тем же OUTPUT_DIR резюмит с последнего чекпоинта
-# (FP32_MASTER_WEIGHTS=1 обязателен и при resume — иначе train падает с явной
-# ошибкой, чтобы мастер-копии не потерялись молча).
+# ДИАГНОСТИКА (лог + trackio + mechanistic.jsonl каждые LOG_INTERVAL шагов):
+#   vit_frozen_frac=0.XXXX   доля весов ViT/mixer, ПОБИТОВО не изменившихся с
+#                            прошлого лог-шага;
+#   vit_drift=0.XXXX         относительный L2-дрейф ЖИВЫХ bf16-весов от W0;
+#   vit_master_drift=0.XXXX  тот же дрейф, но по fp32-МАСТЕРАМ (честная мера
+#                            того, куда реально ушёл оптимизатор);
+#   vit_master_resid[_max]   ||master - bf16_live|| (норма отн. ||W0|| и max
+#                            abs) — НАКОПЛЕННЫЙ, но ещё не проявившийся в bf16
+#                            апдейт. В legacy-пути эта величина уничтожалась.
+#   W0 берётся из mechanistic_init.safetensors (переживает resume).
+#
+# ЗАПУСК (ничего не запускается автоматически; порядок важен):
+#   # 1) ПРИОРИТЕТНЫЙ арм — защищает ЦЕНТРАЛЬНЫЙ клейм о пост-ботлнек глубине:
+#   sbatch --job-name=fp32_randomvit --export=ALL,ARM=randomvit fp32ctrl.sbatch
+#   # 2) вторым — предобученный ViT (вторичный клейм про визуальный приор):
+#   sbatch --job-name=fp32_vit       --export=ALL,ARM=vit       fp32ctrl.sbatch
+# Армы независимы: каждый — своя джоба, свой OUTPUT_DIR, можно запускать по
+# одному. Повторный запуск с тем же OUTPUT_DIR резюмит с последнего чекпоинта
+# (FP32_MASTER_WEIGHTS/FP32_MASTER_SCOPE обязаны совпадать — иначе train падает
+# с явной ошибкой, чтобы мастер-копии не потерялись молча).
 # ============================================================================
 
 set -euo pipefail
@@ -56,37 +73,37 @@ SNAPSHOT_ROOT="${CVLM_SNAPSHOT_ROOT:-/home/aburlova/cvlm}"
 source "${SNAPSHOT_ROOT}/hse/protocol.env"
 export CVLM_ROOT="${SNAPSHOT_ROOT}"
 test -s "${CVLM_ROOT}/VERSION" || { echo "ERROR: missing ${CVLM_ROOT}/VERSION"; exit 1; }
-# Код обязан УЖЕ содержать флаг: иначе молча получили бы обычный bf16-прогон.
-grep -q -- "--fp32_master_weights" "${CVLM_ROOT}/src/train_cvlm.py" || {
-  echo "ERROR: ${CVLM_ROOT}/src/train_cvlm.py has no --fp32_master_weights; sync the code first"
+# Код обязан УЖЕ содержать флаги: иначе молча получили бы обычный bf16-прогон.
+grep -q -- "--fp32_master_scope" "${CVLM_ROOT}/src/train_cvlm.py" || {
+  echo "ERROR: ${CVLM_ROOT}/src/train_cvlm.py has no --fp32_master_scope; sync the code first"
   exit 1
 }
 echo "=== CODE VERSION: $(cat "${CVLM_ROOT}/VERSION")"
 
-ARM="${ARM:?set ARM=vit|randomvit}"
+# ARM по умолчанию — randomvit (приоритетный: центральный клейм).
+ARM="${ARM:-randomvit}"
 export VIT_INIT=pretrained FREEZE_VIT=0 NO_VIT=0 MIXER_DEPTH_MAP=""
 case "${ARM}" in
-  vit)       ;;                          # предобученный ViT-Base (лечение)
   randomvit) export VIT_INIT=random ;;   # та же архитектура, config-init
-  *) echo "unknown ARM=${ARM} (expected vit|randomvit)"; exit 1 ;;
+  vit)       ;;                          # предобученный ViT-Base
+  *) echo "unknown ARM=${ARM} (expected randomvit|vit)"; exit 1 ;;
 esac
 
 # --- ЭТО и есть лечение эксперимента --------------------------------------
 export FP32_MASTER_WEIGHTS=1
+export FP32_MASTER_SCOPE=vision   # ТОЛЬКО ViT/mixer; всё остальное — legacy
 
-# --- укороченный протокол: 4 стадии, решающая точка — шаг 3000 -------------
-# Всё остальное (модели, lr=1e-4, batch, warmup, MAX_*_LEN, unfreeze, seed)
-# берётся из protocol.env, чтобы контроль отличался от основных армов ТОЛЬКО
-# длиной куррикулума и мастер-весами.
-export CR_SCHEDULE="1:1000,2:2000,4:3000,8:0"
-export COMPRESSION_RATE=8      # только для финального eval: последняя стадия
-                               # куррикулума (в трейне cr берётся из CR_SCHEDULE)
-export EPOCHS=1                # ~3.8k optimizer-шагов при bs=64 (эпоха PwC),
-                               # т.е. все 4 стадии проходятся полностью;
-                               # принудительные сейвы на границах 1000/2000/3000
-export SAVE_INTERVAL_STEPS=500 # плотная сетка чекпоинтов для анализа дрейфа
+# --- ПОЛНЫЙ протокол, идентичный legacy-армам ------------------------------
+# Значения дублируют protocol.env НАМЕРЕННО: сравнение идёт с уже отснятыми
+# abl_vit/abl_randomvit, поэтому расписание пиннится здесь и не должно
+# «поехать» вслед за будущими правками протокола.
+export CR_SCHEDULE="1:1500,2:3000,4:4500,8:6000,16:0"
+export EPOCHS=3                # как в основной кампании (~11.3k opt-шагов)
+export COMPRESSION_RATE=16     # только для финального eval: последняя стадия
+                               # (в трейне cr берётся из CR_SCHEDULE)
+export SAVE_INTERVAL_STEPS=1000  # как в protocol.env: ckpt ~3.7 GB каждый
 export LOG_INTERVAL=10         # окно vit_frozen_frac == LOG_INTERVAL шагов
-export SEED=42
+export SEED=42                 # те же батчи, что у legacy-армов
 
 # --- eval: только финальный чекпоинт, только cvlm --------------------------
 export EVAL_ALL_CHECKPOINTS=0
@@ -101,10 +118,11 @@ export RUN_TAG="fp32_${ARM}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${RUNS_ROOT}/fp32_${ARM}_${STAMP:-$(date +%Y%m%d_%H%M%S)}}"
 mkdir -p "${OUTPUT_DIR}"
 
-# Resume после таймаута/падения (12h окна должно хватать: ~4.5h трейн + eval).
+# Resume после таймаута/падения (полный протокол ~9-10 ч трейна + eval; окно
+# 24 ч, но повторный запуск всё равно полезен при перезапусках).
 if compgen -G "${OUTPUT_DIR}/model_step_"*.safetensors >/dev/null 2>&1; then
   export RESUME_DIR="${OUTPUT_DIR}"
-  echo "=== RESUME from ${OUTPUT_DIR} (FP32_MASTER_WEIGHTS must stay 1)"
+  echo "=== RESUME from ${OUTPUT_DIR} (FP32_MASTER_WEIGHTS=1, SCOPE=vision must stay)"
 fi
 if [ -f "${OUTPUT_DIR}/TRAIN_DONE" ]; then
   echo "=== TRAIN_DONE marker present; nothing to do"
@@ -112,11 +130,13 @@ if [ -f "${OUTPUT_DIR}/TRAIN_DONE" ]; then
 fi
 
 echo "=== node $(hostname), gpu: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader)"
-echo "=== ARM=${ARM} VIT_INIT=${VIT_INIT} FP32_MASTER_WEIGHTS=${FP32_MASTER_WEIGHTS}"
-echo "=== CR_SCHEDULE=${CR_SCHEDULE} EPOCHS=${EPOCHS} BATCH_SIZE=${BATCH_SIZE} LR=${LR}"
+echo "=== ARM=${ARM} VIT_INIT=${VIT_INIT} FP32_MASTER_WEIGHTS=1 SCOPE=${FP32_MASTER_SCOPE}"
+echo "=== CR_SCHEDULE=${CR_SCHEDULE} EPOCHS=${EPOCHS} BATCH_SIZE=${BATCH_SIZE} LR=${LR} SEED=${SEED}"
 echo "=== OUTPUT_DIR=${OUTPUT_DIR}"
-# При OOM (fp32-мастера + fp32-моменты стоят ~+2.5 GB состояния оптимизатора):
-#   export BATCH_SIZE=32 GRAD_ACCUM=2   -> тот же эффективный батч 64, ОБА арма.
+# Память: scope=vision добавляет ~1.0 GiB стейта оптимизатора (мастер + fp32
+# grad + fp32 моменты на ~86M параметров ViT) + ~0.34 GiB на снапшоты
+# диагностики. При OOM: export BATCH_SIZE=32 GRAD_ACCUM=2 (тот же эффективный
+# батч 64) — но тогда ОБА арма, иначе сравнение поедет.
 
 cd "${CVLM_ROOT}"
 cp VERSION "${OUTPUT_DIR}/CODE_VERSION"
@@ -127,6 +147,7 @@ sha256sum src/*.py scripts/run_full_pipeline.sh hse/fp32ctrl.sbatch hse/protocol
   echo "ARM=${ARM}"
   echo "VIT_INIT=${VIT_INIT}"
   echo "FP32_MASTER_WEIGHTS=${FP32_MASTER_WEIGHTS}"
+  echo "FP32_MASTER_SCOPE=${FP32_MASTER_SCOPE}"
   echo "CR_SCHEDULE=${CR_SCHEDULE}"
   echo "COMPRESSION_RATE_EVAL=${COMPRESSION_RATE}"
   echo "EPOCHS=${EPOCHS}"
@@ -134,6 +155,7 @@ sha256sum src/*.py scripts/run_full_pipeline.sh hse/fp32ctrl.sbatch hse/protocol
   echo "GRAD_ACCUM=${GRAD_ACCUM}"
   echo "LR=${LR}"
   echo "DISABLE_LR_SCHEDULE=${DISABLE_LR_SCHEDULE}"
+  echo "ENABLE_WARMUP=${ENABLE_WARMUP} WARMUP_STEPS=${WARMUP_STEPS}"
   echo "UNFREEZE_ENCODER_TOP_K=${UNFREEZE_ENCODER_TOP_K}"
   echo "NUM_POOL_LATENTS=${NUM_POOL_LATENTS}"
   echo "MAX_SOURCE_LEN=${MAX_SOURCE_LEN}"
@@ -144,8 +166,8 @@ sha256sum src/*.py scripts/run_full_pipeline.sh hse/fp32ctrl.sbatch hse/protocol
   echo "CODE_VERSION=$(cat VERSION)"
 } > "${OUTPUT_DIR}/EXPERIMENT_FLAGS"
 
-# Диск-гигиена: с fp32-мастерами trainer_step_*.pt весит ~2.6 GB — держим
-# только самый свежий (нужен лишь для resume).
+# Диск-гигиена: trainer_step_*.pt ~8 GB (моменты по ~1.84B обучаемых) — держим
+# только самый свежий, он нужен лишь для resume.
 (
   while true; do
     sleep 900

@@ -151,6 +151,27 @@ def _build_param_groups(model: torch.nn.Module, lr: float, gate_lr_mult: float) 
     ]
 
 
+def _vision_scope_params(model: torch.nn.Module) -> List[torch.nn.Parameter]:
+    """Trainable parameters of the post-bottleneck ViT/mixer stack.
+
+    This is the ``--fp32_master_scope vision`` selection: the ONLY sub-module
+    whose update quantization is under test. Everything else (decoder, text
+    encoder, projectors, pos-embed, pool queries) must keep the legacy bf16
+    optimizer path bit-for-bit, otherwise the run confounds four simultaneous
+    changes of numerics instead of testing one.
+    """
+    core = unwrap_model(model)
+    out: List[torch.nn.Parameter] = []
+    if getattr(core, "mixer_layers", None) is not None:
+        out.extend(core.mixer_layers.parameters())
+        gates = getattr(core, "mixer_gates", None)
+        if gates is not None:
+            out.append(gates)
+    if getattr(core, "vision_encoder", None) is not None:
+        out.extend(core.vision_encoder.parameters())
+    return [p for p in out if p.requires_grad]
+
+
 _BITWISE_VIEW_DTYPES = {
     torch.bfloat16: torch.int16,
     torch.float16: torch.int16,
@@ -193,7 +214,23 @@ class VitDriftTracker:
         same LR — a numerical-precision confounder that is collinear with the
         pretrained-vs-random treatment.
       * ``vit_drift`` — global relative L2 distance from initialization,
-        ``||W - W_0||_2 / ||W_0||_2`` over the same parameter set.
+        ``||W - W_0||_2 / ||W_0||_2`` over the same parameter set, measured on
+        the LIVE (rounded bf16) weights, i.e. on what the forward pass sees.
+
+    With fp32 master weights a ``master_lookup`` is passed in and two more
+    numbers are reported, because the live bf16 weights alone would understate
+    what the optimizer has actually learned:
+
+      * ``vit_master_drift`` — the same relative L2 drift computed on the fp32
+        MASTER weights. This is the honest "how far has the optimizer moved
+        this stack" number.
+      * ``vit_master_resid`` / ``vit_master_resid_max`` — norm (relative to
+        ``||W_0||``) and max-abs of ``master - live_bf16``: the update that has
+        been accumulated but has NOT yet shown up in the bf16 weights because
+        it is still below half an ULP. In the legacy path that quantity is
+        destroyed at every step; here it is carried forward, so a large
+        residual with a flat ``vit_drift`` means "learning is happening and is
+        about to materialise", not "nothing is happening".
 
     ``W_0`` is taken from ``mechanistic_init.safetensors`` when available (the
     exact step-0 weights, written by ``_write_or_verify_initialization_artifacts``),
@@ -210,6 +247,7 @@ class VitDriftTracker:
         self,
         model: torch.nn.Module,
         init_state: Optional[dict] = None,
+        master_lookup: Optional[dict] = None,
     ) -> None:
         core = unwrap_model(model)
         named: List[Tuple[str, torch.nn.Parameter]] = []
@@ -253,6 +291,14 @@ class VitDriftTracker:
         for reference in self._init:
             init_sq += float(torch.linalg.vector_norm(reference.float(), dtype=torch.float32) ** 2)
         self._init_norm = init_sq**0.5
+        # fp32 master behind each tracked parameter, when the optimizer keeps
+        # one. A tracked fp32 parameter (mixer_gates) IS its own master.
+        self.has_masters = master_lookup is not None
+        lookup = master_lookup or {}
+        self._masters = [lookup.get(id(param), param) for _, param in self.params]
+        self.mastered_tensors = sum(
+            1 for (_, param), master in zip(self.params, self._masters) if master is not param
+        )
 
     def measure(self) -> Optional[dict]:
         """Stats since the previous ``measure()`` call; advances the snapshot."""
@@ -260,17 +306,40 @@ class VitDriftTracker:
             return None
         unchanged = 0
         delta_sq = 0.0
-        for (_, param), previous, reference in zip(self.params, self._prev, self._init):
+        master_delta_sq = 0.0
+        resid_sq = 0.0
+        resid_max = 0.0
+        for (_, param), previous, reference, master in zip(
+            self.params, self._prev, self._init, self._masters
+        ):
             current = param.detach()
             unchanged += _bitwise_unchanged(current, previous)
-            delta = current.float() - reference.float()
-            delta_sq += float(torch.linalg.vector_norm(delta, dtype=torch.float32) ** 2)
+            live = current.float()
+            reference_f = reference.float()
+            delta_sq += float(torch.linalg.vector_norm(live - reference_f, dtype=torch.float32) ** 2)
+            if self.has_masters:
+                master_f = master.detach().float()
+                master_delta_sq += float(
+                    torch.linalg.vector_norm(master_f - reference_f, dtype=torch.float32) ** 2
+                )
+                residual = master_f - live
+                resid_sq += float(torch.linalg.vector_norm(residual, dtype=torch.float32) ** 2)
+                resid_max = max(resid_max, float(residual.abs().max()) if residual.numel() else 0.0)
             previous.copy_(current)
-        return {
+        scale = self._init_norm if self._init_norm > 0 else 0.0
+        stats = {
             "vit_frozen_frac": unchanged / max(self.numel, 1),
-            "vit_drift": (delta_sq**0.5) / self._init_norm if self._init_norm > 0 else 0.0,
+            "vit_drift": (delta_sq**0.5) / scale if scale > 0 else 0.0,
             "vit_tracked_params": int(self.numel),
+            "vit_master_drift": None,
+            "vit_master_resid": None,
+            "vit_master_resid_max": None,
         }
+        if self.has_masters:
+            stats["vit_master_drift"] = (master_delta_sq**0.5) / scale if scale > 0 else 0.0
+            stats["vit_master_resid"] = (resid_sq**0.5) / scale if scale > 0 else 0.0
+            stats["vit_master_resid_max"] = resid_max
+        return stats
 
 
 class MixedCrSampler:
@@ -464,8 +533,23 @@ def parse_args() -> argparse.Namespace:
         "and is silently discarded every step, while the ~4x smaller random-init weights "
         "still move — a precision artifact collinear with the pretrained-vs-random "
         "treatment. 0 (default) = legacy in-place bf16 AdamW, byte-for-byte. Costs ~12 "
-        "bytes per low-precision trainable parameter. A resumed run must reuse the same "
-        "value (the master copies live in the optimizer state). Env: FP32_MASTER_WEIGHTS.",
+        "bytes per MASTERED parameter (see --fp32_master_scope). A resumed run must reuse "
+        "the same value (the master copies live in the optimizer state). "
+        "Env: FP32_MASTER_WEIGHTS.",
+    )
+    p.add_argument(
+        "--fp32_master_scope",
+        type=str,
+        choices=["all", "vision"],
+        default=os.environ.get("FP32_MASTER_SCOPE", "all"),
+        help="Which parameters --fp32_master_weights applies to. 'all' (default) = every "
+        "low-precision trainable tensor; note this model trains ~1.84B params (the DECODER "
+        "is trainable), so mastering everything costs ~20.5 GiB of extra optimizer state and "
+        "changes the numerics of decoder + text encoder + projectors + ViT simultaneously. "
+        "'vision' = ONLY the ViT/mixer stack (~86M params, ~1.0 GiB): the isolated control "
+        "for 'ViT update quantization explains the gap', with every other parameter left on "
+        "the bit-for-bit legacy bf16 path. Ignored when --fp32_master_weights is off. "
+        "Env: FP32_MASTER_SCOPE.",
     )
     p.add_argument(
         "--mixed_cr_set",
@@ -1084,21 +1168,34 @@ def main() -> None:
         )
 
     param_groups = _build_param_groups(model, args.lr, float(args.gate_lr_mult))
+    master_scope_params = None
+    if args.fp32_master_weights and str(args.fp32_master_scope) == "vision":
+        master_scope_params = _vision_scope_params(model)
+        if not master_scope_params:
+            raise ValueError(
+                "--fp32_master_scope vision requires a trainable ViT/mixer stack, but this "
+                "run has none (--no_vit / --freeze_vit). Use --fp32_master_scope all or drop "
+                "--fp32_master_weights."
+            )
     optimizer = build_optimizer(
         param_groups,
         lr=args.lr,
         betas=(args.adamw_beta1, args.adamw_beta2),
         weight_decay=0.0,
         fp32_master_weights=bool(args.fp32_master_weights),
+        master_params=master_scope_params,
     )
     if is_master and isinstance(optimizer, MasterWeightAdamW):
         mastered = optimizer.mastered_numel
+        trainable_total = sum(p.numel() for p in unwrap_model(model).parameters() if p.requires_grad)
         print(
-            f"[fp32-master] fp32 MASTER WEIGHTS enabled: {len(optimizer.master_pairs)} bf16/fp16 "
-            f"tensor(s) / {mastered} params get an fp32 master copy "
-            f"(+{mastered * 12 / (1024**3):.2f} GB of optimizer state: master + fp32 grad + "
+            f"[fp32-master] fp32 MASTER WEIGHTS enabled (scope={args.fp32_master_scope}): "
+            f"{len(optimizer.master_pairs)} tensor(s) / {mastered} of {trainable_total} trainable "
+            f"params get an fp32 master copy "
+            f"(+{mastered * 12 / (1024**3):.2f} GiB of optimizer state: master + fp32 grad + "
             f"fp32 moments). Model params stay bf16; updates below half a bf16 ULP now "
-            f"accumulate instead of being rounded away."
+            f"accumulate instead of being rounded away. Parameters OUTSIDE the scope keep "
+            f"the legacy in-place bf16 AdamW path bit-for-bit."
         )
     if is_master and len(param_groups) > 1:
         print(
@@ -1169,15 +1266,25 @@ def main() -> None:
         init_path = os.path.join(args.output_dir, "mechanistic_init.safetensors")
         if os.path.exists(init_path):
             init_state = load_file(init_path)
-        vit_tracker = VitDriftTracker(model, init_state=init_state)
+        master_lookup = None
+        if isinstance(optimizer, MasterWeightAdamW):
+            master_lookup = {id(param): master for param, master in optimizer.master_pairs}
+        vit_tracker = VitDriftTracker(
+            model,
+            init_state=init_state,
+            master_lookup=master_lookup,
+        )
         if vit_tracker.enabled:
             print(
                 f"[vit-drift] tracking {vit_tracker.numel} trainable {vit_tracker.branch} "
                 f"params in {len(vit_tracker.params)} tensor(s); init from "
                 f"{'mechanistic_init.safetensors' if vit_tracker.init_from_file else 'current weights'} "
-                f"({vit_tracker.init_from_file}/{len(vit_tracker.params)} tensors matched). "
-                f"Logs vit_frozen_frac (bitwise-unchanged since last log) + vit_drift "
-                f"(relative L2 from init) every --log_interval."
+                f"({vit_tracker.init_from_file}/{len(vit_tracker.params)} tensors matched); "
+                f"fp32 masters behind {vit_tracker.mastered_tensors}/{len(vit_tracker.params)} "
+                f"tracked tensors. Logs vit_frozen_frac (bitwise-unchanged since last log), "
+                f"vit_drift (live bf16 weights vs init) and, with master weights, "
+                f"vit_master_drift + vit_master_resid (accumulated-but-not-yet-visible update) "
+                f"every --log_interval."
             )
         else:
             vit_tracker = None
@@ -1226,6 +1333,7 @@ def main() -> None:
             "compact_decoder_positions": bool(model_args.compact_decoder_positions),
             "gate_lr_mult": float(args.gate_lr_mult),
             "fp32_master_weights": bool(args.fp32_master_weights),
+            "fp32_master_scope": str(args.fp32_master_scope),
             "mixed_cr_set": str(args.mixed_cr_set or ""),
             "max_source_len": args.max_source_len,
             "epochs": args.epochs,
@@ -1468,9 +1576,17 @@ def main() -> None:
                 # Advances the tracker's window, so call it exactly once per log.
                 vit_stats = vit_tracker.measure() if vit_tracker is not None else None
                 if vit_stats is not None:
+                    master_str = ""
+                    if vit_stats["vit_master_drift"] is not None:
+                        master_str = (
+                            f"vit_master_drift={vit_stats['vit_master_drift']:.4f} "
+                            f"vit_master_resid={vit_stats['vit_master_resid']:.6f} "
+                            f"vit_master_resid_max={vit_stats['vit_master_resid_max']:.3e} "
+                        )
                     print(
                         f"    vit_frozen_frac={vit_stats['vit_frozen_frac']:.4f} "
                         f"vit_drift={vit_stats['vit_drift']:.4f} "
+                        f"{master_str}"
                         f"(tracked={vit_stats['vit_tracked_params']} params, "
                         f"window={args.log_interval} steps)"
                     )
@@ -1511,6 +1627,10 @@ def main() -> None:
                     if vit_stats is not None:
                         metrics["train/vit_frozen_frac"] = vit_stats["vit_frozen_frac"]
                         metrics["train/vit_drift"] = vit_stats["vit_drift"]
+                        if vit_stats["vit_master_drift"] is not None:
+                            metrics["train/vit_master_drift"] = vit_stats["vit_master_drift"]
+                            metrics["train/vit_master_resid"] = vit_stats["vit_master_resid"]
+                            metrics["train/vit_master_resid_max"] = vit_stats["vit_master_resid_max"]
                     if args.mixed_fidelity_p > 0 and running_avg_raw_frac.count > 0:
                         metrics["train/mixed_raw_frac"] = running_avg_raw_frac.avg
                         metrics["train/mixed_input_len"] = running_avg_input_len.avg
@@ -1573,11 +1693,25 @@ def main() -> None:
                                 model_args.compact_decoder_positions
                             ),
                             "fp32_master_weights": bool(args.fp32_master_weights),
+                            "fp32_master_scope": (
+                                str(args.fp32_master_scope)
+                                if args.fp32_master_weights
+                                else None
+                            ),
                             "vit_frozen_frac": (
                                 vit_stats["vit_frozen_frac"] if vit_stats is not None else None
                             ),
                             "vit_drift": (
                                 vit_stats["vit_drift"] if vit_stats is not None else None
+                            ),
+                            "vit_master_drift": (
+                                vit_stats["vit_master_drift"] if vit_stats is not None else None
+                            ),
+                            "vit_master_resid": (
+                                vit_stats["vit_master_resid"] if vit_stats is not None else None
+                            ),
+                            "vit_master_resid_max": (
+                                vit_stats["vit_master_resid_max"] if vit_stats is not None else None
                             ),
                             "vit_tracked_params": (
                                 vit_stats["vit_tracked_params"] if vit_stats is not None else None

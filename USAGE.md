@@ -399,41 +399,59 @@ Notes:
 
 Training runs entirely in bf16 and, by default, AdamW updates those bf16
 parameters **in place** with bf16 moments (no `torch.autocast`, no master
-weights). bf16 keeps 8 mantissa bits, so a weight of magnitude ~1.0 has
-`ULP = 2^-7 = 7.8e-3` while a weight of magnitude ~0.02 has `ULP ~ 1.2e-4`.
-An AdamW update is ~`lr` in size (the moment ratio is O(1)), i.e. `1e-4` in
-this campaign: **below half an ULP for the large pretrained ViT weights, above
-it for the small random-init ones**. The pretrained weights therefore get their
-updates rounded away every step, forever — measured on the rd5/rd6 run, 63.6%
-of the pretrained ViT weights were bit-for-bit unchanged between step 1000 and
-step 11326 (2.77% drift) versus 19.5% drift in the random-init arm. Any
-"pretrained visual prior hurts" conclusion is confounded with that artifact,
-and the confounder is collinear with the treatment.
+weights). bf16 keeps 8 mantissa bits, so its **relative granularity is
+0.39%-0.78%** (`2^-8`..`2^-7`) of the weight's own magnitude: `ULP = 7.8e-3` at
+magnitude ~1.0 and `ULP ~ 1.2e-4` at magnitude ~0.02. An AdamW update is ~`lr`
+in size (the moment ratio is O(1)), i.e. `1e-4` in this campaign: **below half
+an ULP for the large pretrained ViT weights, above it for the small random-init
+ones**. The pretrained weights therefore get their updates rounded away every
+step, forever — measured on the rd5/rd6 run, 63.6% of the pretrained ViT
+weights were bit-for-bit unchanged between step 1000 and step 11326 (2.77%
+drift) versus 19.5% drift in the random-init arm. Both the "pretrained visual
+prior hurts" and the "post-bottleneck depth hurts" conclusions are confounded
+with that artifact, and the confounder is collinear with the treatment.
 
 `--fp32_master_weights` (env `FP32_MASTER_WEIGHTS=1`) makes AdamW keep an fp32
-**master copy** of every bf16 parameter: the model stays bf16 for
+**master copy** of the selected bf16 parameters: the model stays bf16 for
 forward/backward, the optimizer steps the fp32 masters with fp32 moments and
 rounds back into the bf16 tensor. Sub-ULP updates now accumulate instead of
 being destroyed.
 
+`--fp32_master_scope` (env `FP32_MASTER_SCOPE`, `all` | `vision`, default
+`all`) decides what it applies to. **Use `vision` for the controlled
+experiment**:
+
+| scope | mastered params | extra optimizer state | what changes |
+|---|---|---|---|
+| `all` | ~1.836B (everything trainable) | **+20.5 GiB** | decoder + text encoder + projectors + ViT numerics all at once |
+| `vision` | ~86.4M (ViT/mixer only) | **+1.0 GiB** | ViT/mixer only; every other tensor stays on the bit-for-bit legacy path |
+
+Note that **the decoder is trainable** in this codebase (`trainable params:
+1835876608 || all params: 1874560000 || trainable%: 97.94`) — only the lower
+text-encoder layers are frozen. `scope=all` is therefore expensive and
+scientifically blunt; `scope=vision` is the isolated test of "ViT update
+quantization explains the gap".
+
 ```bash
-FP32_MASTER_WEIGHTS=1 bash CVLM/scripts/run_full_pipeline.sh
+FP32_MASTER_WEIGHTS=1 FP32_MASTER_SCOPE=vision bash CVLM/scripts/run_full_pipeline.sh
 # or directly:
-python src/train_cvlm.py --output_dir "${OUTPUT_DIR}" --fp32_master_weights true ...
+python src/train_cvlm.py --output_dir "${OUTPUT_DIR}" \
+  --fp32_master_weights true --fp32_master_scope vision ...
 ```
 
-Ready-made two-arm control (pretrained vs random ViT, 3000-step curriculum):
-`hse/fp32ctrl.sbatch` — `sbatch --export=ALL,ARM=vit fp32ctrl.sbatch`.
+Ready-made two-arm control on the FULL original protocol (`randomvit` first —
+it defends the central post-bottleneck-depth claim; `vit` second):
+`hse/fp32ctrl.sbatch` — `sbatch --export=ALL,ARM=randomvit fp32ctrl.sbatch`.
 
 Notes:
 - `0` (default) = legacy in-place bf16 AdamW, byte-for-byte identical.
-- Memory cost: +12 bytes per low-precision trainable parameter (fp32 master +
-  fp32 grad buffer + fp32 instead of bf16 moments) — ~2.5 GB for this
-  campaign's ~211M trainable params. Checkpoint dtype does not change; only
-  `trainer_step_*.pt` grows (it now carries the masters).
-- **Resume must reuse the same value.** The masters live in the optimizer
-  state; resuming a master-weights run without the flag raises instead of
-  silently discarding the full-precision weights.
+- Memory cost: +12 bytes per **mastered** parameter (fp32 master + fp32 grad
+  buffer + fp32 instead of bf16 moments). Checkpoint dtype does not change;
+  only `trainer_step_*.pt` grows (it now carries the masters).
+- **Resume must reuse the same flag AND the same scope.** The masters live in
+  the optimizer state; resuming a master-weights run without the flag raises
+  instead of silently discarding the full-precision weights, and a scope change
+  is rejected by the master-count check.
 - fp32 parameters already in the model (`pool_queries`, `mixer_gates`) are
   optimized directly, with no master copy.
 
@@ -444,13 +462,23 @@ Every `--log_interval` steps the trainer prints, and logs to trackio /
 trainable ViT (or mixer) stack:
 
 ```
-    vit_frozen_frac=0.6357 vit_drift=0.0277 (tracked=85054464 params, window=10 steps)
+    vit_frozen_frac=0.6357 vit_drift=0.0277 vit_master_drift=0.0312 vit_master_resid=0.001900 vit_master_resid_max=3.052e-03 (tracked=85056000 params, window=10 steps)
 ```
 
 - `vit_frozen_frac` — fraction of individual weights whose **bit pattern** is
   unchanged since the previous log step (1.0 = the stack is not moving at all).
-- `vit_drift` — relative L2 distance from initialization, `||W-W0||/||W0||`.
-  `W0` is read from `mechanistic_init.safetensors` when present, so drift stays
-  anchored to the true step-0 weights across resumes.
+- `vit_drift` — relative L2 distance from initialization, `||W-W0||/||W0||`,
+  computed on the **live bf16** weights (what the forward pass sees).
+- `vit_master_drift` — the same drift on the **fp32 masters**: how far the
+  optimizer has actually moved the stack. Only with `--fp32_master_weights`.
+- `vit_master_resid`, `vit_master_resid_max` — `||master - live_bf16||`
+  (relative to `||W0||`) and its max-abs: update that has been **accumulated
+  but is not yet visible** in bf16 because it is still under half an ULP. The
+  legacy path destroys exactly this quantity every step.
 
-trackio keys: `train/vit_frozen_frac`, `train/vit_drift`.
+`W0` is read from `mechanistic_init.safetensors` when present, so drift stays
+anchored to the true step-0 weights across resumes.
+
+trackio keys: `train/vit_frozen_frac`, `train/vit_drift`,
+`train/vit_master_drift`, `train/vit_master_resid`,
+`train/vit_master_resid_max`.

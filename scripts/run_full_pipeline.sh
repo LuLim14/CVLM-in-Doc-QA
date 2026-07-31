@@ -81,6 +81,11 @@ DISABLE_LR_SCHEDULE="${DISABLE_LR_SCHEDULE:-1}"   # 1 = constant LR after warmup
 # 0 (legacy) an update of size ~lr=1e-4 cannot move a ~1.0-magnitude pretrained
 # ViT weight at all, which confounds the pretrained-vs-random comparison.
 FP32_MASTER_WEIGHTS="${FP32_MASTER_WEIGHTS:-0}"
+# Scope of that treatment: all = every low-precision trainable tensor (~1.84B
+# params here — the decoder IS trainable — i.e. ~20.5 GiB of extra optimizer
+# state and four sub-modules changing numerics at once); vision = ONLY the
+# ViT/mixer stack (~86M, ~1.0 GiB), the isolated control.
+FP32_MASTER_SCOPE="${FP32_MASTER_SCOPE:-all}"
 
 # ViT ablation branch (prior study): VIT_INIT=pretrained|random, FREEZE_VIT=0|1, NO_VIT=0|1.
 VIT_INIT="${VIT_INIT:-pretrained}"
@@ -182,7 +187,7 @@ echo "  MASK_VIT_PADDING  = ${MASK_VIT_PADDING}"
 echo "  VIT_APPLY_FINAL_LAYERNORM = ${VIT_APPLY_FINAL_LAYERNORM}"
 echo "  COMPACT_DECODER_POSITIONS = ${COMPACT_DECODER_POSITIONS}"
 echo "  MIXED_CR_SET      = ${MIXED_CR_SET:-<off>}"
-echo "  FP32_MASTER_WEIGHTS = ${FP32_MASTER_WEIGHTS}"
+echo "  FP32_MASTER_WEIGHTS = ${FP32_MASTER_WEIGHTS} (scope=${FP32_MASTER_SCOPE})"
 echo "  RESUME_DIR        = ${RESUME_DIR:-<none>}"
 echo "  LEGACY_PROJECTOR  = ${LEGACY_PROJECTOR}"
 echo "  CR_SCHEDULE       = ${CR_SCHEDULE:-<static>}"
@@ -242,6 +247,7 @@ run_train() {
     --vit_apply_final_layernorm "${VIT_APPLY_FINAL_LAYERNORM}"
     --compact_decoder_positions "${COMPACT_DECODER_POSITIONS}"
     --fp32_master_weights "${FP32_MASTER_WEIGHTS}"
+    --fp32_master_scope "${FP32_MASTER_SCOPE}"
     --seed "${SEED:-42}"
   )
   if [[ -n "${MIXED_CR_SET}" ]]; then

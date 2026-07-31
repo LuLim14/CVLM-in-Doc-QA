@@ -67,6 +67,10 @@ WARMUP_STEPS="${WARMUP_STEPS:-100}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-1}"
 UNFREEZE_ENCODER_TOP_K="${UNFREEZE_ENCODER_TOP_K:-22}"   # 0 = encoder fully frozen; >0 unfreezes top-K layers + final_norm, 22 == fully unreeze for ModerBert
 NUM_POOL_LATENTS="${NUM_POOL_LATENTS:-4}"                # K learnable queries per chunk for the attention pool; K>1 = Perceiver-style multi-query pool whose K outputs are mean-pooled to 1 vision token per chunk
+# MEANPOOL ABLATION (MeanPool+Project): 1 = the chunk pool is an EXACT masked
+# mean with no learnable part (pool_queries stays allocated but frozen at zero).
+# Passed to BOTH train and eval — a mismatch silently evaluates a different pool.
+MEAN_POOL="${MEAN_POOL:-0}"
 
 # 1 = plain projectors (no input_norm.* in safetensors — old runs before RMSNorm)
 LEGACY_PROJECTOR="${LEGACY_PROJECTOR:-0}"
@@ -91,6 +95,10 @@ FP32_MASTER_SCOPE="${FP32_MASTER_SCOPE:-all}"
 VIT_INIT="${VIT_INIT:-pretrained}"
 FREEZE_VIT="${FREEZE_VIT:-0}"
 NO_VIT="${NO_VIT:-0}"
+# POST-BOTTLENECK DEPTH: 0 = the full 12-layer ViT; N>0 keeps only the first N
+# blocks (same block type / init draw / final LayerNorm as the 12-layer arm, so
+# a 0/N/12 curve differs in depth ONLY). Passed to BOTH train and eval.
+VIT_NUM_LAYERS="${VIT_NUM_LAYERS:-0}"
 
 # RATE-DEPTH MIXER: non-empty "cr:depth,..." map replaces the ViT with a stack
 # of zero-gated ViTLayer blocks (depth per compression rate). Passed to BOTH
@@ -179,7 +187,9 @@ echo "  ENABLE_WARMUP     = ${ENABLE_WARMUP} (steps=${WARMUP_STEPS})"
 echo "  GRADIENT_CHECKPOINTING = ${GRADIENT_CHECKPOINTING}"
 echo "  UNFREEZE_ENCODER_TOP_K = ${UNFREEZE_ENCODER_TOP_K}"
 echo "  NUM_POOL_LATENTS  = ${NUM_POOL_LATENTS}"
+echo "  MEAN_POOL         = ${MEAN_POOL}"
 echo "  VIT_INIT          = ${VIT_INIT}"
+echo "  VIT_NUM_LAYERS    = ${VIT_NUM_LAYERS} (0 = all)"
 echo "  FREEZE_VIT        = ${FREEZE_VIT}"
 echo "  NO_VIT            = ${NO_VIT}"
 echo "  MIXER_DEPTH_MAP   = ${MIXER_DEPTH_MAP:-<off>}"
@@ -205,6 +215,31 @@ echo "  TRACKIO_SPACE_ID  = ${TRACKIO_SPACE_ID:-<local-only>}"
 echo "  TRACKIO_DISABLE   = ${TRACKIO_DISABLE}"
 echo "  SKIP_TRAIN        = ${SKIP_TRAIN:-0}  (set EVAL_ONLY=1 or SKIP_TRAIN=1 for eval-only)"
 echo "======================================================================"
+# Resolved architecture flags on disk, independent of any sbatch wrapper: these
+# are the values THIS invocation actually forwards to train_cvlm/eval_cvlm, so a
+# run directory always carries the arm it really ran (env vars read directly by
+# python would otherwise leave no artifact).
+{
+  echo "MEAN_POOL=${MEAN_POOL}"
+  echo "VIT_NUM_LAYERS=${VIT_NUM_LAYERS}"
+  echo "VIT_INIT=${VIT_INIT}"
+  echo "FREEZE_VIT=${FREEZE_VIT}"
+  echo "NO_VIT=${NO_VIT}"
+  echo "MIXER_DEPTH_MAP=${MIXER_DEPTH_MAP}"
+  echo "MASK_VIT_PADDING=${MASK_VIT_PADDING}"
+  echo "VIT_APPLY_FINAL_LAYERNORM=${VIT_APPLY_FINAL_LAYERNORM}"
+  echo "COMPACT_DECODER_POSITIONS=${COMPACT_DECODER_POSITIONS}"
+  echo "NUM_POOL_LATENTS=${NUM_POOL_LATENTS}"
+  echo "CR_SCHEDULE=${CR_SCHEDULE}"
+  echo "MIXED_CR_SET=${MIXED_CR_SET}"
+  echo "COMPRESSION_RATE=${COMPRESSION_RATE}"
+  echo "EPOCHS=${EPOCHS}"
+  echo "BATCH_SIZE=${BATCH_SIZE}"
+  echo "GRAD_ACCUM=${GRAD_ACCUM}"
+  echo "LR=${LR}"
+  echo "SEED=${SEED:-42}"
+} > "${OUTPUT_DIR}/PIPELINE_FLAGS"
+
 echo "trackio UI:   trackio show --project ${TRACKIO_PROJECT}"
 echo "(or set TRACKIO_SPACE_ID=user/space to host on HF Spaces)"
 echo "======================================================================"
@@ -239,8 +274,10 @@ run_train() {
     --gradient_checkpointing "${GRADIENT_CHECKPOINTING}"
     --unfreeze_encoder_top_k "${UNFREEZE_ENCODER_TOP_K}"
     --num_pool_latents "${NUM_POOL_LATENTS}"
+    --mean_pool "${MEAN_POOL}"
     --disable_lr_schedule "${DISABLE_LR_SCHEDULE}"
     --vit_init "${VIT_INIT}"
+    --vit_num_layers "${VIT_NUM_LAYERS}"
     --freeze_vit "${FREEZE_VIT}"
     --no_vit "${NO_VIT}"
     --mask_vit_padding "${MASK_VIT_PADDING}"
@@ -316,6 +353,7 @@ for MODE in ${EVAL_MODES}; do
     --vision_encoder_name "${VISION_ENCODER_NAME}"
     --compression_rate "${COMPRESSION_RATE}"
     --num_pool_latents "${NUM_POOL_LATENTS}"
+    --mean_pool "${MEAN_POOL}"
     --mode "${MODE}"
     --max_samples "${EVAL_MAX_SAMPLES}"
     --batch_size "${EVAL_BATCH_SIZE}"
@@ -329,6 +367,7 @@ for MODE in ${EVAL_MODES}; do
     --output_json "${OUTPUT_DIR}/eval_${MODE}.json"
     --num_cached_samples "${NUM_CACHED_SAMPLES}"
     --vit_init "${VIT_INIT}"
+    --vit_num_layers "${VIT_NUM_LAYERS}"
     --freeze_vit "${FREEZE_VIT}"
     --no_vit "${NO_VIT}"
     --mask_vit_padding "${MASK_VIT_PADDING}"

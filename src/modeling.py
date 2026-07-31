@@ -89,6 +89,20 @@ class ModelArguments:
             "help": "Number of learnable latent queries (K) used by the chunked attention pool. K=1 = single-query (legacy). K>1 = Perceiver-style multi-query pool whose K outputs are mean-pooled to produce 1 vision token per chunk."
         },
     )
+    mean_pool: bool = field(
+        default=False,
+        metadata={
+            "help": "MEANPOOL ABLATION (MeanPool+Project). Replace the learnable attention pool "
+            "with an EXACT masked mean over the real tokens of each chunk: pool_queries are still "
+            "allocated (so checkpoints/manifests keep the same keys) but are zero-filled, frozen "
+            "(requires_grad=False, hence absent from the optimizer AND from the saved trainable "
+            "state) and NOT passed to _chunked_attention_pool at all. This is the control for "
+            "'is the learnable pool doing anything?': zero-init makes the attention pool START as "
+            "the mean, but the queries do move during training, so an attention-pool run is not a "
+            "mean-pool run. MUST be passed to eval too — otherwise eval rebuilds the attention "
+            "pool and evaluates a different architecture."
+        },
+    )
     projector_use_input_rmsnorm: bool = field(
         default=True,
         metadata={
@@ -99,6 +113,21 @@ class ModelArguments:
         default="pretrained",
         metadata={
             "help": "'pretrained' loads vision_encoder_name weights; 'random' builds the identical ViT architecture from its config with random init (prior ablation)."
+        },
+    )
+    vit_num_layers: int = field(
+        default=0,
+        metadata={
+            "help": "POST-BOTTLENECK DEPTH ablation. 0 (default) = keep every layer of the ViT "
+            "config (12 for ViT-Base). N>0 truncates vision_encoder.encoder.layer to its FIRST N "
+            "blocks immediately after construction, so the N-layer arm differs from the 12-layer "
+            "arm in the number of layers and NOTHING else: same block type, same config, same "
+            "final LayerNorm, same padding-mask setting, same RNG draw (the full stack is built "
+            "and then truncated, so the surviving blocks are bit-identical to the 12-layer arm's "
+            "first N and the shared modules after it are unshifted). Removed blocks are deleted "
+            "from the module, so they are absent from parameters(), the optimizer and checkpoints. "
+            "Incompatible with vit_skip / mixer_depth_map (there is no plain ViT to truncate). "
+            "MUST be passed to eval too."
         },
     )
     vit_freeze: bool = field(
@@ -242,6 +271,45 @@ def _mixer_depth_for_cr(depth_map: dict, cr: int) -> int:
     if lower:
         return depth_map[max(lower)]
     return depth_map[min(depth_map)]
+
+
+def _truncate_vit_layers(vision_encoder, vit_num_layers: int) -> int:
+    """Keep the FIRST ``vit_num_layers`` blocks of a plain ViT stack, in place.
+
+    This is the POST-BOTTLENECK DEPTH ablation (``--vit_num_layers``). The stack
+    must already be fully constructed: truncating AFTER construction (rather
+    than building from a shallower config) is what makes the depth curve
+    interpretable, because
+
+      * the ViT consumes exactly the same amount of global RNG at every depth,
+        so the surviving blocks are bit-identical to the full-depth arm's first
+        N AND every module initialised later (projectors, pos-embed, pool
+        queries) is unshifted;
+      * everything else about the arm — block type, config, final LayerNorm,
+        padding-mask handling — is untouched, so depth is the only difference.
+
+    Dropped blocks are removed from the ``ModuleList``, hence from
+    ``parameters()``, the optimizer and checkpoints. ``config.num_hidden_layers``
+    is updated so the provenance recorded downstream is honest.
+
+    Args:
+        vision_encoder: a ``ViTModel`` (must expose ``encoder.layer``).
+        vit_num_layers: 0 = keep everything; N>0 = keep the first N.
+
+    Returns:
+        The resulting number of layers.
+    """
+    available = len(vision_encoder.encoder.layer)
+    n = int(vit_num_layers)
+    if n < 0:
+        raise ValueError(f"vit_num_layers must be >= 0 (0 = all layers), got {n}")
+    if n == 0 or n == available:
+        return available
+    if n > available:
+        raise ValueError(f"vit_num_layers={n} exceeds the {available} layers of this vision encoder")
+    vision_encoder.encoder.layer = nn.ModuleList(list(vision_encoder.encoder.layer)[:n])
+    vision_encoder.config.num_hidden_layers = n
+    return n
 
 
 def _mixer_forward(
@@ -478,9 +546,19 @@ def _chunked_attention_pool(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool contiguous chunks of `compression_rate` real tokens per sample.
 
-    When ``pool_queries`` is None, falls back to plain unweighted mean-pool
-    (legacy behaviour). When ``pool_queries`` is provided, each chunk is
-    reduced via softmax-weighted multi-query attention:
+    When ``pool_queries`` is None the reduction is an EXACT masked mean over the
+    real tokens of each chunk — this is the ``--mean_pool`` ablation arm
+    (MeanPool+Project), a pool with no learnable parameters at all. "Exact"
+    is meant bitwise, not just mathematically: the partial last chunk is
+    recomputed from the unpadded slice (``chunked[-1, :cr - pad].mean(0)``)
+    rather than rescaled from the zero-padded mean. The two are equal in exact
+    arithmetic, but the rescale ``mean(dim=1) * cr / true_last`` is NOT
+    bit-identical to ``real_tokens.mean(0)`` in bf16 (nor in fp32 for a non
+    power-of-two cr), which would leave the ablation's central claim ("the pool
+    is EXACTLY the mean") resting on a tolerance instead of on ``torch.equal``.
+
+    When ``pool_queries`` is provided, each chunk is instead reduced via
+    softmax-weighted multi-query attention:
 
         scores  = (chunk_tokens @ Q.T) / sqrt(H)          # [cr, K]
         weights = softmax(scores, dim=cr)                 # [cr, K]
@@ -506,7 +584,8 @@ def _chunked_attention_pool(
         source_attention_mask: [B, L] long/int mask (1 for real, 0 for pad).
         compression_rate: pool size.
         max_vision_len: hard cap on output V per sample (truncates longer docs).
-        pool_queries: optional [H] or [K, H] learnable parameter; None -> mean-pool.
+        pool_queries: optional [H] or [K, H] learnable parameter; None -> exact
+            masked mean-pool (the parameter-free --mean_pool arm).
 
     Returns:
         pooled: [B, V_max, H] where V_max = max V_i across batch.
@@ -553,9 +632,11 @@ def _chunked_attention_pool(
         if Q is None:
             chunk_pooled = chunked.mean(dim=1)  # [V_i, H]
             if pad > 0:
-                # Last chunk's mean was divided by cr, should be divided by (cr - pad).
-                true_last = cr - pad
-                chunk_pooled[-1] = chunk_pooled[-1] * cr / true_last
+                # The last chunk holds (cr - pad) real tokens plus a zero tail.
+                # Recompute it from the UNPADDED slice so the result is bitwise
+                # `real_tokens.mean(0)`; rescaling the padded mean by cr/(cr-pad)
+                # is only equal in exact arithmetic (see the docstring).
+                chunk_pooled[-1] = chunked[-1, : cr - pad].mean(dim=0)
         else:
             # scores[v, c, k] = chunked[v, c] · Q[k] / sqrt(H)
             scores = torch.einsum("vch,kh->vck", chunked, Q) * scale  # [V_i, cr, K]
@@ -740,6 +821,21 @@ class CVLM(torch.nn.Module):
                     "mixer_depth_map is incompatible with vit_init='random': the mixer is always "
                     "config-initialised (random) by construction; pass the default vit_init."
                 )
+        vit_num_layers = int(getattr(model_args, "vit_num_layers", 0) or 0)
+        if vit_num_layers < 0:
+            raise ValueError(f"vit_num_layers must be >= 0 (0 = all layers), got {vit_num_layers}")
+        if vit_num_layers > 0:
+            if getattr(model_args, "vit_skip", False):
+                raise ValueError(
+                    "vit_num_layers is incompatible with vit_skip: there is no ViT stack to truncate "
+                    "(vit_skip IS the 0-layer arm)."
+                )
+            if mixer_map is not None:
+                raise ValueError(
+                    "vit_num_layers is incompatible with mixer_depth_map: the mixer replaces the ViT "
+                    "and already sets its own per-cr depth. Pick one depth mechanism."
+                )
+        self.vit_num_layers = vit_num_layers
         self.mixer_depth_map = None
         self.mixer_layers = None
         self.mixer_gates = None
@@ -820,6 +916,24 @@ class CVLM(torch.nn.Module):
                 f"[modeling] vit_init=pretrained: mask_vit_padding={self.mask_vit_padding}; "
                 f"final_layernorm={self.vit_apply_final_layernorm}"
             )
+        if self.vision_encoder is not None and vit_num_layers > 0:
+            # DEPTH ABLATION: keep the FIRST N blocks of the freshly built stack
+            # (see _truncate_vit_layers for why the cut happens after, not
+            # during, construction).
+            available = len(self.vision_encoder.encoder.layer)
+            kept = _truncate_vit_layers(self.vision_encoder, vit_num_layers)
+            if kept < available:
+                print(
+                    f"[modeling] VIT DEPTH ablation: vision encoder TRUNCATED to the first "
+                    f"{kept} of {available} layers (vit_init={vit_init}, "
+                    f"final_layernorm={self.vit_apply_final_layernorm}, "
+                    f"mask_vit_padding={self.mask_vit_padding})"
+                )
+            else:
+                print(
+                    f"[modeling] VIT DEPTH ablation: vit_num_layers={vit_num_layers} == full depth; "
+                    f"stack left untouched (bit-identical to vit_num_layers=0)"
+                )
         if self.vision_encoder is not None and not self.vit_apply_final_layernorm:
             for parameter in self.vision_encoder.layernorm.parameters():
                 parameter.requires_grad = False
@@ -863,6 +977,22 @@ class CVLM(torch.nn.Module):
         # via strict=False and behave identically to legacy mean-pool.
         num_pool_latents = max(int(getattr(model_args, "num_pool_latents", 1) or 1), 1)
         self.pool_queries = nn.Parameter(torch.zeros(num_pool_latents, enc_hidden))
+
+        # MEANPOOL ABLATION: the pool becomes an exact masked mean with no
+        # learnable part. pool_queries is kept (same shape, same checkpoint /
+        # manifest keys as the paired attention-pool arm) but frozen at zero and
+        # never handed to _chunked_attention_pool, so it cannot receive a
+        # gradient, cannot enter the optimizer (param groups filter on
+        # requires_grad) and cannot drift. Verified in
+        # tests/test_meanpool_and_depth1.py.
+        self.mean_pool = bool(getattr(model_args, "mean_pool", False))
+        if self.mean_pool:
+            self.pool_queries.requires_grad_(False)
+            print(
+                f"[modeling] MEAN-POOL ablation: chunk pooling is an EXACT masked mean; "
+                f"pool_queries {tuple(self.pool_queries.shape)} allocated, zero-filled and FROZEN "
+                f"(requires_grad=False, excluded from optimizer and from saved trainable state)"
+            )
 
         if training_args.bf16:
             self.text_projector.to(torch.bfloat16)
@@ -1034,12 +1164,16 @@ class CVLM(torch.nn.Module):
                 ).last_hidden_state  # [B, L, H_enc] in compute_dtype
             enc_out = enc_out.detach()
 
+        # MEANPOOL ABLATION: pool_queries=None selects the exact masked-mean
+        # branch. Passing the (zero) queries instead would be *numerically*
+        # close but not bitwise equal to the mean, and would keep a learnable
+        # tensor in the graph — the whole point of the arm is that there is none.
         pooled, vision_attention_mask = _chunked_attention_pool(
             enc_out,
             source_attention_mask,
             compression_rate=self.compression_rate,
             max_vision_len=self.max_vision_len,
-            pool_queries=self.pool_queries,
+            pool_queries=None if getattr(self, "mean_pool", False) else self.pool_queries,
         )  # [B, V_max, H_enc], [B, V_max]
 
         synthetic_pad_fraction = float(

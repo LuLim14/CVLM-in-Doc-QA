@@ -49,6 +49,15 @@ def parse_args() -> argparse.Namespace:
         help="K learnable latent queries for the chunked attention pool. Must match "
         "the value used at training time so checkpoint pool_queries [K,H] loads.",
     )
+    p.add_argument(
+        "--mean_pool",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("MEAN_POOL", "0") == "1",
+        help="MEANPOOL ABLATION: MUST match training. The chunk pool becomes an EXACT masked "
+        "mean over the real tokens and pool_queries is frozen at zero (and therefore absent from "
+        "the checkpoint). Omitting it on a --mean_pool checkpoint silently evaluates the "
+        "attention pool instead. Env: MEAN_POOL.",
+    )
     p.add_argument("--max_prompt_len", type=int, default=512)
     p.add_argument("--max_answer_len", type=int, default=2048)
     p.add_argument("--max_vision_len", type=int, default=512)
@@ -156,6 +165,14 @@ def parse_args() -> argparse.Namespace:
         help="Must match training. For 'random' the checkpoint overwrites ViT weights anyway (strict=False), but passing it avoids relying on that.",
     )
     p.add_argument(
+        "--vit_num_layers",
+        type=int,
+        default=int(os.environ.get("VIT_NUM_LAYERS", "0")),
+        help="POST-BOTTLENECK DEPTH ablation: MUST match training. 0 = full 12-layer ViT; N>0 keeps "
+        "only the first N blocks. A mismatch is caught by the initialization-manifest check (the "
+        "checkpoint would otherwise load into a differently-shaped stack). Env: VIT_NUM_LAYERS.",
+    )
+    p.add_argument(
         "--freeze_vit",
         type=lambda s: str(s).lower() in ("1", "true", "yes"),
         default=os.environ.get("FREEZE_VIT", "0") == "1",
@@ -234,7 +251,10 @@ def _encode_source_for_baseline(model: CVLM, source_ids, source_mask):
     """Run the frozen text_encoder + chunked attention pool. Used by baseline_proj.
 
     Uses the model's trained pool_queries so the ablation isolates "ViT vs random
-    linear" rather than mixing in a different pooling rule.
+    linear" rather than mixing in a different pooling rule. Under the --mean_pool
+    arm there are no queries, so the baseline must use the same exact masked mean
+    the model was trained with (otherwise the baseline swaps in a *different*
+    pooling rule and stops being the intended control).
     """
     with torch.no_grad():
         h = model.text_encoder(input_ids=source_ids, attention_mask=source_mask).last_hidden_state
@@ -243,9 +263,68 @@ def _encode_source_for_baseline(model: CVLM, source_ids, source_mask):
         source_mask,
         compression_rate=model.compression_rate,
         max_vision_len=model.max_vision_len,
-        pool_queries=model.pool_queries,
+        pool_queries=None if getattr(model, "mean_pool", False) else model.pool_queries,
     )
     return pooled, vmask
+
+
+# Architecture flags whose value eval MUST reproduce exactly, mapped to
+# (argparse attribute, value assumed when the manifest predates the flag).
+#
+# Deliberately narrow: only flags introduced together with this check, so no
+# already-recorded run can newly fail. Both share the same failure mode — the
+# checkpoint loads cleanly (strict=False, and pool_queries is an allowed missing
+# key) into a DIFFERENT architecture, and the eval silently reports the wrong
+# arm. That exact class of silent swap has already cost us a run once.
+_MANIFEST_GUARDED_FLAGS = {
+    "mean_pool": ("mean_pool", False),
+    "vit_num_layers": ("vit_num_layers", 0),
+}
+
+
+def verify_architecture_against_manifest(
+    checkpoint_path: str,
+    args: argparse.Namespace,
+) -> Optional[dict]:
+    """Fail loudly when eval's architecture flags contradict the training run.
+
+    The training run writes ``initialization_manifest.json`` next to its
+    checkpoints. If it is there, the flags in ``_MANIFEST_GUARDED_FLAGS`` must
+    agree with what this eval was asked to build. Returns the recorded
+    ``architecture`` dict (or None when there is no manifest — pre-manifest runs
+    and ad-hoc checkpoints must keep working).
+    """
+    if not checkpoint_path:
+        return None
+    manifest_path = os.path.join(
+        os.path.dirname(os.path.abspath(checkpoint_path)), "initialization_manifest.json"
+    )
+    if not os.path.exists(manifest_path):
+        print(f"[arch-check] no initialization_manifest.json next to {checkpoint_path}; skipped")
+        return None
+    with open(manifest_path, encoding="utf-8") as handle:
+        architecture = json.load(handle).get("architecture", {}) or {}
+
+    mismatches = []
+    for key, (attr, absent_default) in _MANIFEST_GUARDED_FLAGS.items():
+        recorded = architecture.get(key, absent_default)
+        actual = getattr(args, attr, absent_default)
+        if type(absent_default) is bool:
+            recorded, actual = bool(recorded), bool(actual)
+        else:
+            recorded, actual = int(recorded), int(actual)
+        if recorded != actual:
+            mismatches.append(f"{key}: checkpoint was trained with {recorded!r}, eval got {actual!r}")
+    if mismatches:
+        raise RuntimeError(
+            f"Architecture mismatch against {manifest_path}: "
+            + "; ".join(mismatches)
+            + ". The checkpoint would load into a different model and the metrics would describe "
+            "the wrong arm. Pass the training flags (e.g. --mean_pool 1 / --vit_num_layers N)."
+        )
+    checked = {key: architecture.get(key, default) for key, (_, default) in _MANIFEST_GUARDED_FLAGS.items()}
+    print(f"[arch-check] OK against {manifest_path} ({checked})")
+    return architecture
 
 
 def force_zero_mixer_gates(model: Optional[CVLM]) -> int:
@@ -1144,8 +1223,10 @@ def main() -> None:
     model_args.max_vision_len = args.max_vision_len
     model_args.compression_rate = args.compression_rate
     model_args.num_pool_latents = max(int(args.num_pool_latents), 1)
+    model_args.mean_pool = bool(args.mean_pool)
     model_args.projector_use_input_rmsnorm = not bool(args.legacy_projector)
     model_args.vit_init = str(args.vit_init)
+    model_args.vit_num_layers = int(args.vit_num_layers)
     model_args.vit_freeze = bool(args.freeze_vit)
     model_args.vit_skip = bool(args.no_vit)
     model_args.mixer_depth_map = str(args.mixer_depth_map or "")
@@ -1179,6 +1260,9 @@ def main() -> None:
         # (encoder tokenizer still comes from text_encoder_name).
         model_args.model_name_or_path = args.sft_model_path
     else:
+        # BEFORE building 1.8B of weights: refuse an eval whose architecture
+        # flags contradict the run that produced the checkpoint.
+        verify_architecture_against_manifest(args.checkpoint_path, args)
         print(f"Loading model ({model_args.model_name_or_path})...")
         model = CVLM(model_args, training_args)
         model.to(device)
@@ -1316,6 +1400,8 @@ def main() -> None:
             "checkpoint_path": getattr(args, "checkpoint_path", "") or getattr(args, "sft_model_path", ""),
             "global_step": int(args.global_step),
             "all_checkpoints": bool(args.all_checkpoints),
+            "mean_pool": bool(args.mean_pool),
+            "vit_num_layers": int(args.vit_num_layers),
             "mixer_depth_map": str(args.mixer_depth_map or ""),
             "mask_vit_padding": bool(args.mask_vit_padding),
             "vit_apply_final_layernorm": bool(args.vit_apply_final_layernorm),
@@ -1513,6 +1599,8 @@ def main() -> None:
             "doc_budget_cr": int(args.doc_budget_cr),
             "doc_selection_file": args.doc_selection_file,
             "oracle_hit_rate": oracle_hit_rate,
+            "mean_pool": bool(args.mean_pool),
+            "vit_num_layers": int(args.vit_num_layers),
             "mixer_depth_map": str(args.mixer_depth_map or ""),
             "mask_vit_padding": bool(args.mask_vit_padding),
             "vit_apply_final_layernorm": bool(args.vit_apply_final_layernorm),

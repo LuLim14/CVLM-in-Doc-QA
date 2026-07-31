@@ -571,6 +571,18 @@ def parse_args() -> argparse.Namespace:
         "K outputs are mean-pooled to produce 1 vision token per chunk.",
     )
     p.add_argument(
+        "--mean_pool",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("MEAN_POOL", "0") == "1",
+        help="MEANPOOL ABLATION (MeanPool+Project): the chunk pool is an EXACT masked mean over "
+        "the real tokens, with NO learnable queries. pool_queries stays allocated (same shape and "
+        "checkpoint key as the attention-pool arm) but is zero-filled, frozen and never used. "
+        "Zero-init only makes the attention pool START as a mean — the queries do move during "
+        "training — so this is the arm that actually holds the pool fixed at the mean. MUST be "
+        "passed to eval as well (--mean_pool), or eval rebuilds the attention pool. "
+        "Env: MEAN_POOL.",
+    )
+    p.add_argument(
         "--legacy_projector",
         type=lambda s: str(s).lower() in ("1", "true", "yes"),
         default=os.environ.get("LEGACY_PROJECTOR", "0") == "1",
@@ -583,6 +595,18 @@ def parse_args() -> argparse.Namespace:
         choices=["pretrained", "random"],
         default=os.environ.get("VIT_INIT", "pretrained"),
         help="ViT weights: 'pretrained' (default) or 'random' (same architecture, config init) — prior ablation.",
+    )
+    p.add_argument(
+        "--vit_num_layers",
+        type=int,
+        default=int(os.environ.get("VIT_NUM_LAYERS", "0")),
+        help="POST-BOTTLENECK DEPTH ablation: 0 (default) = the full 12-layer ViT; N>0 keeps only "
+        "the FIRST N blocks. The N-layer arm then differs from the 12-layer arm ONLY in depth — "
+        "same block type, same config-init draw, same final LayerNorm, same padding mask — which "
+        "is what makes a 0/N/12 depth curve interpretable. Use this, NOT --mixer_depth_map, for a "
+        "plain-depth point: the mixer is zero-gated, so its depth-N arm measures gate dynamics "
+        "instead. Incompatible with --no_vit / --mixer_depth_map. Must match eval. "
+        "Env: VIT_NUM_LAYERS.",
     )
     p.add_argument(
         "--freeze_vit",
@@ -866,6 +890,17 @@ def _initialization_manifest(model: CVLM, args: argparse.Namespace) -> dict:
             "vit_apply_final_layernorm": bool(args.vit_apply_final_layernorm),
             "compact_decoder_positions": bool(args.compact_decoder_positions),
             "num_pool_latents": int(args.num_pool_latents),
+            # OMITTED when False on purpose. _write_or_verify_initialization_artifacts
+            # compares the whole "architecture" dict on resume, so unconditionally
+            # adding a key would make every pre-existing run un-resumable with this
+            # code. Present-only-when-True still fails resume in BOTH wrong
+            # directions (legacy run resumed with --mean_pool, or vice versa).
+            **({"mean_pool": True} if bool(getattr(args, "mean_pool", False)) else {}),
+            **(
+                {"vit_num_layers": int(args.vit_num_layers)}
+                if int(getattr(args, "vit_num_layers", 0) or 0) > 0
+                else {}
+            ),
         },
         "models": {
             "decoder": str(args.model_name_or_path or model.model_args.model_name_or_path),
@@ -1000,8 +1035,10 @@ def main() -> None:
     model_args.mixed_fidelity_p = float(args.mixed_fidelity_p)
     model_args.unfreeze_encoder_top_k = int(args.unfreeze_encoder_top_k)
     model_args.num_pool_latents = max(int(args.num_pool_latents), 1)
+    model_args.mean_pool = bool(args.mean_pool)
     model_args.projector_use_input_rmsnorm = not bool(args.legacy_projector)
     model_args.vit_init = str(args.vit_init)
+    model_args.vit_num_layers = int(args.vit_num_layers)
     model_args.vit_freeze = bool(args.freeze_vit)
     model_args.vit_skip = bool(args.no_vit)
     model_args.mixer_depth_map = str(args.mixer_depth_map or "")
@@ -1323,8 +1360,10 @@ def main() -> None:
             "mixed_fidelity_p": float(args.mixed_fidelity_p),
             "unfreeze_encoder_top_k": int(args.unfreeze_encoder_top_k),
             "num_pool_latents": int(model_args.num_pool_latents),
+            "mean_pool": bool(model_args.mean_pool),
             "projector_use_input_rmsnorm": bool(model_args.projector_use_input_rmsnorm),
             "vit_init": model_args.vit_init,
+            "vit_num_layers": int(model_args.vit_num_layers),
             "vit_freeze": bool(model_args.vit_freeze),
             "vit_skip": bool(model_args.vit_skip),
             "mixer_depth_map": model_args.mixer_depth_map,

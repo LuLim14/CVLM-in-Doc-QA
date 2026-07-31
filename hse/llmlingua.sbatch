@@ -18,13 +18,24 @@
 # пространстве: LLMLingua-2 (Pan et al., ACL Findings 2024),
 # microsoft/llmlingua-2-xlm-roberta-large-meetingbank.
 #
-# СТРОГО РАВНЫЙ БЮДЖЕТ. Родной параметр LLMLingua — rate в ЕЁ токенизации
-# (XLM-R / cl100k), а не в слотах декодера. Поэтому tools/llmlingua_select.py
-# калибрует rate под число латентов CVLM
-#     V_i = max(min(ceil(min(L_ModernBERT_i, MAX_SOURCE_LEN)/CR), MAX_VISION_LEN), 1),
-# измеренное в токенах ТОКЕНИЗАТОРА ДЕКОДЕРА (SmolLM2), и жёстко обрезает
-# результат до <= V_i. Формула побитово та же, что в
-# CvlmTrainDataset._truncated_doc_ids (--doc_budget_cr).
+# РАВНЫЙ БЮДЖЕТ (и почему "<=", а не "=="). Бюджет —
+#     V_i = max(min(ceil(min(L_ModernBERT_i, MAX_SOURCE_LEN)/CR), MAX_VISION_LEN), 1)
+# токенов ТОКЕНИЗАТОРА ДЕКОДЕРА (SmolLM2); формула побитово та же, что в
+# CvlmTrainDataset._truncated_doc_ids. Ищем ПАРАМЕТР, строку НЕ обрезаем:
+# LLMLingua отдаёт отобранные слова в порядке документа, и отрезание хвоста
+# превратило бы опубликованный метод во front-biased отбор — фору, придуманную
+# нами в свою же пользу.
+# Родной knob LLMLingua (rate) доходит до её же правила отбора только через
+# q = int(100*(1-rate)+1) — ЦЕЛЫЙ перцентиль; на этих документах один шаг
+# перцентиля двигает ~5 слов ≈ 7 токенов декодера, т.е. поиск по rate
+# систематически недобирает 10-20% бюджета. Поэтому tools/llmlingua_select.py
+# гоняет ЕЁ ЖЕ правило (per-chunk порог по вероятностям слов) с НЕПРЕРЫВНЫМ q,
+# бисекцией до максимальной строки, влезающей в V_i. Совпадение с публичным
+# API проверяется побайтово на 25 документах ДО начала отбора (--fidelity_*).
+# Точное равенство V_i всё равно не гарантировано: единица отбора — целое слово
+# ценой 1..k токенов. Фатально проверяется ТОЛЬКО <= V_i (бейзлайн не может
+# получить слотов больше, чем CVLM); фактический недобор (доля и средняя
+# величина) измеряется и идёт в отчёт как есть.
 #
 # Сжимается ТОЛЬКО документ (поле input). Вопрос (поле prompt) в компрессор не
 # передаётся вообще: CvlmTrainDataset сам приклеивает "\n\n"+вопрос к
@@ -51,9 +62,11 @@
 #            Вспомогательная клетка: текстовый вход для декодера,
 #            не видевшего такого формата.
 #        (б) primary_sfttrunc_decoder — truncated-SFT декодер того же cr
-#            (runs/sft_trunc${CR}_*). ОСНОВНОЙ результат LLMLingua: декодер
-#            обучен ровно на "усечённый документ + вопрос", поэтому бейзлайн
-#            не штрафуется за непривычный формат входа.
+#            (runs/sft_trunc${CR}_*). Он адаптирован к КОРОТКОМУ текстовому
+#            входу, но обучался на first-N, не на выходах LLMLingua. Поэтому
+#            чистый контраст этой клетки — с first-N под ТЕМ ЖЕ декодером;
+#            сравнение с CVLM является system-level, а не изоляцией одного
+#            фактора. Selection-specific distribution shift не скрываем.
 #   4) ОТЧЁТ (CPU): tools/llmlingua_report.py — первичная величина NLL
 #      (нат/answer-токен, агрегировано sum/sum), PPL = exp(АГРЕГИРОВАННОГО
 #      NLL), парный bootstrap кластерами по ДОКУМЕНТАМ (строки не независимы:
@@ -72,7 +85,8 @@
 # ОШИБКИ НЕ ГЛУШИМ (set -euo pipefail, никаких "|| echo"): любая упавшая
 # клетка валит джобу, чтобы не получить ложный DONE с дырой в таблице.
 #
-# Запуск: sbatch hse/llmlingua.sbatch
+# Запуск (снапшот обязателен):
+#   CVLM_SNAPSHOT_ROOT=/home/aburlova/cvlm_<immutable_id> sbatch hse/llmlingua.sbatch
 # ============================================================================
 
 set -euo pipefail
@@ -82,7 +96,14 @@ module purge
 module load Python/Miniconda CUDA/12.4
 source activate /home/aburlova/conda_envs/cvlm
 
-SNAP="${CVLM_SNAPSHOT_ROOT:-/home/aburlova/cvlm_rd9}"
+LLMLINGUA_PKG_VERSION="$(python -c 'from importlib.metadata import version; print(version("llmlingua"))')"
+test "${LLMLINGUA_PKG_VERSION}" = "0.2.2" || {
+  echo "ERROR: selector mirrors llmlingua==0.2.2, found ${LLMLINGUA_PKG_VERSION}"; exit 1; }
+
+# No stale fallback: this baseline depends on the audited selector below and
+# on llmlingua==0.2.2 private details. Running an older snapshot silently is
+# worse than failing before allocation.
+SNAP="${CVLM_SNAPSHOT_ROOT:?submit with CVLM_SNAPSHOT_ROOT=/path/to/immutable/snapshot}"
 source "${SNAP}/hse/protocol.env"
 export CVLM_ROOT="${SNAP}"
 # protocol.env — про ОБУЧЕНИЕ: расписание cr и обход всех чекпоинтов здесь
@@ -99,6 +120,23 @@ test -n "$(ls -A "${TIKTOKEN_CACHE_DIR}")" || { echo "ERROR: empty tiktoken cach
 
 OUT="${LLMLINGUA_OUT:-/home/aburlova/cvlm/runs/llmlingua_baseline}"
 REF="${LLMLINGUA_REF:-/home/aburlova/cvlm/runs/fresh_heldout}"
+# Пути truncated-SFT декодеров ЗАФИКСИРОВАНЫ явно. Никаких "ls | tail -1":
+# так молча подхватился бы более поздний упавший/частичный прогон, и клетка
+# основного бейзлайна поехала бы без единого сообщения об ошибке.
+SFT8_DIR="${SFT8_DIR:-/home/aburlova/cvlm/runs/sft_trunc8_20260730_072938}"
+SFT16_DIR="${SFT16_DIR:-/home/aburlova/cvlm/runs/sft_trunc16_20260730_072938}"
+check_sft () {  # $1 = каталог, $2 = ожидаемый cr (только для сообщения)
+  local d="$1" cr="$2" f
+  test -d "${d}" || { echo "ERROR: truncated-SFT dir for cr=${cr} not found: ${d}"; exit 1; }
+  for f in config.json model.safetensors tokenizer_config.json vocab.json merges.txt; do
+    test -s "${d}/${f}" || { echo "ERROR: ${d} is not a complete HF model dir (missing/empty ${f})"; exit 1; }
+  done
+  grep -q "\[train_sft\] Done\." "${d}/pipeline.log" || {
+    echo "ERROR: ${d}/pipeline.log has no '[train_sft] Done.' — training did not finish"; exit 1; }
+  echo "truncated-SFT cr=${cr}: ${d} — complete"
+}
+check_sft "${SFT8_DIR}" 8
+check_sft "${SFT16_DIR}" 16
 mkdir -p "${OUT}"
 cd "${SNAP}"
 export PYTHONPATH="${SNAP}/src" PYTHONUNBUFFERED=1
@@ -118,13 +156,16 @@ LINGUA_MODEL=microsoft/llmlingua-2-xlm-roberta-large-meetingbank
   echo "code_version=$(cat "${SNAP}/VERSION")"
   echo "split=${SPLIT}"
   echo "llmlingua_model=${LINGUA_MODEL}"
-  echo "llmlingua_pkg_version=$(python -c 'import llmlingua; print(llmlingua.__version__)')"
+  echo "llmlingua_pkg_version=${LLMLINGUA_PKG_VERSION}"
+  echo "numpy=$(python -c 'import numpy; print(numpy.__version__)')"
   echo "transformers=$(python -c 'import transformers; print(transformers.__version__)')"
   echo "torch=$(python -c 'import torch; print(torch.__version__)')"
   echo "decoder_base=${MODEL_NAME}"
   echo "encoder=${TEXT_ENCODER_NAME}"
   echo "max_source_len=${MAX_SOURCE_LEN} max_vision_len=${MAX_VISION_LEN}"
   echo "batch_size=8 seed=${SEED} max_samples=0"
+  echo "sft_trunc8_dir=${SFT8_DIR}"
+  echo "sft_trunc16_dir=${SFT16_DIR}"
 } > "${OUT}/PROVENANCE"
 cat "${OUT}/PROVENANCE"
 
@@ -140,11 +181,12 @@ diag_pretrained_decoder_llmlingua_cr{CR}
     produced with the identical invocation.
 
 primary_sfttrunc_decoder_llmlingua_cr{CR}
-    Truncated-SFT decoder, PRIMARY baseline. Weights = runs/sft_trunc{CR}_*,
-    i.e. SmolLM2 fine-tuned on "document truncated to the cr budget + question".
-    The decoder is used to the input format, so this cell isolates the quality
-    of the compression, not format shock. Directly paired with
-    runs/fresh_heldout/sfttrunc_cr{CR}_dump.jsonl (first-N truncation).
+    Truncation-adapted decoder, primary task-adapted control. Weights =
+    runs/sft_trunc{CR}_*: SmolLM2 fine-tuned on "first-N document truncated to
+    the cr budget + question", NOT on LLMLingua outputs. This controls generic
+    short-text/task adaptation but not LLMLingua-specific selection shift.
+    Its clean selector contrast is with runs/fresh_heldout/sfttrunc_cr{CR}_dump.jsonl
+    (first-N under the identical decoder); CVLM comparisons are system-level.
 EOF
 cat "${OUT}/LABELS"
 
@@ -165,7 +207,11 @@ COMMON=(
 # --- фаза 1: селекция LLMLingua-2 при бюджете cr=8 и cr=16 --------------------
 for CR in 8 16; do
   SEL="${OUT}/llmlingua_cr${CR}.jsonl"
-  if [ ! -s "${SEL}" ]; then
+  STATS="${OUT}/llmlingua_cr${CR}_stats.json"
+  # Both files are atomically published by llmlingua_select.py. Requiring the
+  # pair prevents a preemption from turning a partial artefact into a silently
+  # reused baseline on resubmission.
+  if [ ! -s "${SEL}" ] || [ ! -s "${STATS}" ]; then
     echo; echo "=== [1] LLMLingua-2 selection, budget_cr=${CR}"
     python tools/llmlingua_select.py \
       --dataset_name sggetao/PwC --dataset_split "${SPLIT}" \
@@ -175,9 +221,10 @@ for CR in 8 16; do
       --max_samples 0 \
       --budget_cr "${CR}" --max_vision_len "${MAX_VISION_LEN}" \
       --llmlingua_model "${LINGUA_MODEL}" --device cuda \
-      --calibrate_rounds 2 --overshoot 1.10 --seed "${SEED}" \
+      --search_mode threshold --search_iters 32 --fidelity_check_docs 25 \
+      --seed "${SEED}" \
       --output_jsonl "${SEL}" \
-      --stats_json "${OUT}/llmlingua_cr${CR}_stats.json"
+      --stats_json "${STATS}"
   fi
 done
 
@@ -191,13 +238,13 @@ for CR in 8 16; do
     --decoder_tokenizer_name "${MODEL_NAME}" \
     --encoder_tokenizer_name "${TEXT_ENCODER_NAME}" \
     --max_prompt_len 512 --max_answer_len 1024 --max_source_len "${MAX_SOURCE_LEN}" \
-    --max_samples 0 \
+    --max_samples 0 --expect_rows 3000 --expect_docs 205 \
     --out_json "${OUT}/llmlingua_cr${CR}_audit.json"
 
   # Бюджет посчитан в токенах базового SmolLM2, а в режиме sft датасет
   # ре-токенизирует selected_text ТОКЕНИЗАТОРОМ SFT-директории. Разойдись они —
   # "равный бюджет" был бы равным только на бумаге.
-  SFT_DIR="$(ls -d /home/aburlova/cvlm/runs/sft_trunc${CR}_*/ | sort | tail -1)"
+  case "${CR}" in 8) SFT_DIR="${SFT8_DIR}" ;; 16) SFT_DIR="${SFT16_DIR}" ;; *) echo "no SFT dir for cr=${CR}"; exit 1 ;; esac
   echo "=== truncated-SFT cr=${CR}: ${SFT_DIR}"
   SFT_DIR="${SFT_DIR}" SEL="${OUT}/llmlingua_cr${CR}.jsonl" BASE="${MODEL_NAME}" python - <<'PY'
 import json, os
@@ -226,18 +273,18 @@ for CR in 8 16; do
   J="${OUT}/diag_pretrained_decoder_llmlingua_cr${CR}.json"
   if [ ! -s "${J}" ]; then
     echo; echo "=== [3a] pretrained SmolLM2 (text-input diagnostic) + LLMLingua-2, cr=${CR}"
-    python src/eval_cvlm.py --mode baseline_llm_full "${COMMON[@]}" --compression_rate 1 \
+    python src/eval_cvlm.py --mode baseline_llm_full "${COMMON[@]}" --compression_rate "${CR}" \
       --doc_truncation file --doc_selection_file "${SEL}" \
       --output_json "${J}" \
       --dump_per_sample "${OUT}/diag_pretrained_decoder_llmlingua_cr${CR}_dump.jsonl"
   fi
 
   # (б) truncated-SFT декодер того же cr — ОСНОВНАЯ клетка
-  SFT_DIR="$(ls -d /home/aburlova/cvlm/runs/sft_trunc${CR}_*/ | sort | tail -1)"
+  case "${CR}" in 8) SFT_DIR="${SFT8_DIR}" ;; 16) SFT_DIR="${SFT16_DIR}" ;; *) echo "no SFT dir for cr=${CR}"; exit 1 ;; esac
   J="${OUT}/primary_sfttrunc_decoder_llmlingua_cr${CR}.json"
   if [ ! -s "${J}" ]; then
     echo; echo "=== [3b] truncated-SFT(cr=${CR}) decoder (PRIMARY) + LLMLingua-2: ${SFT_DIR}"
-    python src/eval_cvlm.py --mode sft --sft_model_path "${SFT_DIR}" "${COMMON[@]}" --compression_rate 1 \
+    python src/eval_cvlm.py --mode sft --sft_model_path "${SFT_DIR}" "${COMMON[@]}" --compression_rate "${CR}" \
       --doc_truncation file --doc_selection_file "${SEL}" \
       --output_json "${J}" \
       --dump_per_sample "${OUT}/primary_sfttrunc_decoder_llmlingua_cr${CR}_dump.jsonl"
@@ -251,12 +298,13 @@ for CR in 8 16; do
   echo; echo "=== [4] paired document-clustered bootstrap, cr=${CR}"
   python tools/llmlingua_report.py \
     --clusters_jsonl "${OUT}/llmlingua_cr${CR}.jsonl" \
+    --expect_rows 3000 --expect_docs 205 \
     --cell "llmlingua_sft=${OUT}/primary_sfttrunc_decoder_llmlingua_cr${CR}_dump.jsonl" \
     --cell "llmlingua_pre=${OUT}/diag_pretrained_decoder_llmlingua_cr${CR}_dump.jsonl" \
-    --cell "first_sft=${REF}/sfttrunc_cr${CR}_dump.jsonl" \
-    --cell "first_pre=${REF}/frozen_first_cr${CR}_dump.jsonl" \
-    --cell "oracle_pre=${REF}/frozen_oracle_cr${CR}_dump.jsonl" \
-    --cell "cvlm=${REF}/compressor_cr${CR}_dump.jsonl" \
+    --ref_cell "first_sft=${REF}/sfttrunc_cr${CR}_dump.jsonl" \
+    --ref_cell "first_pre=${REF}/frozen_first_cr${CR}_dump.jsonl" \
+    --ref_cell "oracle_pre=${REF}/frozen_oracle_cr${CR}_dump.jsonl" \
+    --ref_cell "cvlm=${REF}/compressor_cr${CR}_dump.jsonl" \
     --contrast llmlingua_sft:first_sft \
     --contrast llmlingua_pre:first_pre \
     --contrast llmlingua_pre:oracle_pre \
@@ -267,4 +315,5 @@ for CR in 8 16; do
 done
 
 sha256sum -c "${OUT}/CODE_SHA256"
+touch "${OUT}/DONE"
 echo "=== LLMLINGUA BASELINE DONE: ${OUT}"

@@ -23,8 +23,10 @@ This tool closes both gaps before any GPU time is spent:
     shortfall is reported, not fatal (the protocol keeps short selections);
   * query invariance: PwC repeats one document across ~15 questions, and a
     document-only compressor must return byte-identical ``selected_text`` for
-    all of them. A violation is not fatal — it means the baseline is
-    query-aware and must be reported as such — but it is flagged loudly.
+    all of them. A violation is FATAL: the baseline would silently be
+    query-aware, which is a different (and stronger) method than the one the
+    write-up claims. ``--allow_query_aware`` downgrades it to a warning for
+    anyone deliberately building a query-conditioned variant.
 
 Exit code is non-zero on any fatal finding, so ``set -e`` in the sbatch stops
 before the evals run.
@@ -47,6 +49,8 @@ import os
 import sys
 from collections import defaultdict
 from typing import Dict, List
+
+import numpy as np
 
 os.environ.setdefault("DISABLE_LIGER", "1")
 # Tokenizers and hashing only — nothing is ever moved to a device, so this runs
@@ -79,6 +83,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_answer_len", type=int, default=2048)
     p.add_argument("--max_source_len", type=int, default=1024)
     p.add_argument("--max_samples", type=int, default=0)
+    p.add_argument(
+        "--allow_query_aware",
+        action="store_true",
+        help="Downgrade 'one document got different selections for different questions' from "
+        "fatal to a warning. Only for a deliberately query-conditioned variant.",
+    )
+    p.add_argument("--expect_rows", type=int, default=0, help="Fatal unless the file has exactly N rows (0 = off).")
+    p.add_argument(
+        "--expect_docs", type=int, default=0, help="Fatal unless there are exactly N unique documents (0 = off)."
+    )
     p.add_argument("--out_json", type=str, default="")
     return p.parse_args()
 
@@ -144,12 +158,16 @@ def main() -> None:
     n_under = 0
     deficit_sum = 0
     deficit_max = 0
+    deficits: List[int] = []
     n_hash_doc_bad = 0
     n_hash_q_bad = 0
     n_calls_sum = 0
     compress_seconds_sum = 0.0
+    n_truncated = 0
     models = set()
     revisions = set()
+    search_modes = set()
+    n_cr_mismatch = 0
 
     for i in range(n):
         rec = by_idx[i]
@@ -180,12 +198,17 @@ def main() -> None:
             n_under += 1
             deficit_sum += v_i - measured
             deficit_max = max(deficit_max, v_i - measured)
+        deficits.append(v_i - measured)
 
         by_doc[doc_sha].append(i)
         n_calls_sum += int(rec.get("n_calls", 0))
         compress_seconds_sum += float(rec.get("compress_seconds", 0.0))
+        n_truncated += int(bool(rec.get("truncated", False)))
         models.add(str(rec.get("llmlingua_model", "")))
         revisions.add(str(rec.get("model_revision", "")))
+        search_modes.add(str(rec.get("search_mode", "")))
+        if int(rec.get("cr", -1)) != args.budget_cr:
+            n_cr_mismatch += 1
 
     # Query invariance: one document, many questions, one selection.
     n_docs_multi = 0
@@ -207,13 +230,32 @@ def main() -> None:
         fatal.append(f"{n_token_mismatch}/{n} selected_smol_tokens != measured decoder tokens")
     if n_over:
         fatal.append(f"{n_over}/{n} selections EXCEED the budget V_i (unequal budget)")
+    if n_truncated:
+        fatal.append(
+            f"{n_truncated}/{n} selections used prefix truncation; the main protocol "
+            "requires whole LLMLingua outputs selected only through the threshold knob"
+        )
     if len(models) > 1:
         fatal.append(f"mixed llmlingua_model values in one file: {sorted(models)}")
+    if "" in models:
+        fatal.append("missing llmlingua_model provenance")
+    if len(revisions) > 1 or "" in revisions:
+        fatal.append(f"missing or mixed model_revision provenance: {sorted(revisions)}")
+    if len(search_modes) > 1 or "" in search_modes:
+        fatal.append(f"missing or mixed search_mode provenance: {sorted(search_modes)}")
+    if n_cr_mismatch:
+        fatal.append(f"{n_cr_mismatch}/{n} records have cr != --budget_cr={args.budget_cr}")
     if n_docs_inconsistent:
-        warn.append(
+        msg = (
             f"{n_docs_inconsistent}/{n_docs_multi} documents got different selections for "
-            f"different questions -> the baseline is QUERY-AWARE and must be reported as such"
+            f"different questions -> the baseline is QUERY-AWARE, not the document-only "
+            f"method claimed in the protocol"
         )
+        (warn if args.allow_query_aware else fatal).append(msg)
+    if args.expect_rows and n != args.expect_rows:
+        fatal.append(f"row count {n} != expected {args.expect_rows}")
+    if args.expect_docs and len(by_doc) != args.expect_docs:
+        fatal.append(f"unique document count {len(by_doc)} != expected {args.expect_docs}")
 
     out = {
         "jsonl": args.jsonl,
@@ -229,14 +271,20 @@ def main() -> None:
         "frac_under_budget": n_under / max(n, 1),
         "frac_exact_budget": (n - n_under - n_over) / max(n, 1),
         "mean_deficit_all": deficit_sum / max(n, 1),
+        "median_deficit_all": float(np.median(deficits)) if deficits else 0.0,
+        "p90_deficit_all": float(np.percentile(deficits, 90)) if deficits else 0.0,
+        "p95_deficit_all": float(np.percentile(deficits, 95)) if deficits else 0.0,
         "mean_deficit_when_under": deficit_sum / n_under if n_under else 0.0,
         "max_deficit": deficit_max,
         "n_source_sha_mismatch": n_hash_doc_bad,
         "n_prompt_sha_mismatch": n_hash_q_bad,
         "n_budget_mismatch": n_budget_mismatch,
         "n_token_count_mismatch": n_token_mismatch,
+        "n_prefix_truncated": n_truncated,
         "llmlingua_model": sorted(models),
         "model_revision": sorted(revisions),
+        "search_mode": sorted(search_modes),
+        "n_cr_mismatch": n_cr_mismatch,
         "compress_calls_total": n_calls_sum,
         "compress_seconds_total_from_jsonl": compress_seconds_sum,
         "fatal": fatal,

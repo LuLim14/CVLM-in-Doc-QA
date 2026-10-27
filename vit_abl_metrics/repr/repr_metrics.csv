@@ -1,0 +1,4 @@
+arm,transform_mag_mean,transform_mag_std,cos_align_mean,cos_align_std,erank_vit_input,erank_vit_output,erank_vision_embeds,aniso_vit_input,aniso_vit_output,aniso_vision_embeds
+vit,0.9599,0.0367,0.304,0.106,69.118,84.7133,60.1814,0.1568,0.1021,0.1943
+random_vit,1.6887,0.496,0.44,0.0632,53.8025,162.2023,70.4387,0.0697,0.0278,0.1597
+none,0.0,0.0,1.0,0.0,170.3315,170.3315,109.3599,0.0322,0.0322,0.1522

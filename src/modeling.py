@@ -1,11 +1,19 @@
+import math
 import os
+import random
 from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import transformers
-from liger_kernel.transformers.auto_model import MODEL_TYPE_TO_APPLY_LIGER_FN
+
+try:
+    from liger_kernel.transformers.auto_model import MODEL_TYPE_TO_APPLY_LIGER_FN
+except ImportError:
+    # liger-kernel needs torch>=2.5; allow running without it (set DISABLE_LIGER=1
+    # and budget for unfused fp32 logits: shrink batch + raise grad_accum).
+    MODEL_TYPE_TO_APPLY_LIGER_FN = None
 from safetensors.torch import load_file
 
 # Liger dispatch: pick the apply_liger_kernel_to_<model_type> matching the
@@ -14,12 +22,19 @@ from safetensors.torch import load_file
 # fused_linear_cross_entropy fuse is the critical one — it avoids materialising
 # the `[B, L, vocab]` fp32 logits tensor, which on Qwen3 (vocab=151936) is
 # ~3x larger than on Llama/SmolLM2 (vocab=49152) and OOMs at moderate batch.
-from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer, ViTModel
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer, ViTConfig, ViTModel
 
 
 def _apply_liger_for(model_name_or_path: str) -> None:
     if os.environ.get("DISABLE_LIGER", "0").lower() in ("1", "true", "yes"):
         print("[modeling] DISABLE_LIGER is set; decoder will run without Liger kernels.")
+        return
+    if MODEL_TYPE_TO_APPLY_LIGER_FN is None:
+        print(
+            "[modeling] WARN: liger-kernel is not installed; decoder will run "
+            "unfused — expect ~3-30 GB of fp32 logits depending on (vocab, batch, seq_len)."
+        )
         return
     cfg = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
     mt = getattr(cfg, "model_type", "")
@@ -52,6 +67,16 @@ class ModelArguments:
     compression_rate: int = field(
         default=4, metadata={"help": "Average-pool this many source tokens into one vision token."}
     )
+    mixed_fidelity_p: float = field(
+        default=0.0,
+        metadata={
+            "help": "MIXED-FIDELITY training: per-chunk probability that a document chunk enters the "
+            "decoder as raw decoder-token embeddings instead of its single compressed vision token. "
+            "Blocks are interleaved in document order. 0.0 (default) = pure compressed, legacy path. "
+            "Requires the dataset/collator to supply doc_dec_ids + chunk_dec_spans + chunk_counts. "
+            "Fine-tuning feature: combine with --restore_from."
+        },
+    )
     unfreeze_encoder_top_k: int = field(
         default=0,
         metadata={
@@ -64,24 +89,101 @@ class ModelArguments:
             "help": "Number of learnable latent queries (K) used by the chunked attention pool. K=1 = single-query (legacy). K>1 = Perceiver-style multi-query pool whose K outputs are mean-pooled to produce 1 vision token per chunk."
         },
     )
-    vision_backend: str = field(
-        default="vit",
+    mean_pool: bool = field(
+        default=False,
         metadata={
-            "help": "Ablation switch for the vision stage. 'vit' = pretrained ViT (default). "
-            "'random_vit' = same ViT architecture with randomly-initialised weights (isolates "
-            "the value of the pretrained visual prior). 'none' = drop the ViT transformer+layernorm "
-            "entirely; pool -> text_projector -> +pos -> vision_projector -> decoder (isolates the "
-            "value of the ViT's transformer computation)."
+            "help": "MEANPOOL ABLATION (MeanPool+Project). Replace the learnable attention pool "
+            "with an EXACT masked mean over the real tokens of each chunk: pool_queries are still "
+            "allocated (so checkpoints/manifests keep the same keys) but are zero-filled, frozen "
+            "(requires_grad=False, hence absent from the optimizer AND from the saved trainable "
+            "state) and NOT passed to _chunked_attention_pool at all. This is the control for "
+            "'is the learnable pool doing anything?': zero-init makes the attention pool START as "
+            "the mean, but the queries do move during training, so an attention-pool run is not a "
+            "mean-pool run. MUST be passed to eval too — otherwise eval rebuilds the attention "
+            "pool and evaluates a different architecture."
         },
-    )
-    random_vit_seed: int = field(
-        default=0,
-        metadata={"help": "Seed for the explicit random re-initialisation when vision_backend='random_vit'."},
     )
     projector_use_input_rmsnorm: bool = field(
         default=True,
         metadata={
             "help": "If False, projectors are plain 2-layer MLP (up_proj/GELU/down_proj) — matches pre-RMSNorm checkpoints with no input_norm.* keys."
+        },
+    )
+    vit_init: str = field(
+        default="pretrained",
+        metadata={
+            "help": "'pretrained' loads vision_encoder_name weights; 'random' builds the identical ViT architecture from its config with random init (prior ablation)."
+        },
+    )
+    vit_num_layers: int = field(
+        default=0,
+        metadata={
+            "help": "POST-BOTTLENECK DEPTH ablation. 0 (default) = keep every layer of the ViT "
+            "config (12 for ViT-Base). N>0 truncates vision_encoder.encoder.layer to its FIRST N "
+            "blocks immediately after construction, so the N-layer arm differs from the 12-layer "
+            "arm in the number of layers and NOTHING else: same block type, same config, same "
+            "final LayerNorm, same padding-mask setting, same RNG draw (the full stack is built "
+            "and then truncated, so the surviving blocks are bit-identical to the 12-layer arm's "
+            "first N and the shared modules after it are unshifted). Removed blocks are deleted "
+            "from the module, so they are absent from parameters(), the optimizer and checkpoints. "
+            "Incompatible with vit_skip / mixer_depth_map (there is no plain ViT to truncate). "
+            "MUST be passed to eval too."
+        },
+    )
+    vit_freeze: bool = field(
+        default=False,
+        metadata={
+            "help": "Freeze the vision encoder (requires_grad=False + eval mode). Gradient still flows THROUGH it to the projector/pool/encoder. Frozen ViT weights are not saved in checkpoints; eval reloads them from HF, so combining with vit_init='random' is rejected."
+        },
+    )
+    vit_skip: bool = field(
+        default=False,
+        metadata={
+            "help": "Bypass the ViT block entirely (no-ViT ablation): encoder -> pool -> text_projector -> +pos_embed -> vision_projector. Projector/pos_embed geometry is kept identical to the ViT branches. Must be passed to eval too, or eval silently rebuilds a pretrained ViT."
+        },
+    )
+    mixer_depth_map: str = field(
+        default="",
+        metadata={
+            "help": "RATE-DEPTH MIXER: comma-separated 'cr:depth' map (e.g. '1:0,2:1,4:3,8:6,16:12'). "
+            "Non-empty ENABLES the mixer and fully replaces the ViT branching: instead of a ViT encoder, "
+            "a stack of zero-gated ViTLayer blocks is built (config-init from vision_encoder_name) and the "
+            "ACTIVE depth is looked up from the current compression_rate (exact key; else nearest LOWER key; "
+            "else the smallest key). Depth 0 / zero gates are byte-identical to the no-ViT path. "
+            "Incompatible with vit_skip / vit_freeze / vit_init='random'. Empty (default) = legacy ViT branching."
+        },
+    )
+    mask_vit_padding: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, apply vision_attention_mask INSIDE every ViT/mixer self-attention "
+            "layer so real latent tokens cannot attend to batch-padding slots. False preserves "
+            "legacy checkpoints/behaviour. New controlled experiments should enable this flag "
+            "for every ViT/mixer arm and pass it to eval as well."
+        },
+    )
+    vit_apply_final_layernorm: bool = field(
+        default=True,
+        metadata={
+            "help": "Apply ViTModel.layernorm after the plain pretrained/random ViT encoder. "
+            "Set False only for the fixed-depth direct control that is compared with the bare "
+            "zero-gated mixer stack (which has no final layernorm)."
+        },
+    )
+    compact_decoder_positions: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, construct decoder position_ids from the cumulative "
+            "attention mask so left-padding and masked latent slots do not shift "
+            "subsequent answer positions. False preserves legacy teacher-forcing "
+            "behaviour. GenerationMixin already uses compact positions by default, "
+            "so enabling this flag also removes a train/generation mismatch."
+        },
+    )
+    shared_init_seed: int = field(
+        default=0,
+        metadata={
+            "help": "If >0, re-seed torch RNG (a) with shared_init_seed+1 right before building the ViT and (b) with shared_init_seed right after — so the branch-specific ViT paths (from_pretrained / config-init / skip) consume different RNG amounts WITHOUT desynchronising the shared modules (projectors, pos_embed, pool_queries): those become bit-identical across ablation branches for a given seed."
         },
     )
     train: bool = field(
@@ -117,6 +219,290 @@ def print_trainable_parameters(model):
 def freeze_model(model):
     for _, param in model.named_parameters():
         param.requires_grad = False
+
+
+def _parse_mixer_depth_map(s: Optional[str], max_depth: Optional[int] = None) -> Optional[dict]:
+    """Parse a RATE-DEPTH MIXER map string "cr:depth,..." into {cr: depth}.
+
+    Returns None for empty/None input (mixer disabled). Raises ValueError on
+    malformed input: missing ':', non-integer fields, cr < 1, depth < 0,
+    duplicate cr keys, or depth > max_depth (when max_depth is given —
+    depth == max_depth, i.e. "use every layer", is legal).
+    """
+    if s is None:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    out: dict = {}
+    for tok in s.split(","):
+        tok = tok.strip()
+        if ":" not in tok:
+            raise ValueError(f"mixer_depth_map token {tok!r} missing ':' separator")
+        cr_str, depth_str = tok.split(":", 1)
+        try:
+            cr = int(cr_str.strip())
+            depth = int(depth_str.strip())
+        except ValueError:
+            raise ValueError(f"mixer_depth_map token {tok!r} has non-integer fields")
+        if cr < 1:
+            raise ValueError(f"mixer_depth_map cr={cr} must be >= 1")
+        if depth < 0:
+            raise ValueError(f"mixer_depth_map depth={depth} must be >= 0")
+        if max_depth is not None and depth > max_depth:
+            raise ValueError(f"mixer_depth_map depth={depth} exceeds available mixer layers ({max_depth})")
+        if cr in out:
+            raise ValueError(f"mixer_depth_map has duplicate cr={cr}")
+        out[cr] = depth
+    return out
+
+
+def _mixer_depth_for_cr(depth_map: dict, cr: int) -> int:
+    """Depth lookup rule: exact key; else nearest LOWER key; else smallest key.
+
+    The nearest-lower rule makes eval on an unseen cr conservative: e.g. with a
+    map up to 16, cr=32 uses the depth trained for cr=16 (never extrapolates to
+    a deeper stack than was ever trained).
+    """
+    cr = int(cr)
+    if cr in depth_map:
+        return depth_map[cr]
+    lower = [k for k in depth_map if k < cr]
+    if lower:
+        return depth_map[max(lower)]
+    return depth_map[min(depth_map)]
+
+
+def _truncate_vit_layers(vision_encoder, vit_num_layers: int) -> int:
+    """Keep the FIRST ``vit_num_layers`` blocks of a plain ViT stack, in place.
+
+    This is the POST-BOTTLENECK DEPTH ablation (``--vit_num_layers``). The stack
+    must already be fully constructed: truncating AFTER construction (rather
+    than building from a shallower config) is what makes the depth curve
+    interpretable, because
+
+      * the ViT consumes exactly the same amount of global RNG at every depth,
+        so the surviving blocks are bit-identical to the full-depth arm's first
+        N AND every module initialised later (projectors, pos-embed, pool
+        queries) is unshifted;
+      * everything else about the arm — block type, config, final LayerNorm,
+        padding-mask handling — is untouched, so depth is the only difference.
+
+    Dropped blocks are removed from the ``ModuleList``, hence from
+    ``parameters()``, the optimizer and checkpoints. ``config.num_hidden_layers``
+    is updated so the provenance recorded downstream is honest.
+
+    Args:
+        vision_encoder: a ``ViTModel`` (must expose ``encoder.layer``).
+        vit_num_layers: 0 = keep everything; N>0 = keep the first N.
+
+    Returns:
+        The resulting number of layers.
+    """
+    available = len(vision_encoder.encoder.layer)
+    n = int(vit_num_layers)
+    if n < 0:
+        raise ValueError(f"vit_num_layers must be >= 0 (0 = all layers), got {n}")
+    if n == 0 or n == available:
+        return available
+    if n > available:
+        raise ValueError(f"vit_num_layers={n} exceeds the {available} layers of this vision encoder")
+    vision_encoder.encoder.layer = nn.ModuleList(list(vision_encoder.encoder.layer)[:n])
+    vision_encoder.config.num_hidden_layers = n
+    return n
+
+
+def _mixer_forward(
+    h: torch.Tensor,
+    layers,
+    gates: torch.Tensor,
+    depth: int,
+    use_checkpoint: bool = False,
+    return_contrib: bool = False,
+    valid_mask: Optional[torch.Tensor] = None,
+    mask_padding: bool = False,
+):
+    """Zero-gated interpolation stack over the first ``depth`` ViTLayer blocks.
+
+    Each step is ``h <- h + g_i * (Layer_i(h) - h)``. ViTLayer already contains
+    its internal residual connections, so the gate interpolates between the
+    identity (g=0) and the full layer output (g=1): at zero gates — and at
+    depth=0, where ``h`` is returned untouched — the path is byte-identical to
+    the no-ViT path (vit_output = vit_input, no final layernorm).
+
+    ``layers[i](h)`` returns a bare Tensor on transformers >= 4.56 and a
+    ``(hidden, ...)`` tuple on older versions; both are handled — blindly
+    indexing ``[0]`` on a Tensor would silently slice the batch dimension.
+
+    CONTRIBUTION RATIO (``return_contrib=True``) — the diagnostic that makes the
+    mixer readable. Per applied layer it measures how much the gated update
+    actually moves the representation, relative to the representation itself:
+
+        c_i = || g_i * (Layer_i(h) - h) ||_F / || h ||_F
+
+    computed over VALID latent slots only when ``valid_mask`` is supplied
+    (otherwise over the whole batch tensor), in float32, on DETACHED tensors —
+    no autograd graph, no effect on the update, no gradient path. ``h`` in the
+    denominator is the layer's INPUT (the running hidden state), so the ratios
+    are sequential, not independent. Returns
+    ``(h, contrib)`` with ``contrib`` a float32 tensor of shape [depth]
+    (empty at depth=0) living on ``h``'s device; the caller decides when to sync
+    it to CPU. ``||h|| == 0`` yields 0.0 rather than a NaN.
+
+    ``mask_padding=True`` additionally applies ``valid_mask`` as a KEY mask
+    inside self-attention. Merely zeroing padded outputs after a ViTLayer is not
+    sufficient: real queries would already have mixed padded keys/values into
+    their representations.
+    """
+    if mask_padding and valid_mask is None:
+        raise ValueError("mask_padding=True requires valid_mask [B, V]")
+    if valid_mask is not None:
+        if valid_mask.ndim != 2 or tuple(valid_mask.shape) != tuple(h.shape[:2]):
+            raise ValueError(
+                f"valid_mask must have shape {tuple(h.shape[:2])}, got {tuple(valid_mask.shape)}"
+            )
+        valid_mask = valid_mask.to(device=h.device, dtype=torch.bool)
+    contribs: Optional[list] = [] if return_contrib else None
+    for i in range(depth):
+        layer = layers[i]
+        if mask_padding:
+            if use_checkpoint:
+                def _masked_forward(x, _layer=layer, _mask=valid_mask):
+                    return _vit_layer_forward_with_padding_mask(_layer, x, _mask)
+
+                out = _torch_checkpoint(_masked_forward, h, use_reentrant=False)
+            else:
+                out = _vit_layer_forward_with_padding_mask(layer, h, valid_mask)
+        elif use_checkpoint:
+            out = _torch_checkpoint(layer, h, use_reentrant=False)
+        else:
+            out = layer(h)
+        if isinstance(out, tuple):
+            out = out[0]
+        delta = gates[i].to(h.dtype) * (out - h)
+        if contribs is not None:
+            with torch.no_grad():
+                delta_for_norm = delta.detach()
+                h_for_norm = h.detach()
+                if valid_mask is not None:
+                    norm_mask = valid_mask.unsqueeze(-1).to(dtype=h.dtype)
+                    delta_for_norm = delta_for_norm * norm_mask
+                    h_for_norm = h_for_norm * norm_mask
+                # dtype=float32 accumulates the reduction in fp32 even for a
+                # bf16 hidden state, without an fp32 copy of the activations.
+                num = torch.linalg.vector_norm(delta_for_norm, dtype=torch.float32)
+                den = torch.linalg.vector_norm(h_for_norm, dtype=torch.float32)
+                contribs.append(
+                    torch.where(
+                        den > 0,
+                        num / torch.clamp(den, min=torch.finfo(torch.float32).tiny),
+                        torch.zeros_like(num),
+                    )
+                )
+        h = h + delta
+    if contribs is None:
+        return h
+    contrib = (
+        torch.stack(contribs) if contribs else torch.zeros(0, dtype=torch.float32, device=h.device)
+    )
+    return h, contrib
+
+
+def _vit_layer_forward_with_padding_mask(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """ViTLayer forward with a real key-padding mask.
+
+    Hugging Face ``ViTLayer`` accepts a *head* mask but no sequence padding
+    mask. CVLM batches variable-length pooled sequences, so calling the native
+    layer lets real latent queries attend to padded slots (which are non-zero
+    after projector biases + positional embeddings). This function reuses the
+    exact ViT parameters and residual/MLP structure while inserting the missing
+    key mask before the attention softmax.
+    """
+    if valid_mask.ndim != 2 or tuple(valid_mask.shape) != tuple(hidden_states.shape[:2]):
+        raise ValueError(
+            f"valid_mask must have shape {tuple(hidden_states.shape[:2])}, "
+            f"got {tuple(valid_mask.shape)}"
+        )
+    valid_mask = valid_mask.to(device=hidden_states.device, dtype=torch.bool)
+
+    hidden_states_norm = layer.layernorm_before(hidden_states)
+    self_attn = layer.attention.attention
+    batch_size = hidden_states_norm.shape[0]
+    n_heads = int(self_attn.num_attention_heads)
+    head_dim = int(self_attn.attention_head_size)
+    qkv_shape = (batch_size, -1, n_heads, head_dim)
+
+    key = self_attn.key(hidden_states_norm).view(*qkv_shape).transpose(1, 2)
+    value = self_attn.value(hidden_states_norm).view(*qkv_shape).transpose(1, 2)
+    query = self_attn.query(hidden_states_norm).view(*qkv_shape).transpose(1, 2)
+    scaling = float(getattr(self_attn, "scaling", head_dim**-0.5))
+
+    attention_scores = torch.matmul(query, key.transpose(-1, -2)) * scaling
+    key_mask = valid_mask[:, None, None, :]
+    attention_scores = attention_scores.masked_fill(
+        ~key_mask,
+        torch.finfo(attention_scores.dtype).min,
+    )
+    attention_probs = torch.softmax(attention_scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    dropout_value = getattr(self_attn, "dropout_prob", getattr(self_attn, "dropout", 0.0))
+    dropout_p = float(dropout_value.p if isinstance(dropout_value, nn.Dropout) else dropout_value)
+    attention_probs = torch.nn.functional.dropout(
+        attention_probs,
+        p=dropout_p,
+        training=self_attn.training,
+    )
+    context = torch.matmul(attention_probs, value)
+    context = context.transpose(1, 2).contiguous().reshape(
+        batch_size,
+        hidden_states_norm.size(1),
+        n_heads * head_dim,
+    )
+    attention_output = layer.attention.output(context, hidden_states_norm)
+
+    hidden_states = attention_output + hidden_states
+    layer_output = layer.layernorm_after(hidden_states)
+    layer_output = layer.intermediate(layer_output)
+    return layer.output(layer_output, hidden_states)
+
+
+def _vit_encoder_forward_with_padding_mask(
+    layers,
+    hidden_states: torch.Tensor,
+    valid_mask: torch.Tensor,
+    use_checkpoint: bool = False,
+) -> torch.Tensor:
+    """Run a ViT encoder stack with the missing sequence padding mask."""
+    for layer in layers:
+        if use_checkpoint:
+            def _masked_forward(x, _layer=layer, _mask=valid_mask):
+                return _vit_layer_forward_with_padding_mask(_layer, x, _mask)
+
+            hidden_states = _torch_checkpoint(_masked_forward, hidden_states, use_reentrant=False)
+        else:
+            hidden_states = _vit_layer_forward_with_padding_mask(layer, hidden_states, valid_mask)
+    return hidden_states
+
+
+def _compact_position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Position indices that ignore masked holes in a decoder sequence.
+
+    This matches Hugging Face ``GenerationMixin.prepare_inputs_for_generation``:
+    real tokens receive ``cumsum(mask)-1`` and masked slots receive an arbitrary
+    harmless value. CVLM has masked latent slots *inside* the sequence, between
+    prompt/document and answer. Letting the decoder infer ``0..L-1`` positions
+    makes a sample's answer coordinates depend on its batchmates and disagrees
+    with generation, which already compacts positions from the attention mask.
+    """
+    if attention_mask.ndim != 2:
+        raise ValueError(
+            f"attention_mask must have shape [B, L], got {tuple(attention_mask.shape)}"
+        )
+    positions = attention_mask.to(dtype=torch.long).cumsum(dim=-1) - 1
+    return positions.masked_fill(attention_mask == 0, 1)
 
 
 class RMSNorm(nn.Module):
@@ -160,9 +546,19 @@ def _chunked_attention_pool(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool contiguous chunks of `compression_rate` real tokens per sample.
 
-    When ``pool_queries`` is None, falls back to plain unweighted mean-pool
-    (legacy behaviour). When ``pool_queries`` is provided, each chunk is
-    reduced via softmax-weighted multi-query attention:
+    When ``pool_queries`` is None the reduction is an EXACT masked mean over the
+    real tokens of each chunk — this is the ``--mean_pool`` ablation arm
+    (MeanPool+Project), a pool with no learnable parameters at all. "Exact"
+    is meant bitwise, not just mathematically: the partial last chunk is
+    recomputed from the unpadded slice (``chunked[-1, :cr - pad].mean(0)``)
+    rather than rescaled from the zero-padded mean. The two are equal in exact
+    arithmetic, but the rescale ``mean(dim=1) * cr / true_last`` is NOT
+    bit-identical to ``real_tokens.mean(0)`` in bf16 (nor in fp32 for a non
+    power-of-two cr), which would leave the ablation's central claim ("the pool
+    is EXACTLY the mean") resting on a tolerance instead of on ``torch.equal``.
+
+    When ``pool_queries`` is provided, each chunk is instead reduced via
+    softmax-weighted multi-query attention:
 
         scores  = (chunk_tokens @ Q.T) / sqrt(H)          # [cr, K]
         weights = softmax(scores, dim=cr)                 # [cr, K]
@@ -188,7 +584,8 @@ def _chunked_attention_pool(
         source_attention_mask: [B, L] long/int mask (1 for real, 0 for pad).
         compression_rate: pool size.
         max_vision_len: hard cap on output V per sample (truncates longer docs).
-        pool_queries: optional [H] or [K, H] learnable parameter; None -> mean-pool.
+        pool_queries: optional [H] or [K, H] learnable parameter; None -> exact
+            masked mean-pool (the parameter-free --mean_pool arm).
 
     Returns:
         pooled: [B, V_max, H] where V_max = max V_i across batch.
@@ -235,9 +632,11 @@ def _chunked_attention_pool(
         if Q is None:
             chunk_pooled = chunked.mean(dim=1)  # [V_i, H]
             if pad > 0:
-                # Last chunk's mean was divided by cr, should be divided by (cr - pad).
-                true_last = cr - pad
-                chunk_pooled[-1] = chunk_pooled[-1] * cr / true_last
+                # The last chunk holds (cr - pad) real tokens plus a zero tail.
+                # Recompute it from the UNPADDED slice so the result is bitwise
+                # `real_tokens.mean(0)`; rescaling the padded mean by cr/(cr-pad)
+                # is only equal in exact arithmetic (see the docstring).
+                chunk_pooled[-1] = chunked[-1, : cr - pad].mean(dim=0)
         else:
             # scores[v, c, k] = chunked[v, c] · Q[k] / sqrt(H)
             scores = torch.einsum("vch,kh->vck", chunked, Q) * scale  # [V_i, cr, K]
@@ -254,6 +653,122 @@ def _chunked_attention_pool(
         v_mask[b, :V_i] = 1
 
     return pooled, v_mask
+
+
+def _sample_raw_chunk_flags(
+    chunk_lens: list[int],
+    p: float,
+    budget: int,
+    rng: Optional[random.Random] = None,
+) -> list[bool]:
+    """Sample which chunks are fed RAW (decoder tokens) vs COMPRESSED (1 vision token).
+
+    Each chunk is independently raw with probability ``p`` (fraction ~p in
+    expectation). A raw chunk costs ``chunk_lens[i]`` decoder tokens; a
+    compressed chunk costs exactly 1. If the total cost exceeds ``budget``,
+    raw chunks are demoted back to compressed in random order until the cost
+    fits (unbiased trim — no position preference). Chunks with an empty
+    decoder span (len 0) are never raw: they must keep their vision token so
+    the chunk stays represented in the sequence.
+
+    Args:
+        chunk_lens: decoder-token length of each chunk's raw span, doc order.
+        p: raw probability in [0, 1].
+        budget: max total decoder positions for the mixed block.
+        rng: optional random.Random for determinism (tests); default global RNG.
+
+    Returns:
+        List of booleans, one per chunk, in document order. True = raw.
+    """
+    r: random.Random = rng if rng is not None else random  # type: ignore[assignment]
+    n = len(chunk_lens)
+    flags = [(chunk_lens[i] > 0) and (r.random() < p) for i in range(n)]
+    cost = sum(chunk_lens[i] if flags[i] else 1 for i in range(n))
+    if cost > budget:
+        raw_idx = [i for i in range(n) if flags[i]]
+        r.shuffle(raw_idx)
+        while cost > budget and raw_idx:
+            i = raw_idx.pop()
+            flags[i] = False
+            cost -= chunk_lens[i] - 1
+    return flags
+
+
+def _assemble_mixed_decoder_input(
+    prompt_embs: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    vision_embeds: torch.Tensor,
+    vision_mask: torch.Tensor,
+    doc_embs: torch.Tensor,
+    chunk_spans: torch.Tensor,
+    chunk_counts,
+    raw_flags: list[list[bool]],
+    answer_embs: torch.Tensor,
+    answer_mask: torch.Tensor,
+    labels_src: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    """Build the MIXED-FIDELITY decoder input: [prompt | mixed blocks | answer].
+
+    The mixed segment is a per-sample concatenation of blocks in DOCUMENT
+    ORDER: chunk j contributes either its raw decoder-token embeddings
+    ``doc_embs[b, lo_j:hi_j]`` (raw_flags[b][j] True and span non-empty) or its
+    single compressed vision embedding ``vision_embeds[b, j]``. Variable mixed
+    lengths are right-padded with zero embeddings and mask 0 (same convention
+    as the vision block in the legacy path). Labels are -100 over
+    prompt+mixed; the answer part carries ``labels_src`` (loss on answer only).
+
+    Args:
+        prompt_embs/prompt_mask: [B, P, D] / [B, P] (left-padded prompt).
+        vision_embeds/vision_mask: [B, V, D] / [B, V] from _encode_vision.
+        doc_embs: [B, T_doc, D] decoder embeddings of the whole document.
+        chunk_spans: [B, C, 2] (start, end) decoder-token spans per chunk.
+        chunk_counts: [B] number of valid chunks per sample (int or tensor).
+        raw_flags: per-sample list of booleans, document order.
+        answer_embs/answer_mask: [B, A, D] / [B, A] (right-padded answer).
+        labels_src: [B, A] answer labels (-100 on answer pad).
+
+    Returns:
+        (decoder_input [B, P+M+A, D], attention_mask [B, P+M+A],
+         labels [B, P+M+A], stats) where stats has per-sample python lists:
+         "mixed_lens" (real mixed-block length), "raw_counts", "n_chunks".
+    """
+    B, P, D = prompt_embs.shape
+    blocks_per_sample: list[torch.Tensor] = []
+    mixed_lens: list[int] = []
+    raw_counts: list[int] = []
+    n_chunks: list[int] = []
+    for b in range(B):
+        n = min(int(vision_mask[b].sum()), int(chunk_counts[b]))
+        blocks: list[torch.Tensor] = []
+        n_raw = 0
+        for j in range(n):
+            lo = int(chunk_spans[b, j, 0])
+            hi = int(chunk_spans[b, j, 1])
+            if j < len(raw_flags[b]) and raw_flags[b][j] and hi > lo:
+                blocks.append(doc_embs[b, lo:hi])
+                n_raw += 1
+            else:
+                blocks.append(vision_embeds[b, j : j + 1])
+        mixed = torch.cat(blocks, dim=0) if blocks else vision_embeds.new_zeros((0, D))
+        blocks_per_sample.append(mixed)
+        mixed_lens.append(int(mixed.size(0)))
+        raw_counts.append(n_raw)
+        n_chunks.append(n)
+
+    M_max = max(max(mixed_lens), 1)
+    mixed_embs = vision_embeds.new_zeros((B, M_max, D))
+    mixed_mask = torch.zeros((B, M_max), dtype=torch.long, device=vision_embeds.device)
+    for b, m in enumerate(blocks_per_sample):
+        if m.size(0) > 0:
+            mixed_embs[b, : m.size(0)] = m
+            mixed_mask[b, : m.size(0)] = 1
+
+    decoder_input = torch.cat([prompt_embs, mixed_embs, answer_embs], dim=1)
+    attention_mask = torch.cat([prompt_mask, mixed_mask, answer_mask], dim=1)
+    ignore = torch.full((B, P + M_max), -100, dtype=labels_src.dtype, device=labels_src.device)
+    labels = torch.cat([ignore, labels_src], dim=1)
+    stats = {"mixed_lens": mixed_lens, "raw_counts": raw_counts, "n_chunks": n_chunks}
+    return decoder_input, attention_mask, labels, stats
 
 
 class CVLM(torch.nn.Module):
@@ -285,57 +800,170 @@ class CVLM(torch.nn.Module):
         # Stash the encoder's hidden size for the text_projector input dim.
         enc_hidden = self.text_encoder.config.hidden_size
 
-        # Vision backend ablation. In every case we instantiate a ViT so the
-        # projector dims (text_projector out / vision_projector in) are sized by
-        # its hidden_size; the backend only controls whether/how the ViT weights
-        # are initialised and whether its transformer runs in _encode_vision.
-        self.vision_backend = str(getattr(model_args, "vision_backend", "vit") or "vit").lower()
-        if self.vision_backend not in ("vit", "random_vit", "none"):
+        vit_init = str(getattr(model_args, "vit_init", "pretrained") or "pretrained")
+        if vit_init not in ("pretrained", "random"):
+            raise ValueError(f"vit_init must be 'pretrained' or 'random', got {vit_init!r}")
+        # RATE-DEPTH MIXER: non-empty map fully replaces the ViT branching below.
+        mixer_map = _parse_mixer_depth_map(getattr(model_args, "mixer_depth_map", "") or "")
+        if mixer_map is not None:
+            if getattr(model_args, "vit_skip", False):
+                raise ValueError(
+                    "mixer_depth_map is incompatible with vit_skip: the mixer replaces the ViT "
+                    "branching entirely (depth 0 already IS the no-ViT path)."
+                )
+            if getattr(model_args, "vit_freeze", False):
+                raise ValueError(
+                    "mixer_depth_map is incompatible with vit_freeze: mixer layers are always "
+                    "trainable (frozen params are excluded from checkpoints and would be lost)."
+                )
+            if vit_init == "random":
+                raise ValueError(
+                    "mixer_depth_map is incompatible with vit_init='random': the mixer is always "
+                    "config-initialised (random) by construction; pass the default vit_init."
+                )
+        vit_num_layers = int(getattr(model_args, "vit_num_layers", 0) or 0)
+        if vit_num_layers < 0:
+            raise ValueError(f"vit_num_layers must be >= 0 (0 = all layers), got {vit_num_layers}")
+        if vit_num_layers > 0:
+            if getattr(model_args, "vit_skip", False):
+                raise ValueError(
+                    "vit_num_layers is incompatible with vit_skip: there is no ViT stack to truncate "
+                    "(vit_skip IS the 0-layer arm)."
+                )
+            if mixer_map is not None:
+                raise ValueError(
+                    "vit_num_layers is incompatible with mixer_depth_map: the mixer replaces the ViT "
+                    "and already sets its own per-cr depth. Pick one depth mechanism."
+                )
+        self.vit_num_layers = vit_num_layers
+        self.mixer_depth_map = None
+        self.mixer_layers = None
+        self.mixer_gates = None
+        self._mixer_grad_ckpt = False
+        self._masked_vit_grad_ckpt = False
+        self.mask_vit_padding = bool(getattr(model_args, "mask_vit_padding", False))
+        self.vit_apply_final_layernorm = bool(
+            getattr(model_args, "vit_apply_final_layernorm", True)
+        )
+        self.compact_decoder_positions = bool(
+            getattr(model_args, "compact_decoder_positions", False)
+        )
+        # Diagnostic-only knob used by tools/measure_padding_contamination.py.
+        # It appends masked latent slots AFTER pooling so the real content is
+        # unchanged while the unmasked ViT sees extra projected+positioned pads.
+        self.synthetic_latent_pad_fraction = 0.0
+        self._last_synthetic_pad_slots = 0
+        # Per-layer contribution ratios of the most recent mixer forward
+        # (diagnostic; None when the mixer is disabled — nothing is computed).
+        self._last_mixer_contrib = None
+        shared_seed = int(getattr(model_args, "shared_init_seed", 0) or 0)
+        if shared_seed:
+            # Reproducible branch-specific ViT init (matters for vit_init='random').
+            torch.manual_seed(shared_seed + 1)
+        if vit_init == "random" and getattr(model_args, "vit_freeze", False):
             raise ValueError(
-                f"vision_backend must be one of 'vit'/'random_vit'/'none', got {self.vision_backend!r}"
+                "vit_init='random' + vit_freeze is unsupported: frozen params are not "
+                "saved in checkpoints, so the random weights would be lost for eval."
             )
-        if self.vision_backend == "random_vit":
-            # Same architecture, random weights: isolates the pretrained prior.
-            # ViTModel(config) already runs HF's post_init -> _init_weights, but
-            # we re-initialise *explicitly under a fixed local seed* so the random
-            # ViT is fully reproducible and independent of construction order /
-            # any prior RNG consumption. We fork the RNG so this does not perturb
-            # the global stream used by the rest of the model's init.
-            vit_config = AutoConfig.from_pretrained(model_args.vision_encoder_name)
-            self.vision_encoder = ViTModel(vit_config)
-            rvit_seed = int(getattr(model_args, "random_vit_seed", 0) or 0)
-            with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(rvit_seed)
-                # Re-apply the model's own weight initialiser to every submodule.
-                self.vision_encoder.apply(self.vision_encoder._init_weights)
-            n_vit = sum(p.numel() for p in self.vision_encoder.parameters())
+        if mixer_map is not None:
+            # RATE-DEPTH MIXER: built HERE — after manual_seed(shared_seed + 1) —
+            # so mixer weights are reproducible across runs like the other ViT
+            # branches. Config-init only (no pretrained weights); embeddings and
+            # pooler of the throwaway ViTModel are NOT kept, only the layer stack.
+            vit_cfg = ViTConfig.from_pretrained(model_args.vision_encoder_name)
+            _vit_tmp = ViTModel(vit_cfg)
+            self.mixer_layers = nn.ModuleList(list(_vit_tmp.encoder.layer))
+            del _vit_tmp
+            bad = {k: v for k, v in mixer_map.items() if v > len(self.mixer_layers)}
+            if bad:
+                raise ValueError(
+                    f"mixer_depth_map depths {bad} exceed available mixer layers ({len(self.mixer_layers)})"
+                )
+            self.mixer_gates = nn.Parameter(torch.zeros(len(self.mixer_layers)))
+            self.mixer_depth_map = dict(sorted(mixer_map.items()))
+            self.vision_encoder = None
+            vit_hidden = vit_cfg.hidden_size
+            n_mixer = sum(p.numel() for p in self.mixer_layers.parameters()) + self.mixer_gates.numel()
             print(
-                f"[modeling] vision_backend=random_vit: ViT re-initialised from scratch "
-                f"(config={model_args.vision_encoder_name}, seed={rvit_seed}, "
-                f"{n_vit/1e6:.1f}M params, NO pretrained weights loaded)"
+                f"[modeling] RATE-DEPTH MIXER enabled: depth_map={self.mixer_depth_map} "
+                f"layers={len(self.mixer_layers)} params={n_mixer} "
+                f"(zero-gated; depth 0 == no-ViT path byte-for-byte; "
+                f"mask_vit_padding={self.mask_vit_padding})"
+            )
+        elif getattr(model_args, "vit_skip", False):
+            # no-ViT ablation: keep projector/pos_embed geometry via the ViT config,
+            # but never instantiate the encoder itself.
+            self.vision_encoder = None
+            vit_hidden = AutoConfig.from_pretrained(model_args.vision_encoder_name).hidden_size
+            print("[modeling] vit_skip: ViT block is BYPASSED (encoder->pool->projectors only)")
+        elif vit_init == "random":
+            vit_cfg = AutoConfig.from_pretrained(model_args.vision_encoder_name)
+            self.vision_encoder = ViTModel(vit_cfg)
+            vit_hidden = self.vision_encoder.config.hidden_size
+            print(
+                f"[modeling] vit_init=random: ViT built from config "
+                f"({model_args.vision_encoder_name}), no pretrained weights; "
+                f"mask_vit_padding={self.mask_vit_padding}; "
+                f"final_layernorm={self.vit_apply_final_layernorm}"
             )
         else:
             self.vision_encoder = ViTModel.from_pretrained(
                 model_args.vision_encoder_name,
                 use_safetensors=True,
             )
-            if self.vision_backend == "none":
-                print("[modeling] vision_backend=none: ViT transformer+layernorm will be BYPASSED in _encode_vision")
+            vit_hidden = self.vision_encoder.config.hidden_size
+            print(
+                f"[modeling] vit_init=pretrained: mask_vit_padding={self.mask_vit_padding}; "
+                f"final_layernorm={self.vit_apply_final_layernorm}"
+            )
+        if self.vision_encoder is not None and vit_num_layers > 0:
+            # DEPTH ABLATION: keep the FIRST N blocks of the freshly built stack
+            # (see _truncate_vit_layers for why the cut happens after, not
+            # during, construction).
+            available = len(self.vision_encoder.encoder.layer)
+            kept = _truncate_vit_layers(self.vision_encoder, vit_num_layers)
+            if kept < available:
+                print(
+                    f"[modeling] VIT DEPTH ablation: vision encoder TRUNCATED to the first "
+                    f"{kept} of {available} layers (vit_init={vit_init}, "
+                    f"final_layernorm={self.vit_apply_final_layernorm}, "
+                    f"mask_vit_padding={self.mask_vit_padding})"
+                )
+            else:
+                print(
+                    f"[modeling] VIT DEPTH ablation: vit_num_layers={vit_num_layers} == full depth; "
+                    f"stack left untouched (bit-identical to vit_num_layers=0)"
+                )
+        if self.vision_encoder is not None and not self.vit_apply_final_layernorm:
+            for parameter in self.vision_encoder.layernorm.parameters():
+                parameter.requires_grad = False
+        if shared_seed:
+            # CRITICAL for ablation fairness: the three ViT paths above consume
+            # different amounts of global RNG. Re-seed so every shared module
+            # below starts bit-identical across branches.
+            torch.manual_seed(shared_seed)
         use_prms = bool(getattr(model_args, "projector_use_input_rmsnorm", True))
         self.text_projector = Projector(
             enc_hidden,
-            self.vision_encoder.config.hidden_size,
+            vit_hidden,
             use_input_rmsnorm=use_prms,
         )
         self.vision_projector = Projector(
-            self.vision_encoder.config.hidden_size,
+            vit_hidden,
             self.decoder.config.hidden_size,
             use_input_rmsnorm=use_prms,
         )
         # Learned positional embedding for the compressed vision sequence.
         self.max_vision_len = int(model_args.max_vision_len)
         self.compression_rate = int(model_args.compression_rate)
-        self.vision_pos_embed = nn.Embedding(self.max_vision_len, self.vision_encoder.config.hidden_size)
+        # MIXED-FIDELITY: per-chunk probability of feeding raw decoder tokens
+        # instead of the compressed vision token (0.0 = legacy pure-compressed).
+        self.mixed_fidelity_p = float(getattr(model_args, "mixed_fidelity_p", 0.0) or 0.0)
+        if not (0.0 <= self.mixed_fidelity_p <= 1.0):
+            raise ValueError(f"mixed_fidelity_p must be in [0, 1], got {self.mixed_fidelity_p}")
+        if self.mixed_fidelity_p > 0.0:
+            print(f"[modeling] MIXED-FIDELITY enabled: p={self.mixed_fidelity_p} (mixed block budget = 2*max_vision_len = {2 * self.max_vision_len})")
+        self.vision_pos_embed = nn.Embedding(self.max_vision_len, vit_hidden)
         nn.init.normal_(self.vision_pos_embed.weight, std=0.02)
 
         # Learnable queries for attention pooling over each chunk of
@@ -350,10 +978,30 @@ class CVLM(torch.nn.Module):
         num_pool_latents = max(int(getattr(model_args, "num_pool_latents", 1) or 1), 1)
         self.pool_queries = nn.Parameter(torch.zeros(num_pool_latents, enc_hidden))
 
+        # MEANPOOL ABLATION: the pool becomes an exact masked mean with no
+        # learnable part. pool_queries is kept (same shape, same checkpoint /
+        # manifest keys as the paired attention-pool arm) but frozen at zero and
+        # never handed to _chunked_attention_pool, so it cannot receive a
+        # gradient, cannot enter the optimizer (param groups filter on
+        # requires_grad) and cannot drift. Verified in
+        # tests/test_meanpool_and_depth1.py.
+        self.mean_pool = bool(getattr(model_args, "mean_pool", False))
+        if self.mean_pool:
+            self.pool_queries.requires_grad_(False)
+            print(
+                f"[modeling] MEAN-POOL ablation: chunk pooling is an EXACT masked mean; "
+                f"pool_queries {tuple(self.pool_queries.shape)} allocated, zero-filled and FROZEN "
+                f"(requires_grad=False, excluded from optimizer and from saved trainable state)"
+            )
+
         if training_args.bf16:
             self.text_projector.to(torch.bfloat16)
             self.vision_projector.to(torch.bfloat16)
-            self.vision_encoder.to(torch.bfloat16)
+            if self.vision_encoder is not None:
+                self.vision_encoder.to(torch.bfloat16)
+            if self.mixer_layers is not None:
+                # Gates stay fp32 (like pool_queries) and are cast at use site.
+                self.mixer_layers.to(torch.bfloat16)
             self.vision_pos_embed.to(torch.bfloat16)
 
         self.dim = self.decoder.config.hidden_size
@@ -372,6 +1020,13 @@ class CVLM(torch.nn.Module):
             self._freeze_frozen_submodules()
 
     def _freeze_frozen_submodules(self):
+        if getattr(self.model_args, "vit_freeze", False) and self.vision_encoder is not None:
+            # Frozen-prior ablation: params get no updates, but gradient still
+            # flows THROUGH the ViT to pool/projector/encoder (requires_grad=False
+            # on parameters does not block input gradients). No no_grad wrapper!
+            freeze_model(self.vision_encoder)
+            self.vision_encoder.eval()
+            print("[modeling] vit_freeze: vision encoder FROZEN (weights excluded from checkpoints)")
         freeze_model(self.text_encoder)
         self.text_encoder.eval()
         k = int(getattr(self.model_args, "unfreeze_encoder_top_k", 0) or 0)
@@ -418,6 +1073,12 @@ class CVLM(torch.nn.Module):
             raise ValueError(f"compression_rate must be >= 1, got {cr}")
         self.compression_rate = cr
 
+    def _mixer_depth_for(self, cr: int) -> int:
+        """Active mixer depth for compression rate `cr` (see _mixer_depth_for_cr)."""
+        if self.mixer_depth_map is None:
+            raise RuntimeError("_mixer_depth_for called but the mixer is not enabled (empty mixer_depth_map)")
+        return _mixer_depth_for_cr(self.mixer_depth_map, cr)
+
     def _init_training(self):
         print("Decoder is trainable; freezing the text encoder...")
         self._freeze_frozen_submodules()
@@ -447,10 +1108,23 @@ class CVLM(torch.nn.Module):
             self.decoder.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False},
             )
-            self.vision_encoder.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False},
-            )
-            msg = "Gradient checkpointing: ENABLED on decoder + vision_encoder"
+            msg = "Gradient checkpointing: ENABLED on decoder"
+            if self.vision_encoder is not None:
+                self.vision_encoder.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False},
+                )
+                if self.mask_vit_padding:
+                    # The mask-safe path bypasses ViTEncoder.forward and walks
+                    # its layer stack directly, so checkpoint those layers in
+                    # our custom loop instead of relying on the HF wrapper.
+                    self._masked_vit_grad_ckpt = True
+                msg += " + vision_encoder"
+            if self.mixer_layers is not None:
+                # Mixer layers are a bare ModuleList (no HF PreTrainedModel
+                # wrapper), so activation checkpointing is applied manually in
+                # _mixer_forward via torch.utils.checkpoint (non-reentrant).
+                self._mixer_grad_ckpt = True
+                msg += " + mixer_layers (manual torch.utils.checkpoint)"
             if k_enc > 0 and hasattr(self.text_encoder, "gradient_checkpointing_enable"):
                 # text_encoder input is integer ids (no upstream grad); non-reentrant
                 # gc handles that correctly without enable_input_require_grads.
@@ -467,14 +1141,8 @@ class CVLM(torch.nn.Module):
             missing, unexpected = self.load_state_dict(state_dict, strict=False)
             print(f"  restored; missing={len(missing)} unexpected={len(unexpected)}")
 
-    def _encode_vision(self, source_input_ids, source_attention_mask, return_intermediates=False):
-        """source text ids -> text encoder -> chunked pool -> ViT encoder (+pos) -> vision_projector.
-
-        When ``return_intermediates`` is set, the method additionally returns a dict of
-        the internal representations (pooled/vit_input/vit_output/vision_embeds) for the
-        mechanistic representation analysis. This flag has NO effect on the default
-        (train/eval) return signature or on any tensor math.
-        """
+    def _encode_vision(self, source_input_ids, source_attention_mask):
+        """source text ids -> text encoder -> chunked pool -> ViT encoder (+pos) -> vision_projector."""
         # When the encoder is fully frozen (unfreeze_encoder_top_k=0) we wrap it
         # in no_grad so the 22-layer activation chain is not kept alive for the
         # downstream backward pass. When top-K layers are unfrozen and we are
@@ -496,13 +1164,59 @@ class CVLM(torch.nn.Module):
                 ).last_hidden_state  # [B, L, H_enc] in compute_dtype
             enc_out = enc_out.detach()
 
+        # MEANPOOL ABLATION: pool_queries=None selects the exact masked-mean
+        # branch. Passing the (zero) queries instead would be *numerically*
+        # close but not bitwise equal to the mean, and would keep a learnable
+        # tensor in the graph — the whole point of the arm is that there is none.
         pooled, vision_attention_mask = _chunked_attention_pool(
             enc_out,
             source_attention_mask,
             compression_rate=self.compression_rate,
             max_vision_len=self.max_vision_len,
-            pool_queries=self.pool_queries,
+            pool_queries=None if getattr(self, "mean_pool", False) else self.pool_queries,
         )  # [B, V_max, H_enc], [B, V_max]
+
+        synthetic_pad_fraction = float(
+            getattr(self, "synthetic_latent_pad_fraction", 0.0) or 0.0
+        )
+        self._last_synthetic_pad_slots = 0
+        if synthetic_pad_fraction < 0.0:
+            raise ValueError(
+                f"synthetic_latent_pad_fraction must be >= 0, got {synthetic_pad_fraction}"
+            )
+        if synthetic_pad_fraction > 0.0:
+            requested_extra_slots = max(
+                int(math.ceil(pooled.size(1) * synthetic_pad_fraction)),
+                1,
+            )
+            available_slots = max(self.max_vision_len - pooled.size(1), 0)
+            extra_slots = min(requested_extra_slots, available_slots)
+            self._last_synthetic_pad_slots = int(extra_slots)
+            if extra_slots > 0:
+                pooled = torch.cat(
+                    [
+                        pooled,
+                        pooled.new_zeros(
+                            pooled.size(0),
+                            extra_slots,
+                            pooled.size(2),
+                        ),
+                    ],
+                    dim=1,
+                )
+                vision_attention_mask = torch.cat(
+                    [
+                        vision_attention_mask,
+                        vision_attention_mask.new_zeros(
+                            vision_attention_mask.size(0),
+                            extra_slots,
+                        ),
+                    ],
+                    dim=1,
+                )
+        # Exposed only for read-only forward hooks in the padding-contamination
+        # diagnostic. Detached to avoid retaining the training graph.
+        self._current_vision_attention_mask = vision_attention_mask.detach()
 
         vit_input = self.text_projector(pooled)  # [B, V_max, vit_dim]
         V = vit_input.size(1)
@@ -513,25 +1227,46 @@ class CVLM(torch.nn.Module):
             )
         pos = torch.arange(V, device=vit_input.device)
         vit_input = vit_input + self.vision_pos_embed(pos).unsqueeze(0).to(vit_input.dtype)
-        if self.vision_backend == "none":
-            # Ablation: bypass the ViT transformer + final layernorm. The pooled,
-            # projected, position-augmented sequence is fed straight to the
-            # vision_projector. This keeps the exact same tensor geometry and
-            # both projectors, isolating the contribution of the ViT's own
-            # transformer computation.
+        if self.mixer_layers is not None:
+            # RATE-DEPTH MIXER: zero-gated interpolation stack whose depth is a
+            # function of the CURRENT compression rate. depth=0 (and zero gates)
+            # is byte-identical to the no-ViT branch below: vit_output is the
+            # untouched vit_input — no final layernorm.
+            depth = self._mixer_depth_for(self.compression_rate)
+            vit_output, contrib = _mixer_forward(
+                vit_input,
+                self.mixer_layers,
+                self.mixer_gates,
+                depth,
+                use_checkpoint=self._mixer_grad_ckpt and self.training and torch.is_grad_enabled(),
+                return_contrib=True,
+                valid_mask=vision_attention_mask,
+                mask_padding=bool(getattr(self, "mask_vit_padding", False)),
+            )
+            # Diagnostic only (detached, no graph): stashed for forward() to
+            # surface. Kept as a device tensor so no CUDA sync happens here —
+            # the training loop copies it to CPU at logging time only.
+            self._last_mixer_contrib = contrib
+        elif self.vision_encoder is None:
+            # no-ViT ablation: identical pipeline minus the ViT block itself.
             vit_output = vit_input
         else:
-            vit_output = self.vision_encoder.encoder(vit_input).last_hidden_state  # [B, V, vit_dim]
-            vit_output = self.vision_encoder.layernorm(vit_output)
-        vision_embeds = self.vision_projector(vit_output)  # [B, V, llm_dim]
-        if return_intermediates:
-            return vision_embeds, vision_attention_mask, {
-                "pooled": pooled,            # [B, V, H_enc]  pre-projection pooled text
-                "vit_input": vit_input,      # [B, V, vit_dim] projected + pos (backend-independent)
-                "vit_output": vit_output,    # [B, V, vit_dim] after ViT (or bypass for 'none')
-                "vision_embeds": vision_embeds,  # [B, V, llm_dim] decoder-facing
-            }
-        return vision_embeds, vision_attention_mask  # [B, V, llm_dim], [B, V]
+            if bool(getattr(self, "mask_vit_padding", False)):
+                vit_output = _vit_encoder_forward_with_padding_mask(
+                    self.vision_encoder.encoder.layer,
+                    vit_input,
+                    vision_attention_mask,
+                    use_checkpoint=(
+                        self._masked_vit_grad_ckpt
+                        and self.training
+                        and torch.is_grad_enabled()
+                    ),
+                )
+            else:
+                vit_output = self.vision_encoder.encoder(vit_input).last_hidden_state
+            if bool(getattr(self, "vit_apply_final_layernorm", True)):
+                vit_output = self.vision_encoder.layernorm(vit_output)
+        return self.vision_projector(vit_output), vision_attention_mask  # [B, V, llm_dim], [B, V]
 
     def forward(
         self,
@@ -542,6 +1277,9 @@ class CVLM(torch.nn.Module):
         answer_labels: torch.LongTensor = None,
         prompt_mask: torch.LongTensor = None,
         answer_mask: torch.LongTensor = None,
+        doc_dec_ids: torch.LongTensor = None,
+        chunk_dec_spans: torch.LongTensor = None,
+        chunk_counts: torch.LongTensor = None,
     ):
         batch_size = prompt_ids.size(0)
 
@@ -552,51 +1290,125 @@ class CVLM(torch.nn.Module):
         prompt_embs = embed_layer(prompt_ids)  # [B, P, llm_dim]
         answer_embs = embed_layer(answer_ids)  # [B, A, llm_dim]
 
-        decoder_input = torch.cat([prompt_embs, vision_embeds, answer_embs], dim=1)
-
-        # Combined attention mask: prompt_mask | vision_mask | answer_mask.
-        # (Collator provides the three sub-masks so we don't need to reconstruct them.)
         if prompt_mask is None or answer_mask is None:
             raise ValueError("prompt_mask and answer_mask are required in forward().")
-        attention_mask = torch.cat([prompt_mask, vision_mask, answer_mask], dim=1)
-
         labels_src = answer_labels if answer_labels is not None else answer_ids
-        P = prompt_ids.size(1)
-        V = vision_embeds.size(1)
-        ignore = torch.full((batch_size, P + V), -100, dtype=labels_src.dtype, device=labels_src.device)
-        labels = torch.cat([ignore, labels_src], dim=1)
+
+        mixed_stats = None
+        use_mixed = self.mixed_fidelity_p > 0.0 and doc_dec_ids is not None
+        if use_mixed:
+            # MIXED-FIDELITY: interleave raw decoder-token chunks with
+            # compressed vision-token chunks IN DOCUMENT ORDER.
+            if chunk_dec_spans is None or chunk_counts is None:
+                raise ValueError(
+                    "mixed-fidelity forward requires chunk_dec_spans and chunk_counts alongside doc_dec_ids "
+                    "(enable mixed_fidelity_p in CvlmTrainDataset)."
+                )
+            doc_embs = embed_layer(doc_dec_ids)  # [B, T_doc, llm_dim]
+            # Budget: a raw chunk costs ~cr decoder tokens instead of 1 vision
+            # token. Cap the mixed block at 2*max_vision_len; prompt/answer are
+            # already length-filtered by the dataset, so the full sequence stays
+            # <= max_prompt_len + 2*max_vision_len + max_answer_len.
+            budget = 2 * self.max_vision_len
+            raw_flags: list[list[bool]] = []
+            for b in range(batch_size):
+                n = min(int(vision_mask[b].sum()), int(chunk_counts[b]))
+                lens = [
+                    max(int(chunk_dec_spans[b, j, 1]) - int(chunk_dec_spans[b, j, 0]), 0)
+                    for j in range(n)
+                ]
+                raw_flags.append(_sample_raw_chunk_flags(lens, self.mixed_fidelity_p, budget))
+            decoder_input, attention_mask, labels, stats = _assemble_mixed_decoder_input(
+                prompt_embs,
+                prompt_mask,
+                vision_embeds,
+                vision_mask,
+                doc_embs,
+                chunk_dec_spans,
+                chunk_counts,
+                raw_flags,
+                answer_embs,
+                answer_mask,
+                labels_src,
+            )
+            total_chunks = max(sum(stats["n_chunks"]), 1)
+            mixed_stats = {
+                "raw_frac": float(sum(stats["raw_counts"]) / total_chunks),
+                "mixed_len": float(sum(stats["mixed_lens"]) / max(len(stats["mixed_lens"]), 1)),
+                "input_len": float(attention_mask.sum(dim=1).float().mean()),
+            }
+        else:
+            decoder_input = torch.cat([prompt_embs, vision_embeds, answer_embs], dim=1)
+
+            # Combined attention mask: prompt_mask | vision_mask | answer_mask.
+            # (Collator provides the three sub-masks so we don't need to reconstruct them.)
+            attention_mask = torch.cat([prompt_mask, vision_mask, answer_mask], dim=1)
+
+            P = prompt_ids.size(1)
+            V = vision_embeds.size(1)
+            ignore = torch.full((batch_size, P + V), -100, dtype=labels_src.dtype, device=labels_src.device)
+            labels = torch.cat([ignore, labels_src], dim=1)
 
         if self.training:
             # Train: pass labels so Liger's fused-linear-CE fuses lm_head x
             # labels into one Triton kernel and never materialises the
             # [B, L, vocab] logits tensor. decoder_outputs.logits is None.
+            decoder_position_kwargs = {}
+            if bool(getattr(self, "compact_decoder_positions", False)):
+                decoder_position_kwargs["position_ids"] = _compact_position_ids(
+                    attention_mask
+                )
             decoder_outputs = self.decoder(
                 inputs_embeds=decoder_input,
                 attention_mask=attention_mask,
                 labels=labels,
                 use_cache=False,
+                **decoder_position_kwargs,
             )
             loss = decoder_outputs.loss
             logits = decoder_outputs.logits  # None under fused-linear-CE
+            if use_mixed:
+                # DDP safety (find_unused_parameters=False in train_cvlm): if
+                # every chunk in the batch happened to be sampled raw, the
+                # vision path would contribute no grads and the reducer would
+                # error. A zero-weighted sum keeps it in the graph at no cost.
+                loss = loss + vision_embeds.float().sum() * 0.0
         else:
             # Eval: callers (eval_cvlm.py) need logits for per-token loss and
             # argmax accuracy. Skip fused-CE here; eval runs in no_grad so
             # there is no activation pressure to save.
+            decoder_position_kwargs = {}
+            if bool(getattr(self, "compact_decoder_positions", False)):
+                decoder_position_kwargs["position_ids"] = _compact_position_ids(
+                    attention_mask
+                )
             decoder_outputs = self.decoder(
                 inputs_embeds=decoder_input,
                 attention_mask=attention_mask,
                 use_cache=False,
+                **decoder_position_kwargs,
             )
             logits = decoder_outputs.logits
             effective_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
             target = labels[:, 1:].reshape(-1)
             loss = self.loss_fct(effective_logits, target)
-        return {
+        out = {
             "loss": loss,
             "logits": logits,
             "vision_mask": vision_mask,
             "attention_mask": attention_mask,
         }
+        if mixed_stats is not None:
+            out["mixed_stats"] = mixed_stats
+        # RATE-DEPTH MIXER diagnostics (absent when the mixer is disabled):
+        # per-layer contribution ratios of THIS forward, plus their sum. Both
+        # are detached float32 device tensors — no sync until the caller reads
+        # them.
+        contrib = getattr(self, "_last_mixer_contrib", None)
+        if contrib is not None:
+            out["mixer_contrib"] = contrib
+            out["mixer_contrib_total"] = contrib.sum()
+        return out
 
     @torch.no_grad()
     def generate(
@@ -607,24 +1419,11 @@ class CVLM(torch.nn.Module):
         prompt_mask,
         max_new_tokens=512,
         temperature=0.0,
-        suffix_ids=None,
-        suffix_mask=None,
     ):
-        # Layout: [prompt][vision][suffix]. ``suffix`` carries the chat-template
-        # tokens that must follow the compressed document at generation time —
-        # the document-suffix + question + assistant-open tag — so decoding
-        # begins on the answer. When absent (raw path), the sequence is just
-        # [prompt][vision] and generation continues right after the vision block.
-        embed_layer = self.decoder.get_input_embeddings()
         vision_embeds, vision_mask = self._encode_vision(source_input_ids, source_attention_mask)
-        prompt_embs = embed_layer(prompt_ids)
-        parts = [prompt_embs, vision_embeds]
-        masks = [prompt_mask, vision_mask]
-        if suffix_ids is not None:
-            parts.append(embed_layer(suffix_ids))
-            masks.append(suffix_mask)
-        decoder_input = torch.cat(parts, dim=1)
-        attention_mask = torch.cat(masks, dim=1)
+        prompt_embs = self.decoder.get_input_embeddings()(prompt_ids)
+        decoder_input = torch.cat([prompt_embs, vision_embeds], dim=1)
+        attention_mask = torch.cat([prompt_mask, vision_mask], dim=1)
 
         gen_kwargs = dict(
             inputs_embeds=decoder_input,
@@ -634,15 +1433,7 @@ class CVLM(torch.nn.Module):
             pad_token_id=self.tokenizer.pad_token_id,
         )
         if temperature == 0:
-            # Greedy. Explicitly null the sampling knobs so the decoder's
-            # pretrained generation_config (e.g. temperature/top_p/top_k) cannot
-            # leak in and silently make decoding non-greedy. Matches the eval-mode
-            # baselines' _greedy_gen_kwargs so CVLM and baselines decode identically.
             gen_kwargs["do_sample"] = False
-            gen_kwargs["num_beams"] = 1
-            gen_kwargs["temperature"] = None
-            gen_kwargs["top_p"] = None
-            gen_kwargs["top_k"] = None
         else:
             gen_kwargs["do_sample"] = True
             gen_kwargs["temperature"] = temperature

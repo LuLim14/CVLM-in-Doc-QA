@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import random
 import time
@@ -11,15 +13,19 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+import transformers
+from safetensors.torch import load_file, save_file
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
 from cvlm_dataset import CvlmTrainDataset, make_collate_fn
 from modeling import CVLM, ModelArguments, TrainingArguments
 from train_utils import (
     AverageMeter,
+    MasterWeightAdamW,
+    build_optimizer,
     cleanup_distributed,
     find_latest_checkpoint,
     load_cvlm_checkpoint,
@@ -72,6 +78,335 @@ def _parse_cr_schedule(s: Optional[str]) -> Optional[List[Tuple[int, int]]]:
     return out
 
 
+def _parse_mixed_cr_set(s: Optional[str]) -> Optional[List[int]]:
+    """Parse a MIXED-CR set string like "1 2 4 8 16" (whitespace-separated).
+
+    Returns None for empty/None input (mixed-cr off). Raises ValueError on
+    non-integer tokens, cr < 1, or duplicate values.
+    """
+    if s is None:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    out: List[int] = []
+    for tok in s.split():
+        try:
+            cr = int(tok)
+        except ValueError:
+            raise ValueError(f"mixed_cr_set token {tok!r} is not an integer")
+        if cr < 1:
+            raise ValueError(f"mixed_cr_set cr={cr} must be >= 1")
+        if cr in out:
+            raise ValueError(f"mixed_cr_set has duplicate cr={cr}")
+        out.append(cr)
+    return out
+
+
+def _build_param_groups(model: torch.nn.Module, lr: float, gate_lr_mult: float) -> List[dict]:
+    """AdamW param groups, optionally isolating the mixer gates at their own LR.
+
+    GATE-LR CONTROL. The zero-gated mixer is a diagnostic instrument: "given the
+    chance to add depth for free, does the model take it?". A near-zero gate is
+    ambiguous — it can mean "the depth is useless" OR "the gate is simply slow
+    to learn" (one scalar per layer, tiny gradient, shared LR with ~100M other
+    params). Training a control arm with ``gate_lr_mult`` >> 1 separates the two:
+    if the gates stay shut at 100x LR, slow optimisation is ruled out.
+
+    Group layout — deliberately a function of ``gate_lr_mult`` ONLY:
+      * ``gate_lr_mult == 1.0`` (default): ONE group with every trainable param
+        — byte-identical to the legacy optimizer, so old ``trainer_step_*.pt``
+        files still resume.
+      * ``gate_lr_mult != 1.0``: TWO groups, [0] = everything except
+        ``mixer_gates`` at ``lr``, [1] = ``mixer_gates`` alone at
+        ``lr * gate_lr_mult``. The order is fixed (base first, gates second) so
+        optimizer state maps back onto the same groups on resume.
+
+    Resuming across a change of ``gate_lr_mult`` therefore changes the group
+    count; ``load_cvlm_checkpoint`` detects that and fails with an explicit
+    message instead of silently mis-assigning optimizer state.
+    """
+    if gate_lr_mult <= 0.0:
+        raise ValueError(f"--gate_lr_mult must be > 0, got {gate_lr_mult}")
+    core = unwrap_model(model)
+    gate_param = getattr(core, "mixer_gates", None)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if gate_lr_mult == 1.0:
+        return [{"params": trainable, "lr": lr}]
+    if gate_param is None:
+        raise ValueError(
+            "--gate_lr_mult != 1.0 requires the rate-depth mixer (--mixer_depth_map); "
+            "there are no mixer_gates to give a separate learning rate to."
+        )
+    if not gate_param.requires_grad:
+        raise ValueError("mixer_gates is frozen; --gate_lr_mult would have no effect.")
+    gate_ids = {id(gate_param)}
+    base_params = [p for p in trainable if id(p) not in gate_ids]
+    gate_params = [p for p in trainable if id(p) in gate_ids]
+    if not gate_params:
+        raise ValueError("mixer_gates was not found among the trainable parameters.")
+    return [
+        {"params": base_params, "lr": lr},
+        {"params": gate_params, "lr": lr * gate_lr_mult},
+    ]
+
+
+def _vision_scope_params(model: torch.nn.Module) -> List[torch.nn.Parameter]:
+    """Trainable parameters of the post-bottleneck ViT/mixer stack.
+
+    This is the ``--fp32_master_scope vision`` selection: the ONLY sub-module
+    whose update quantization is under test. Everything else (decoder, text
+    encoder, projectors, pos-embed, pool queries) must keep the legacy bf16
+    optimizer path bit-for-bit, otherwise the run confounds four simultaneous
+    changes of numerics instead of testing one.
+    """
+    core = unwrap_model(model)
+    out: List[torch.nn.Parameter] = []
+    if getattr(core, "mixer_layers", None) is not None:
+        out.extend(core.mixer_layers.parameters())
+        gates = getattr(core, "mixer_gates", None)
+        if gates is not None:
+            out.append(gates)
+    if getattr(core, "vision_encoder", None) is not None:
+        out.extend(core.vision_encoder.parameters())
+    return [p for p in out if p.requires_grad]
+
+
+_BITWISE_VIEW_DTYPES = {
+    torch.bfloat16: torch.int16,
+    torch.float16: torch.int16,
+    torch.float32: torch.int32,
+    torch.float64: torch.int64,
+}
+
+
+def _bitwise_unchanged(current: torch.Tensor, previous: torch.Tensor) -> int:
+    """Count elements that are BIT-for-BIT identical in the two tensors.
+
+    Compared through an integer view rather than with ``==`` so the answer is
+    about the stored bit pattern (the thing an AdamW update either changes or
+    rounds away) and not about float equality semantics.
+    """
+    view = _BITWISE_VIEW_DTYPES.get(current.dtype)
+    if view is None or current.dtype != previous.dtype:
+        return int(torch.eq(current, previous).sum())
+    return int(
+        torch.eq(
+            current.detach().contiguous().view(view),
+            previous.detach().contiguous().view(view),
+        ).sum()
+    )
+
+
+class VitDriftTracker:
+    """Measures whether the post-bottleneck ViT/mixer stack is LEARNING AT ALL.
+
+    Two numbers per log interval, over every trainable parameter of the ViT
+    encoder layer stack (+ its final LayerNorm) or, with the rate-depth mixer,
+    of the mixer layers (+ gates):
+
+      * ``vit_frozen_frac`` — fraction of individual weights whose bit pattern
+        is identical to the previous log step. Under bf16 in-place AdamW this
+        is the direct measurement of updates being destroyed by rounding: an
+        update smaller than half an ULP of the weight leaves the bits alone.
+        Pretrained ViT weights are ~4x larger in magnitude than the random-init
+        ones, hence ~4x coarser ULP, hence a much larger frozen fraction at the
+        same LR — a numerical-precision confounder that is collinear with the
+        pretrained-vs-random treatment.
+      * ``vit_drift`` — global relative L2 distance from initialization,
+        ``||W - W_0||_2 / ||W_0||_2`` over the same parameter set, measured on
+        the LIVE (rounded bf16) weights, i.e. on what the forward pass sees.
+
+    With fp32 master weights a ``master_lookup`` is passed in and two more
+    numbers are reported, because the live bf16 weights alone would understate
+    what the optimizer has actually learned:
+
+      * ``vit_master_drift`` — the same relative L2 drift computed on the fp32
+        MASTER weights. This is the honest "how far has the optimizer moved
+        this stack" number.
+      * ``vit_master_resid`` / ``vit_master_resid_max`` — norm (relative to
+        ``||W_0||``) and max-abs of ``master - live_bf16``: the update that has
+        been accumulated but has NOT yet shown up in the bf16 weights because
+        it is still below half an ULP. In the legacy path that quantity is
+        destroyed at every step; here it is carried forward, so a large
+        residual with a flat ``vit_drift`` means "learning is happening and is
+        about to materialise", not "nothing is happening".
+
+    ``W_0`` is taken from ``mechanistic_init.safetensors`` when available (the
+    exact step-0 weights, written by ``_write_or_verify_initialization_artifacts``),
+    so drift stays measured from the true initialization ACROSS RESUMES; the
+    parameter names used here deliberately match the prefixes written by
+    ``_compression_path_initial_state``. Without that file it falls back to the
+    weights present when the tracker is constructed.
+
+    Snapshot cost: two clones of the tracked stack (~2 x 170 MB for ViT-Base in
+    bf16), kept on the parameters' own device.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        init_state: Optional[dict] = None,
+        master_lookup: Optional[dict] = None,
+    ) -> None:
+        core = unwrap_model(model)
+        named: List[Tuple[str, torch.nn.Parameter]] = []
+        if getattr(core, "mixer_layers", None) is not None:
+            named.extend(core.mixer_layers.named_parameters(prefix="mixer_layers"))
+            gates = getattr(core, "mixer_gates", None)
+            if gates is not None:
+                named.append(("mixer_gates", gates))
+            self.branch = "mixer"
+        elif getattr(core, "vision_encoder", None) is not None:
+            named.extend(
+                core.vision_encoder.encoder.layer.named_parameters(
+                    prefix="vision_encoder_layers"
+                )
+            )
+            named.extend(
+                core.vision_encoder.layernorm.named_parameters(
+                    prefix="vision_encoder_final_layernorm"
+                )
+            )
+            self.branch = "vit"
+        else:
+            self.branch = "none"
+        self.params = [(name, p) for name, p in named if p.requires_grad]
+        self.enabled = bool(self.params)
+        self.numel = sum(p.numel() for _, p in self.params)
+        self._prev = [p.detach().clone() for _, p in self.params]
+        state = init_state or {}
+        self._init: List[torch.Tensor] = []
+        self.init_from_file = 0
+        for name, param in self.params:
+            reference = state.get(name)
+            if reference is not None and tuple(reference.shape) == tuple(param.shape):
+                self._init.append(
+                    reference.detach().to(device=param.device, dtype=param.dtype).clone()
+                )
+                self.init_from_file += 1
+            else:
+                self._init.append(param.detach().clone())
+        init_sq = 0.0
+        for reference in self._init:
+            init_sq += float(torch.linalg.vector_norm(reference.float(), dtype=torch.float32) ** 2)
+        self._init_norm = init_sq**0.5
+        # fp32 master behind each tracked parameter, when the optimizer keeps
+        # one. A tracked fp32 parameter (mixer_gates) IS its own master.
+        self.has_masters = master_lookup is not None
+        lookup = master_lookup or {}
+        self._masters = [lookup.get(id(param), param) for _, param in self.params]
+        self.mastered_tensors = sum(
+            1 for (_, param), master in zip(self.params, self._masters) if master is not param
+        )
+
+    def measure(self) -> Optional[dict]:
+        """Stats since the previous ``measure()`` call; advances the snapshot."""
+        if not self.enabled:
+            return None
+        unchanged = 0
+        delta_sq = 0.0
+        master_delta_sq = 0.0
+        resid_sq = 0.0
+        resid_max = 0.0
+        for (_, param), previous, reference, master in zip(
+            self.params, self._prev, self._init, self._masters
+        ):
+            current = param.detach()
+            unchanged += _bitwise_unchanged(current, previous)
+            live = current.float()
+            reference_f = reference.float()
+            delta_sq += float(torch.linalg.vector_norm(live - reference_f, dtype=torch.float32) ** 2)
+            if self.has_masters:
+                master_f = master.detach().float()
+                master_delta_sq += float(
+                    torch.linalg.vector_norm(master_f - reference_f, dtype=torch.float32) ** 2
+                )
+                residual = master_f - live
+                resid_sq += float(torch.linalg.vector_norm(residual, dtype=torch.float32) ** 2)
+                resid_max = max(resid_max, float(residual.abs().max()) if residual.numel() else 0.0)
+            previous.copy_(current)
+        scale = self._init_norm if self._init_norm > 0 else 0.0
+        stats = {
+            "vit_frozen_frac": unchanged / max(self.numel, 1),
+            "vit_drift": (delta_sq**0.5) / scale if scale > 0 else 0.0,
+            "vit_tracked_params": int(self.numel),
+            "vit_master_drift": None,
+            "vit_master_resid": None,
+            "vit_master_resid_max": None,
+        }
+        if self.has_masters:
+            stats["vit_master_drift"] = (master_delta_sq**0.5) / scale if scale > 0 else 0.0
+            stats["vit_master_resid"] = (resid_sq**0.5) / scale if scale > 0 else 0.0
+            stats["vit_master_resid_max"] = resid_max
+        return stats
+
+
+class MixedCrSampler:
+    """Balanced deterministic per-optimizer-step cr sequence for MIXED-CR training.
+
+    NOT naive per-step choice: the sequence is a concatenation of BLOCKS, each
+    block a fresh ``random.Random(seed)``-shuffled permutation of the FULL cr
+    set (sorted ascending before shuffling, so the sequence does not depend on
+    the formatting order of --mixed_cr_set). Guarantees:
+      (a) identical cr sequence across arms/runs for a given (seed, cr set);
+      (b) an EQUAL number of optimizer steps per cr in any prefix whose length
+          is a multiple of len(cr_set).
+    Blocks are generated lazily; on resume the sequence is reconstructed from
+    (seed, global_step) alone — nothing is stored in checkpoints.
+    """
+
+    def __init__(self, cr_set: List[int], seed: int) -> None:
+        if not cr_set:
+            raise ValueError("MixedCrSampler needs a non-empty cr set")
+        self._base = sorted(int(c) for c in cr_set)
+        self._rng = random.Random(int(seed))
+        self._seq: List[int] = []
+
+    def cr_for_step(self, step: int) -> int:
+        """cr for the 1-indexed optimizer step ``step`` (== global_step)."""
+        if step < 1:
+            raise ValueError(f"optimizer step must be >= 1, got {step}")
+        while len(self._seq) < step:
+            block = list(self._base)
+            self._rng.shuffle(block)
+            self._seq.extend(block)
+        return self._seq[step - 1]
+
+
+class EpochRandomSampler(Sampler[int]):
+    """Deterministic single-process shuffle with explicit epoch control.
+
+    Unlike DataLoader(shuffle=True), the permutation is a pure function of
+    ``seed + epoch``. A resumed run can therefore recreate the current epoch
+    and skip exactly the batches already consumed without serialising an opaque
+    RandomSampler generator state.
+    """
+
+    def __init__(self, data_source, seed: int) -> None:
+        self.data_source = data_source
+        self.seed = int(seed)
+        self.epoch = 1
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        yield from torch.randperm(len(self.data_source), generator=generator).tolist()
+
+    def __len__(self) -> int:
+        return len(self.data_source)
+
+
+def _next_resume_position(local_epoch: int, local_step: int, loader_len: int) -> Tuple[int, int]:
+    """Epoch/batch coordinates of the next batch after ``local_step``."""
+    if local_step >= loader_len:
+        return int(local_epoch) + 1, 1
+    return int(local_epoch), int(local_step) + 1
+
+
 def _active_cr(schedule: List[Tuple[int, int]], step: int) -> int:
     """Return the cr for the bucket containing `step`.
 
@@ -107,7 +442,7 @@ def parse_args() -> argparse.Namespace:
         "--model_name_or_path",
         type=str,
         default=None,
-        help="HF id for the frozen decoder (e.g. HuggingFaceTB/SmolLM-135M-Instruct).",
+        help="HF id for the decoder (trained end-to-end here; e.g. HuggingFaceTB/SmolLM-135M-Instruct).",
     )
     p.add_argument("--vision_encoder_name", type=str, default=None)
     p.add_argument(
@@ -130,12 +465,122 @@ def parse_args() -> argparse.Namespace:
         "0 (default) = encoder fully frozen, legacy behaviour.",
     )
     p.add_argument(
+        "--mixed_fidelity_p",
+        type=float,
+        default=float(os.environ.get("MIXED_FIDELITY_P", "0.0")),
+        help="MIXED-FIDELITY: per-chunk probability of feeding the decoder raw decoder-token "
+        "embeddings for that chunk instead of its 1 compressed vision token, interleaved in "
+        "document order. 0.0 (default) = off, legacy pure-compressed path. Fine-tuning feature: "
+        "combine with --restore_from. Incompatible with --cr_schedule (chunk->decoder-token "
+        "spans are precomputed in the dataset with the static --compression_rate).",
+    )
+    p.add_argument(
+        "--mixer_depth_map",
+        type=str,
+        default=os.environ.get("MIXER_DEPTH_MAP", ""),
+        help="RATE-DEPTH MIXER: 'cr:depth,...' map (e.g. '1:0,2:1,4:3,8:6,16:12'). Non-empty REPLACES "
+        "the ViT with a stack of zero-gated ViTLayer blocks whose active depth is looked up from the "
+        "current compression rate (exact key; else nearest lower key; else smallest key). Incompatible "
+        "with --no_vit / --freeze_vit / --vit_init random. Must also be passed to eval. "
+        "Empty (default) = legacy ViT branching. Env: MIXER_DEPTH_MAP.",
+    )
+    p.add_argument(
+        "--mask_vit_padding",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("MASK_VIT_PADDING", "0") == "1",
+        help="Apply vision_attention_mask inside every ViT/mixer self-attention layer. "
+        "Enable for new controlled experiments; keep disabled only to reproduce legacy "
+        "checkpoints that mixed real latents with batch padding. Must match eval. "
+        "Env: MASK_VIT_PADDING.",
+    )
+    p.add_argument(
+        "--vit_apply_final_layernorm",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("VIT_APPLY_FINAL_LAYERNORM", "1") == "1",
+        help="Apply the plain ViT encoder's final LayerNorm. Set false for the fixed-depth "
+        "direct control compared with the bare mixer layer stack. Must match eval. "
+        "Env: VIT_APPLY_FINAL_LAYERNORM.",
+    )
+    p.add_argument(
+        "--compact_decoder_positions",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("COMPACT_DECODER_POSITIONS", "0") == "1",
+        help="Build decoder position_ids from attention_mask.cumsum so masked "
+        "latent slots do not shift answer positions. False reproduces legacy "
+        "teacher forcing; generation already compacts positions. Must match eval. "
+        "Env: COMPACT_DECODER_POSITIONS.",
+    )
+    p.add_argument(
+        "--gate_lr_mult",
+        type=float,
+        default=float(os.environ.get("GATE_LR_MULT", "1.0")),
+        help="RATE-DEPTH MIXER diagnostic: learning-rate multiplier for the mixer_gates "
+        "parameter. 1.0 (default) = single param group, legacy behaviour. Any other value "
+        "puts mixer_gates in its OWN AdamW group at lr*gate_lr_mult (group order: base, "
+        "gates), which is the control that separates 'the added depth is not useful' from "
+        "'the gates just learn too slowly' — e.g. --gate_lr_mult 100. Requires "
+        "--mixer_depth_map. Resuming a run must reuse the same value (the group count is "
+        "part of the optimizer state). Env: GATE_LR_MULT.",
+    )
+    p.add_argument(
+        "--fp32_master_weights",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("FP32_MASTER_WEIGHTS", "0") == "1",
+        help="NUMERICAL-PRECISION CONTROL: keep fp32 master copies of the bf16 trainable "
+        "parameters inside AdamW (params stay bf16 for forward/backward; the optimizer "
+        "steps the fp32 masters with fp32 moments and rounds back). Without it an update "
+        "of size ~lr=1e-4 is BELOW half an ULP of a ~1.0-magnitude pretrained ViT weight "
+        "and is silently discarded every step, while the ~4x smaller random-init weights "
+        "still move — a precision artifact collinear with the pretrained-vs-random "
+        "treatment. 0 (default) = legacy in-place bf16 AdamW, byte-for-byte. Costs ~12 "
+        "bytes per MASTERED parameter (see --fp32_master_scope). A resumed run must reuse "
+        "the same value (the master copies live in the optimizer state). "
+        "Env: FP32_MASTER_WEIGHTS.",
+    )
+    p.add_argument(
+        "--fp32_master_scope",
+        type=str,
+        choices=["all", "vision"],
+        default=os.environ.get("FP32_MASTER_SCOPE", "all"),
+        help="Which parameters --fp32_master_weights applies to. 'all' (default) = every "
+        "low-precision trainable tensor; note this model trains ~1.84B params (the DECODER "
+        "is trainable), so mastering everything costs ~20.5 GiB of extra optimizer state and "
+        "changes the numerics of decoder + text encoder + projectors + ViT simultaneously. "
+        "'vision' = ONLY the ViT/mixer stack (~86M params, ~1.0 GiB): the isolated control "
+        "for 'ViT update quantization explains the gap', with every other parameter left on "
+        "the bit-for-bit legacy bf16 path. Ignored when --fp32_master_weights is off. "
+        "Env: FP32_MASTER_SCOPE.",
+    )
+    p.add_argument(
+        "--mixed_cr_set",
+        type=str,
+        default=os.environ.get("MIXED_CR_SET", ""),
+        help="MIXED-CR training: whitespace-separated cr set, e.g. '1 2 4 8 16'. Non-empty samples one "
+        "cr per optimizer step (all grad-accum micro-batches of a step share it) from a BALANCED "
+        "deterministic sequence: concatenated random.Random(seed+30000)-shuffled permutations of the "
+        "full set, indexed by global_step — equal per-cr update counts in any prefix divisible by the "
+        "set size, identical across arms for a given seed. Incompatible with --cr_schedule. "
+        "Empty (default) = off. Env: MIXED_CR_SET.",
+    )
+    p.add_argument(
         "--num_pool_latents",
         type=int,
         default=int(os.environ.get("NUM_POOL_LATENTS", "1")),
         help="Number of learnable latent queries (K) used by the chunked attention pool. "
         "K=1 (default) = single-query pool. K>1 = Perceiver-style multi-query pool whose "
         "K outputs are mean-pooled to produce 1 vision token per chunk.",
+    )
+    p.add_argument(
+        "--mean_pool",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("MEAN_POOL", "0") == "1",
+        help="MEANPOOL ABLATION (MeanPool+Project): the chunk pool is an EXACT masked mean over "
+        "the real tokens, with NO learnable queries. pool_queries stays allocated (same shape and "
+        "checkpoint key as the attention-pool arm) but is zero-filled, frozen and never used. "
+        "Zero-init only makes the attention pool START as a mean — the queries do move during "
+        "training — so this is the arm that actually holds the pool fixed at the mean. MUST be "
+        "passed to eval as well (--mean_pool), or eval rebuilds the attention pool. "
+        "Env: MEAN_POOL.",
     )
     p.add_argument(
         "--legacy_projector",
@@ -145,13 +590,35 @@ def parse_args() -> argparse.Namespace:
         "Set LEGACY_PROJECTOR=1 or pass --legacy_projector true for old safetensors.",
     )
     p.add_argument(
-        "--vision_backend",
+        "--vit_init",
         type=str,
-        default=os.environ.get("VISION_BACKEND", "vit"),
-        choices=["vit", "random_vit", "none"],
-        help="Vision-stage ablation. 'vit' (default) = pretrained ViT. 'random_vit' = same "
-        "ViT architecture, random weights. 'none' = bypass the ViT transformer+layernorm "
-        "(pool -> projectors -> decoder).",
+        choices=["pretrained", "random"],
+        default=os.environ.get("VIT_INIT", "pretrained"),
+        help="ViT weights: 'pretrained' (default) or 'random' (same architecture, config init) — prior ablation.",
+    )
+    p.add_argument(
+        "--vit_num_layers",
+        type=int,
+        default=int(os.environ.get("VIT_NUM_LAYERS", "0")),
+        help="POST-BOTTLENECK DEPTH ablation: 0 (default) = the full 12-layer ViT; N>0 keeps only "
+        "the FIRST N blocks. The N-layer arm then differs from the 12-layer arm ONLY in depth — "
+        "same block type, same config-init draw, same final LayerNorm, same padding mask — which "
+        "is what makes a 0/N/12 depth curve interpretable. Use this, NOT --mixer_depth_map, for a "
+        "plain-depth point: the mixer is zero-gated, so its depth-N arm measures gate dynamics "
+        "instead. Incompatible with --no_vit / --mixer_depth_map. Must match eval. "
+        "Env: VIT_NUM_LAYERS.",
+    )
+    p.add_argument(
+        "--freeze_vit",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("FREEZE_VIT", "0") == "1",
+        help="Freeze the ViT (no weight updates; gradient still flows through it).",
+    )
+    p.add_argument(
+        "--no_vit",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("NO_VIT", "0") == "1",
+        help="Bypass the ViT block entirely (no-ViT ablation). Must also be passed at eval.",
     )
     p.add_argument("--max_samples", type=int, default=0, help="Cap HF dataset to first N rows (0 = all).")
     p.add_argument(
@@ -205,6 +672,24 @@ def parse_args() -> argparse.Namespace:
             "Save every N optimizer steps (sync points). "
             "Set to 0 to save only at the end of each epoch (no extra mid-epoch saves)."
         ),
+    )
+    p.add_argument(
+        "--mechanistic_probe_samples",
+        type=int,
+        default=int(os.environ.get("MECHANISTIC_PROBE_SAMPLES", "16")),
+        help="Save the first N fully tokenized training examples as "
+        "<output_dir>/mechanistic_probe.pt for checkpoint-level CKA/activation "
+        "analysis without reloading a mutable dataset. 0 disables. "
+        "Env: MECHANISTIC_PROBE_SAMPLES.",
+    )
+    p.add_argument(
+        "--save_mechanistic_init",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("SAVE_MECHANISTIC_INIT", "1") != "0",
+        help="Save the exact initial compression-path weights as "
+        "<output_dir>/mechanistic_init.safetensors. This makes later weight-drift "
+        "analysis independent of reconstructing random initialization. "
+        "Env: SAVE_MECHANISTIC_INIT.",
     )
     p.add_argument(
         "--resume_dir",
@@ -285,13 +770,6 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("TRACKIO_DISABLE", "0") == "1",
         help="Disable trackio logging (CSV/PNG still run).",
     )
-    p.add_argument(
-        "--use_chat_template",
-        action="store_true",
-        default=os.environ.get("USE_CHAT_TEMPLATE", "0") == "1",
-        help="Wrap the document+question+answer in the decoder chat template "
-        "(system+user turns, assistant-open tag). Must match at eval time.",
-    )
     return p.parse_args()
 
 
@@ -315,6 +793,226 @@ def move_batch(batch: dict, device: torch.device, dtype: torch.dtype) -> dict:
     return out
 
 
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    """Stable hash over dtype, shape and exact tensor bytes."""
+    value = tensor.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(value.dtype).encode("utf-8"))
+    digest.update(str(tuple(value.shape)).encode("utf-8"))
+    digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _module_sha256(module: torch.nn.Module) -> str:
+    digest = hashlib.sha256()
+    for name, value in sorted(module.state_dict().items()):
+        digest.update(name.encode("utf-8"))
+        digest.update(_tensor_sha256(value).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _compression_path_initial_state(model: CVLM) -> dict:
+    """Exact step-0 weights needed by post-hoc compressor analyses.
+
+    This intentionally excludes the decoder and text encoder: the former is
+    frozen, while this campaign's mechanistic question concerns capacity after
+    pooling. The text/projector/pooling/position modules are included because
+    they define the interface into the post-bottleneck stack.
+    """
+    state = {}
+
+    def add_module(prefix: str, module: Optional[torch.nn.Module]) -> None:
+        if module is None:
+            return
+        for name, value in module.state_dict().items():
+            state[f"{prefix}.{name}"] = value.detach().cpu().clone().contiguous()
+
+    add_module("text_projector", model.text_projector)
+    add_module("vision_projector", model.vision_projector)
+    add_module("vision_pos_embed", model.vision_pos_embed)
+    state["pool_queries"] = model.pool_queries.detach().cpu().clone().contiguous()
+    if model.mixer_layers is not None:
+        add_module("mixer_layers", model.mixer_layers)
+        state["mixer_gates"] = model.mixer_gates.detach().cpu().clone().contiguous()
+    elif model.vision_encoder is not None:
+        add_module("vision_encoder_layers", model.vision_encoder.encoder.layer)
+        add_module("vision_encoder_final_layernorm", model.vision_encoder.layernorm)
+    return state
+
+
+def _initialization_manifest(model: CVLM, args: argparse.Namespace) -> dict:
+    if model.mixer_layers is not None:
+        branch_kind = "zero_gated_mixer"
+        branch_layers = model.mixer_layers
+    elif model.vision_encoder is not None:
+        branch_kind = f"vit_{args.vit_init}"
+        branch_layers = model.vision_encoder.encoder.layer
+    else:
+        branch_kind = "no_vit"
+        branch_layers = None
+
+    layer_hashes = (
+        [_module_sha256(layer) for layer in branch_layers]
+        if branch_layers is not None
+        else []
+    )
+    hashes = {
+        "text_projector": _module_sha256(model.text_projector),
+        "vision_projector": _module_sha256(model.vision_projector),
+        "vision_pos_embed": _module_sha256(model.vision_pos_embed),
+        "pool_queries": _tensor_sha256(model.pool_queries),
+        "post_bottleneck_stack": (
+            _module_sha256(branch_layers) if branch_layers is not None else None
+        ),
+        "post_bottleneck_layers": layer_hashes,
+        "post_bottleneck_final_layernorm": (
+            _module_sha256(model.vision_encoder.layernorm)
+            if model.vision_encoder is not None
+            else None
+        ),
+        "mixer_gates": (
+            _tensor_sha256(model.mixer_gates)
+            if model.mixer_gates is not None
+            else None
+        ),
+    }
+    return {
+        "schema_version": 1,
+        "seed": int(args.seed),
+        "shared_init_seed": int(args.seed) + 10000,
+        "branch_kind": branch_kind,
+        "architecture": {
+            "vit_init": str(args.vit_init),
+            "freeze_vit": bool(args.freeze_vit),
+            "no_vit": bool(args.no_vit),
+            "mixer_depth_map": str(args.mixer_depth_map or ""),
+            "mask_vit_padding": bool(args.mask_vit_padding),
+            "vit_apply_final_layernorm": bool(args.vit_apply_final_layernorm),
+            "compact_decoder_positions": bool(args.compact_decoder_positions),
+            "num_pool_latents": int(args.num_pool_latents),
+            # OMITTED when False on purpose. _write_or_verify_initialization_artifacts
+            # compares the whole "architecture" dict on resume, so unconditionally
+            # adding a key would make every pre-existing run un-resumable with this
+            # code. Present-only-when-True still fails resume in BOTH wrong
+            # directions (legacy run resumed with --mean_pool, or vice versa).
+            **({"mean_pool": True} if bool(getattr(args, "mean_pool", False)) else {}),
+            **(
+                {"vit_num_layers": int(args.vit_num_layers)}
+                if int(getattr(args, "vit_num_layers", 0) or 0) > 0
+                else {}
+            ),
+        },
+        "models": {
+            "decoder": str(args.model_name_or_path or model.model_args.model_name_or_path),
+            "text_encoder": str(args.text_encoder_name or model.model_args.text_encoder_name),
+            "vision_encoder": str(
+                args.vision_encoder_name or model.model_args.vision_encoder_name
+            ),
+            "decoder_commit": getattr(model.decoder.config, "_commit_hash", None),
+            "text_encoder_commit": getattr(model.text_encoder.config, "_commit_hash", None),
+            "vision_encoder_commit": (
+                getattr(model.vision_encoder.config, "_commit_hash", None)
+                if model.vision_encoder is not None
+                else None
+            ),
+        },
+        "versions": {
+            "torch": str(torch.__version__),
+            "transformers": str(transformers.__version__),
+            "numpy": str(np.__version__),
+        },
+        "hashes": hashes,
+    }
+
+
+def _write_or_verify_initialization_artifacts(
+    model: CVLM,
+    args: argparse.Namespace,
+) -> None:
+    """Persist exact step-0 provenance, failing on an incompatible resume."""
+    os.makedirs(args.output_dir, exist_ok=True)
+    manifest = _initialization_manifest(model, args)
+    manifest_path = os.path.join(args.output_dir, "initialization_manifest.json")
+    if os.path.exists(manifest_path):
+        with open(manifest_path, encoding="utf-8") as handle:
+            recorded = json.load(handle)
+        for field in ("architecture", "models", "versions", "hashes"):
+            if recorded.get(field) != manifest.get(field):
+                raise RuntimeError(
+                    f"Initialization mismatch in {manifest_path}: field {field!r} "
+                    "does not match the model reconstructed for resume. Refusing "
+                    "to mix trajectories from different initial states."
+                )
+        print(f"[init-manifest] verified existing {manifest_path}")
+    else:
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        print(f"[init-manifest] saved {manifest_path}")
+
+    if args.save_mechanistic_init:
+        init_path = os.path.join(args.output_dir, "mechanistic_init.safetensors")
+        if os.path.exists(init_path):
+            print(f"[mech-init] preserving existing {init_path}")
+        else:
+            save_file(_compression_path_initial_state(model), init_path)
+            print(f"[mech-init] saved exact compression-path initialization -> {init_path}")
+
+
+def _save_mechanistic_probe(
+    dataset,
+    collate,
+    output_dir: str,
+    sample_count: int,
+    metadata: dict,
+) -> None:
+    """Cache a fixed tokenized probe so CKA needs no dataset reload."""
+    count = min(max(int(sample_count), 0), len(dataset))
+    if count == 0:
+        return
+    path = os.path.join(output_dir, "mechanistic_probe.pt")
+    batch = collate([dataset[index] for index in range(count)])
+    keep = {
+        key: value.detach().cpu().contiguous()
+        for key, value in batch.items()
+        if torch.is_tensor(value) and not key.startswith("full_prompt")
+    }
+    payload = {
+        "schema_version": 1,
+        "dataset_indices": list(range(count)),
+        "metadata": metadata,
+        "batch": keep,
+    }
+    source_hash = _tensor_sha256(keep["source_ids"])
+    if os.path.exists(path):
+        try:
+            recorded = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            recorded = torch.load(path, map_location="cpu")
+        recorded_batch = recorded.get("batch", {})
+        recorded_source = recorded_batch.get("source_ids")
+        if (
+            recorded.get("metadata") != metadata
+            or recorded.get("dataset_indices") != list(range(count))
+            or recorded_source is None
+            or _tensor_sha256(recorded_source) != source_hash
+        ):
+            raise RuntimeError(
+                f"Mechanistic probe mismatch in {path}: the current dataset/filter/"
+                "tokenizer no longer reproduces the cached probe. Refusing to resume "
+                "with silently changed data."
+            )
+        print(
+            f"[mech-probe] verified existing {path} "
+            f"(source_ids_sha256={source_hash})"
+        )
+        return
+    torch.save(payload, path)
+    print(
+        f"[mech-probe] saved {count} tokenized examples -> {path} "
+        f"(source_ids_sha256={source_hash})"
+    )
+
+
 def main() -> None:
     args = parse_args()
     rank, world_size, local_rank, device, use_ddp = setup_distributed()
@@ -330,12 +1028,25 @@ def main() -> None:
         model_args.vision_encoder_name = args.vision_encoder_name
     if args.text_encoder_name:
         model_args.text_encoder_name = args.text_encoder_name
+    if not (0.0 <= args.mixed_fidelity_p <= 1.0):
+        raise ValueError(f"--mixed_fidelity_p must be in [0, 1], got {args.mixed_fidelity_p}")
     model_args.max_vision_len = args.max_vision_len
     model_args.compression_rate = args.compression_rate
+    model_args.mixed_fidelity_p = float(args.mixed_fidelity_p)
     model_args.unfreeze_encoder_top_k = int(args.unfreeze_encoder_top_k)
     model_args.num_pool_latents = max(int(args.num_pool_latents), 1)
+    model_args.mean_pool = bool(args.mean_pool)
     model_args.projector_use_input_rmsnorm = not bool(args.legacy_projector)
-    model_args.vision_backend = str(args.vision_backend)
+    model_args.vit_init = str(args.vit_init)
+    model_args.vit_num_layers = int(args.vit_num_layers)
+    model_args.vit_freeze = bool(args.freeze_vit)
+    model_args.vit_skip = bool(args.no_vit)
+    model_args.mixer_depth_map = str(args.mixer_depth_map or "")
+    model_args.mask_vit_padding = bool(args.mask_vit_padding)
+    model_args.vit_apply_final_layernorm = bool(args.vit_apply_final_layernorm)
+    model_args.compact_decoder_positions = bool(args.compact_decoder_positions)
+    # Bit-identical shared-module init across ablation branches (see ModelArguments).
+    model_args.shared_init_seed = int(args.seed) + 10000
 
     training_args = TrainingArguments(output_dir=args.output_dir)
     training_args.bf16 = bool(use_bf16)
@@ -343,10 +1054,23 @@ def main() -> None:
     training_args.gradient_checkpointing = args.gradient_checkpointing
 
     model = CVLM(model_args, training_args)
+    if is_master:
+        _write_or_verify_initialization_artifacts(model, args)
+        print(
+            f"[init-hash] text_projector={_module_sha256(model.text_projector)[:12]} "
+            f"vision_projector={_module_sha256(model.vision_projector)[:12]} "
+            f"vision_pos_embed={_module_sha256(model.vision_pos_embed)[:12]} "
+            f"(shared_init_seed={model_args.shared_init_seed}; must match across branches)"
+        )
     model.to(device)
 
     # ---- compression-rate curriculum ------------------------------------
     cr_schedule = _parse_cr_schedule(args.cr_schedule)
+    if cr_schedule is not None and args.mixed_fidelity_p > 0.0:
+        raise ValueError(
+            "--mixed_fidelity_p > 0 is incompatible with --cr_schedule: chunk->decoder-token "
+            "spans are precomputed in the dataset with the static --compression_rate."
+        )
     if cr_schedule is not None:
         # Validate vision-len budget for the smallest cr in the schedule.
         min_cr = min(cr for cr, _ in cr_schedule)
@@ -370,6 +1094,39 @@ def main() -> None:
         current_cr = first_cr
     else:
         current_cr = args.compression_rate
+    # ---- mixed-cr per-step sampling (balanced, deterministic) -----------
+    mixed_cr_set = _parse_mixed_cr_set(args.mixed_cr_set)
+    mixed_cr_sampler: Optional[MixedCrSampler] = None
+    if mixed_cr_set is not None:
+        if cr_schedule is not None:
+            raise ValueError(
+                "--mixed_cr_set is incompatible with --cr_schedule: use per-step cr sampling OR a "
+                "stage curriculum, not both (set CR_SCHEDULE='' for mixed-cr runs)."
+            )
+        if args.mixed_fidelity_p > 0.0:
+            raise ValueError(
+                "--mixed_cr_set is incompatible with --mixed_fidelity_p > 0: chunk->decoder-token "
+                "spans are precomputed in the dataset with the static --compression_rate."
+            )
+        # Same vision-len budget validation as cr_schedule: the smallest cr in
+        # the set must fit the source into max_vision_len chunks.
+        min_cr = min(mixed_cr_set)
+        effective_src = args.max_source_len if args.max_source_len > 0 else args.compression_rate * args.max_vision_len
+        required_vl = (effective_src + min_cr - 1) // min_cr
+        if args.max_vision_len < required_vl:
+            raise ValueError(
+                f"max_vision_len={args.max_vision_len} too small for mixed_cr_set "
+                f"min_cr={min_cr} with effective_source_len={effective_src} "
+                f"(needs >= {required_vl}). Raise the min cr in the set, "
+                f"raise --max_vision_len, or lower --max_source_len."
+            )
+        mixed_cr_sampler = MixedCrSampler(mixed_cr_set, int(args.seed) + 30000)
+        if is_master:
+            print(
+                f"[mixed-cr] BALANCED per-step cr sampling from {sorted(mixed_cr_set)} "
+                f"(shuffled-block sequence, rng seed = seed+30000 = {int(args.seed) + 30000}; "
+                f"equal per-cr update counts in any prefix divisible by {len(mixed_cr_set)})"
+            )
     # ---------------------------------------------------------------------
 
     dec_pad = model.tokenizer.pad_token_id
@@ -388,21 +1145,51 @@ def main() -> None:
         max_answer_len=args.max_answer_len,
         max_source_len=max_source_len,
         max_samples=args.max_samples,
-        use_chat_template=args.use_chat_template,
+        mixed_fidelity_p=float(args.mixed_fidelity_p),
+        mixed_chunk_cr=args.compression_rate,
+        mixed_max_chunks=args.max_vision_len,
     )
+    if is_master:
+        _save_mechanistic_probe(
+            dataset,
+            collate,
+            args.output_dir,
+            args.mechanistic_probe_samples,
+            {
+                "dataset_name": args.dataset_name,
+                "dataset_split": args.dataset_split,
+                "max_source_len": max_source_len,
+                "max_prompt_len": args.max_prompt_len,
+                "max_answer_len": args.max_answer_len,
+                "max_samples": args.max_samples,
+                "seed": args.seed,
+            },
+        )
 
-    sampler: Optional[DistributedSampler] = None
+    sampler = None
     if use_ddp:
-        sampler = DistributedSampler(dataset, shuffle=True, drop_last=False)
+        sampler = DistributedSampler(
+            dataset,
+            shuffle=True,
+            drop_last=False,
+            seed=int(args.seed) + 20000,
+        )
+    else:
+        sampler = EpochRandomSampler(dataset, seed=int(args.seed) + 20000)
 
+    # Dedicated generator for DataLoader internals. Sample order itself comes
+    # from the explicit epoch-addressable sampler above.
+    loader_gen = torch.Generator()
+    loader_gen.manual_seed(int(args.seed) + 21000)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=sampler is None,
+        shuffle=False,
         sampler=sampler,
         num_workers=0,
         collate_fn=collate,
         drop_last=False,
+        generator=loader_gen,
     )
 
     if use_ddp:
@@ -417,13 +1204,42 @@ def main() -> None:
             find_unused_parameters=False,
         )
 
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        trainable,
+    param_groups = _build_param_groups(model, args.lr, float(args.gate_lr_mult))
+    master_scope_params = None
+    if args.fp32_master_weights and str(args.fp32_master_scope) == "vision":
+        master_scope_params = _vision_scope_params(model)
+        if not master_scope_params:
+            raise ValueError(
+                "--fp32_master_scope vision requires a trainable ViT/mixer stack, but this "
+                "run has none (--no_vit / --freeze_vit). Use --fp32_master_scope all or drop "
+                "--fp32_master_weights."
+            )
+    optimizer = build_optimizer(
+        param_groups,
         lr=args.lr,
         betas=(args.adamw_beta1, args.adamw_beta2),
         weight_decay=0.0,
+        fp32_master_weights=bool(args.fp32_master_weights),
+        master_params=master_scope_params,
     )
+    if is_master and isinstance(optimizer, MasterWeightAdamW):
+        mastered = optimizer.mastered_numel
+        trainable_total = sum(p.numel() for p in unwrap_model(model).parameters() if p.requires_grad)
+        print(
+            f"[fp32-master] fp32 MASTER WEIGHTS enabled (scope={args.fp32_master_scope}): "
+            f"{len(optimizer.master_pairs)} tensor(s) / {mastered} of {trainable_total} trainable "
+            f"params get an fp32 master copy "
+            f"(+{mastered * 12 / (1024**3):.2f} GiB of optimizer state: master + fp32 grad + "
+            f"fp32 moments). Model params stay bf16; updates below half a bf16 ULP now "
+            f"accumulate instead of being rounded away. Parameters OUTSIDE the scope keep "
+            f"the legacy in-place bf16 AdamW path bit-for-bit."
+        )
+    if is_master and len(param_groups) > 1:
+        print(
+            f"[gate-lr] mixer_gates in a separate AdamW group: "
+            f"lr={args.lr} * gate_lr_mult={args.gate_lr_mult} = {args.lr * float(args.gate_lr_mult)} "
+            f"({len(param_groups[0]['params'])} base tensors + {len(param_groups[1]['params'])} gate tensor(s))"
+        )
     grad_clip = args.grad_clip
 
     grad_accum_steps = args.gradient_accumulation_steps
@@ -442,6 +1258,7 @@ def main() -> None:
     lr_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.min_lr)
 
     start_epoch = 1
+    start_batch = 1
     global_step = 1
     resume_from_dir = args.resume_dir.strip()
     if resume_from_dir:
@@ -451,11 +1268,64 @@ def main() -> None:
         if found is None:
             raise FileNotFoundError(f"No model_step_*.safetensors + trainer_step_*.pt pair in {resume_from_dir}")
         mp, tp, _ = found
-        start_epoch, global_step = load_cvlm_checkpoint(mp, tp, model, optimizer, lr_scheduler, device)
+        start_epoch, global_step, start_batch = load_cvlm_checkpoint(
+            mp,
+            tp,
+            model,
+            optimizer,
+            lr_scheduler,
+            device,
+        )
         if use_ddp:
             dist.barrier()
         if is_master:
-            print(f"Resumed from {resume_from_dir} next_start_epoch={start_epoch} global_step={global_step}")
+            print(
+                f"Resumed from {resume_from_dir} next_start_epoch={start_epoch} "
+                f"next_start_batch={start_batch} global_step={global_step}"
+            )
+
+    if mixed_cr_sampler is not None:
+        # cr for the upcoming optimizer step, set BEFORE its first micro-batch.
+        # On resume this reconstructs the same sequence position an
+        # uninterrupted run would be at (pure function of seed + global_step).
+        current_cr = mixed_cr_sampler.cr_for_step(global_step)
+        unwrap_model(model).set_compression_rate(current_cr)
+        if is_master:
+            print(f"[mixed-cr] step {global_step}: cr={current_cr}")
+
+    # ---- ViT/mixer learnability diagnostic ------------------------------
+    # Built AFTER any resume so the "unchanged since last log" window starts at
+    # the weights this process actually trains from; drift stays anchored to the
+    # true step-0 weights via mechanistic_init.safetensors when it exists.
+    vit_tracker: Optional[VitDriftTracker] = None
+    if is_master:
+        init_state = None
+        init_path = os.path.join(args.output_dir, "mechanistic_init.safetensors")
+        if os.path.exists(init_path):
+            init_state = load_file(init_path)
+        master_lookup = None
+        if isinstance(optimizer, MasterWeightAdamW):
+            master_lookup = {id(param): master for param, master in optimizer.master_pairs}
+        vit_tracker = VitDriftTracker(
+            model,
+            init_state=init_state,
+            master_lookup=master_lookup,
+        )
+        if vit_tracker.enabled:
+            print(
+                f"[vit-drift] tracking {vit_tracker.numel} trainable {vit_tracker.branch} "
+                f"params in {len(vit_tracker.params)} tensor(s); init from "
+                f"{'mechanistic_init.safetensors' if vit_tracker.init_from_file else 'current weights'} "
+                f"({vit_tracker.init_from_file}/{len(vit_tracker.params)} tensors matched); "
+                f"fp32 masters behind {vit_tracker.mastered_tensors}/{len(vit_tracker.params)} "
+                f"tracked tensors. Logs vit_frozen_frac (bitwise-unchanged since last log), "
+                f"vit_drift (live bf16 weights vs init) and, with master weights, "
+                f"vit_master_drift + vit_master_resid (accumulated-but-not-yet-visible update) "
+                f"every --log_interval."
+            )
+        else:
+            vit_tracker = None
+            print("[vit-drift] no trainable ViT/mixer parameters; diagnostic disabled")
 
     if is_master:
         print(optimizer)
@@ -476,8 +1346,9 @@ def main() -> None:
     trackio_run = None
     csv_writer = None
     plotter = None
+    mechanistic_writer = None
     if is_master:
-        from train_logging import TrackioRun, make_logger
+        from train_logging import MechanisticJsonlWriter, TrackioRun, make_logger
 
         run_name = args.trackio_run_name.strip() or os.path.basename(args.output_dir.rstrip("/"))
         config_payload = {
@@ -486,9 +1357,23 @@ def main() -> None:
             "vision_encoder_name": getattr(model_args, "vision_encoder_name", ""),
             "compression_rate": args.compression_rate,
             "max_vision_len": args.max_vision_len,
+            "mixed_fidelity_p": float(args.mixed_fidelity_p),
             "unfreeze_encoder_top_k": int(args.unfreeze_encoder_top_k),
             "num_pool_latents": int(model_args.num_pool_latents),
+            "mean_pool": bool(model_args.mean_pool),
             "projector_use_input_rmsnorm": bool(model_args.projector_use_input_rmsnorm),
+            "vit_init": model_args.vit_init,
+            "vit_num_layers": int(model_args.vit_num_layers),
+            "vit_freeze": bool(model_args.vit_freeze),
+            "vit_skip": bool(model_args.vit_skip),
+            "mixer_depth_map": model_args.mixer_depth_map,
+            "mask_vit_padding": bool(model_args.mask_vit_padding),
+            "vit_apply_final_layernorm": bool(model_args.vit_apply_final_layernorm),
+            "compact_decoder_positions": bool(model_args.compact_decoder_positions),
+            "gate_lr_mult": float(args.gate_lr_mult),
+            "fp32_master_weights": bool(args.fp32_master_weights),
+            "fp32_master_scope": str(args.fp32_master_scope),
+            "mixed_cr_set": str(args.mixed_cr_set or ""),
             "max_source_len": args.max_source_len,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
@@ -505,6 +1390,9 @@ def main() -> None:
             disable=args.trackio_disable,
         )
         csv_writer, plotter = make_logger(args.output_dir, args.csv_path, args.plot_interval)
+        mechanistic_writer = MechanisticJsonlWriter(
+            os.path.join(args.output_dir, "mechanistic.jsonl")
+        )
 
     model.train()
     # Frozen sub-modules must stay in eval mode (no dropout noise on frozen weights).
@@ -515,6 +1403,9 @@ def main() -> None:
         unwrap_model(model).text_encoder.eval()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
     pgs = -1
+    # Cross-arm batch-comparability audit: log the sha256 of the first batch's
+    # source ids once per process start (i.e. at step 1 and after each resume).
+    batch_hash_logged = False
 
     if start_epoch > args.epochs:
         if is_master:
@@ -529,14 +1420,39 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         running_avg_batch_time = AverageMeter("time", ":6.3f")
         running_avg_loss_value = AverageMeter("loss", ":6.3f")
+        # MIXED-FIDELITY telemetry (stays at 0 when mixed_fidelity_p == 0).
+        running_avg_raw_frac = AverageMeter("raw_frac", ":6.3f")
+        running_avg_input_len = AverageMeter("input_len", ":8.1f")
         grad_norm = 0.0
         t0 = time.perf_counter()
         curr_lrs: List[float] = []
+        # Latest mixer contribution ratios (device tensor; None until the first
+        # forward, and always None when the mixer is disabled) + the cr they
+        # were measured at (the vector length == the mixer depth for that cr).
+        last_mixer_contrib: Optional[torch.Tensor] = None
+        last_mixer_contrib_cr: int = current_cr
+        gate_grads_for_log = None
+        mixer_layer_grad_norms_for_log = None
+        post_bottleneck_layer_grad_norms_for_log = None
 
         for local_step, batch_data in enumerate(loader, start=1):
+            if local_epoch == start_epoch and local_step < start_batch:
+                # Recreate the deterministic epoch permutation and consume
+                # already-finished batches without touching model/global RNG.
+                continue
             data_time = time.perf_counter() - t0
             batch_cpu = batch_data
+            if is_master and not batch_hash_logged:
+                # Same seed => this line must print an identical hash across
+                # ablation arms (loader order is decoupled from model init RNG).
+                n_h = min(8, batch_cpu["source_ids"].size(0))
+                hb = batch_cpu["source_ids"][:n_h].detach().to(torch.long).contiguous()
+                print(f"[batch-hash] step={global_step} hash={hashlib.sha256(hb.numpy().tobytes()).hexdigest()}")
+                batch_hash_logged = True
             batch_data = move_batch(batch_cpu, device, dtype)
+            # Pin the rate that THIS forward/update uses. `current_cr` is
+            # advanced to the next optimizer step inside the sync branch.
+            cr_used = int(current_cr)
 
             # LR schedule: warmup (if any) uses linear on global_step, else read
             # current group LR. The scheduler itself is stepped *after*
@@ -559,8 +1475,26 @@ def main() -> None:
                 answer_labels=batch_data["answer_labels"],
                 prompt_mask=batch_data["prompt_mask"],
                 answer_mask=batch_data["answer_mask"],
+                # MIXED-FIDELITY extras (None when mixed_fidelity_p == 0).
+                doc_dec_ids=batch_data.get("doc_dec_ids"),
+                chunk_dec_spans=batch_data.get("chunk_dec_spans"),
+                chunk_counts=batch_data.get("chunk_counts"),
             )
             loss = out["loss"]
+            mixed_stats = out.get("mixed_stats")
+            if mixed_stats is not None:
+                running_avg_raw_frac.update(mixed_stats["raw_frac"])
+                running_avg_input_len.update(mixed_stats["input_len"])
+            # RATE-DEPTH MIXER diagnostics: keep the latest per-layer
+            # contribution ratios as a DEVICE tensor (detached, no sync); it is
+            # copied to CPU only inside the log_interval branch below.
+            mixer_contrib_t = out.get("mixer_contrib")
+            if mixer_contrib_t is not None:
+                last_mixer_contrib = mixer_contrib_t
+                # Pin the cr THIS forward ran at: `current_cr` is advanced to the
+                # next step's value inside the sync branch below, so the cr shown
+                # on a log line can otherwise be one step ahead of the ratios.
+                last_mixer_contrib_cr = cr_used
             loss = loss / grad_accum_steps
 
             sync_step = local_step % grad_accum_steps == 0 or local_step == len(loader)
@@ -575,6 +1509,45 @@ def main() -> None:
                 if grad_clip > 0.0:
                     params = unwrap_model(model).parameters()
                     grad_norm = float(torch.nn.utils.clip_grad_norm_(params, grad_clip))
+                # Capture gradients BEFORE optimizer.step()/zero_grad so the
+                # mechanistic JSONL can show when gates/layers begin learning.
+                diag_due = is_master and (global_step + 1) % args.log_interval == 0
+                if diag_due:
+                    _core_for_grad = unwrap_model(model)
+                    _gates_for_grad = getattr(_core_for_grad, "mixer_gates", None)
+                    if _gates_for_grad is not None:
+                        if _gates_for_grad.grad is None:
+                            gate_grads_for_log = [0.0] * int(_gates_for_grad.numel())
+                        else:
+                            gate_grads_for_log = (
+                                _gates_for_grad.grad.detach().float().cpu().tolist()
+                            )
+                    _layers_for_grad = getattr(_core_for_grad, "mixer_layers", None)
+                    if (
+                        _layers_for_grad is None
+                        and getattr(_core_for_grad, "vision_encoder", None) is not None
+                    ):
+                        _layers_for_grad = _core_for_grad.vision_encoder.encoder.layer
+                    if _layers_for_grad is not None:
+                        post_bottleneck_layer_grad_norms_for_log = []
+                        for _layer in _layers_for_grad:
+                            _norms = [
+                                torch.linalg.vector_norm(p.grad.detach(), dtype=torch.float32)
+                                for p in _layer.parameters()
+                                if p.grad is not None
+                            ]
+                            _layer_norm = (
+                                torch.linalg.vector_norm(torch.stack(_norms))
+                                if _norms
+                                else torch.zeros((), device=device, dtype=torch.float32)
+                            )
+                            post_bottleneck_layer_grad_norms_for_log.append(
+                                float(_layer_norm)
+                            )
+                        if getattr(_core_for_grad, "mixer_layers", None) is not None:
+                            mixer_layer_grad_norms_for_log = (
+                                post_bottleneck_layer_grad_norms_for_log
+                            )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 if global_step > warmup_steps and not args.disable_lr_schedule:
@@ -586,18 +1559,32 @@ def main() -> None:
                         unwrap_model(model).set_compression_rate(cr_now)
                         if is_master:
                             print(f"[step {global_step}] cr {current_cr} -> {cr_now}")
+                            next_epoch, next_batch = _next_resume_position(
+                                local_epoch,
+                                local_step,
+                                len(loader),
+                            )
                             save_cvlm_checkpoint(
                                 args.output_dir,
                                 model,
                                 optimizer,
                                 lr_scheduler,
-                                next_start_epoch=local_epoch,
+                                next_start_epoch=next_epoch,
                                 global_step=global_step,
                                 is_master=True,
+                                next_start_batch=next_batch,
                             )
                         current_cr = cr_now
+                elif mixed_cr_sampler is not None:
+                    # cr for the NEW global_step, set here — i.e. BEFORE the
+                    # first micro-batch of that optimizer step; all grad-accum
+                    # micro-batches of a step therefore share one cr.
+                    cr_next = mixed_cr_sampler.cr_for_step(global_step)
+                    if cr_next != current_cr:
+                        unwrap_model(model).set_compression_rate(cr_next)
+                    current_cr = cr_next
                 if trackio_run is not None and is_master:
-                    trackio_run.log({"train/compression_rate": float(current_cr)}, step=global_step)
+                    trackio_run.log({"train/compression_rate": float(cr_used)}, step=global_step)
 
             t1 = time.perf_counter()
             batch_time = t1 - t0
@@ -605,16 +1592,68 @@ def main() -> None:
             curr_loss = loss.item() * grad_accum_steps
             running_avg_loss_value.update(curr_loss)
 
-            if is_master and global_step % args.log_interval == 0:
+            if is_master and sync_step and global_step % args.log_interval == 0:
                 rp = global_step / max(total_steps, 1) * 100
                 curr_lrs_str = " ' ".join(f"{lr:.10f}" for lr in curr_lrs)
                 gn = f"grad norm: {grad_norm:>6.3f} " if grad_norm > 0 else ""
+                mx = (
+                    f"raw_frac: {running_avg_raw_frac.avg:>5.3f} input_len: {running_avg_input_len.avg:>7.1f} "
+                    if args.mixed_fidelity_p > 0
+                    else ""
+                )
+                crs = f"cr: {cr_used} " if mixed_cr_sampler is not None else ""
                 print(
                     f"epoch: {local_epoch} step: {global_step} ({total_steps}) | {rp:5.2f}% ",
                     f"lr: {curr_lrs_str} loss: {curr_loss:>6.3f} ({running_avg_loss_value.avg:>6.3f}) ",
+                    crs,
                     gn,
+                    mx,
                     f"data: {data_time:>7.5f}s batch: {batch_time:>6.3f}s",
                 )
+                # NUMERICAL-PRECISION diagnostic: is the ViT/mixer stack moving
+                # at all, or is AdamW's update being rounded away by bf16?
+                # Advances the tracker's window, so call it exactly once per log.
+                vit_stats = vit_tracker.measure() if vit_tracker is not None else None
+                if vit_stats is not None:
+                    master_str = ""
+                    if vit_stats["vit_master_drift"] is not None:
+                        master_str = (
+                            f"vit_master_drift={vit_stats['vit_master_drift']:.4f} "
+                            f"vit_master_resid={vit_stats['vit_master_resid']:.6f} "
+                            f"vit_master_resid_max={vit_stats['vit_master_resid_max']:.3e} "
+                        )
+                    print(
+                        f"    vit_frozen_frac={vit_stats['vit_frozen_frac']:.4f} "
+                        f"vit_drift={vit_stats['vit_drift']:.4f} "
+                        f"{master_str}"
+                        f"(tracked={vit_stats['vit_tracked_params']} params, "
+                        f"window={args.log_interval} steps)"
+                    )
+                # RATE-DEPTH MIXER ablation telemetry: gate values show how much
+                # of each ViTLayer the model actually uses.
+                mixer_gates_now = None
+                mixer_gates_full = None
+                _core = unwrap_model(model)
+                if getattr(_core, "mixer_gates", None) is not None:
+                    mixer_gates_full = _core.mixer_gates.detach().float().cpu().tolist()
+                    mixer_gates_now = [round(float(g), 4) for g in mixer_gates_full]
+                    print(f"    mixer_gates={mixer_gates_now}")
+                # CONTRIBUTION RATIO: ||g_i*(Layer_i(h)-h)||_F / ||h||_F per
+                # applied layer (see modeling._mixer_forward). Unlike the raw
+                # gate value this is scale-aware — it says how much the gated
+                # update actually moves the representation. Length == the ACTIVE
+                # depth for the current cr, so it shrinks/grows under mixed-cr.
+                mixer_contrib_now = None
+                mixer_contrib_total = None
+                if last_mixer_contrib is not None:
+                    _contrib_raw = last_mixer_contrib.detach().float().cpu().tolist()
+                    mixer_contrib_now = [round(float(c), 4) for c in _contrib_raw]
+                    mixer_contrib_total = float(sum(_contrib_raw))
+                    print(
+                        f"    mixer_contrib={mixer_contrib_now} "
+                        f"mixer_contrib_total={mixer_contrib_total:.4f} "
+                        f"(cr={last_mixer_contrib_cr}, depth={len(mixer_contrib_now)})"
+                    )
                 if trackio_run is not None:
                     metrics = {
                         "train/loss": curr_loss,
@@ -624,7 +1663,115 @@ def main() -> None:
                     }
                     if grad_norm > 0:
                         metrics["train/grad_norm"] = grad_norm
+                    if vit_stats is not None:
+                        metrics["train/vit_frozen_frac"] = vit_stats["vit_frozen_frac"]
+                        metrics["train/vit_drift"] = vit_stats["vit_drift"]
+                        if vit_stats["vit_master_drift"] is not None:
+                            metrics["train/vit_master_drift"] = vit_stats["vit_master_drift"]
+                            metrics["train/vit_master_resid"] = vit_stats["vit_master_resid"]
+                            metrics["train/vit_master_resid_max"] = vit_stats["vit_master_resid_max"]
+                    if args.mixed_fidelity_p > 0 and running_avg_raw_frac.count > 0:
+                        metrics["train/mixed_raw_frac"] = running_avg_raw_frac.avg
+                        metrics["train/mixed_input_len"] = running_avg_input_len.avg
+                    if mixer_gates_now is not None:
+                        for gi, gv in enumerate(mixer_gates_now):
+                            metrics[f"train/mixer_gate_{gi:02d}"] = gv
+                    if mixer_contrib_now is not None:
+                        metrics["train/mixer_contrib_total"] = mixer_contrib_total
+                        # cr the ratios were measured at — under mixed-cr the
+                        # depth (== len of the vector) is a function of it, so
+                        # any per-cr analysis must group on this, not on
+                        # train/compression_rate (which is the NEXT step's cr).
+                        metrics["train/mixer_contrib_cr"] = float(last_mixer_contrib_cr)
+                        for ci, cv in enumerate(mixer_contrib_now):
+                            metrics[f"train/mixer_contrib_{ci:02d}"] = cv
                     trackio_run.log(metrics, step=global_step)
+                if mechanistic_writer is not None:
+                    vision_mask_diag = out["vision_mask"].detach()
+                    vision_lens = vision_mask_diag.sum(dim=1)
+                    real_slots = int(vision_mask_diag.sum().item())
+                    total_slots = int(vision_mask_diag.numel())
+                    source_lens = batch_cpu["source_attention_mask"].sum(dim=1)
+                    n_h = min(8, batch_cpu["source_ids"].size(0))
+                    hb = batch_cpu["source_ids"][:n_h].detach().to(torch.long).contiguous()
+                    if getattr(_core, "mixer_depth_map", None) is not None:
+                        active_depth = int(_core._mixer_depth_for(cr_used))
+                    elif getattr(_core, "vision_encoder", None) is not None:
+                        active_depth = len(_core.vision_encoder.encoder.layer)
+                    else:
+                        active_depth = 0
+                    mechanistic_writer.append(
+                        {
+                            "step": int(global_step),
+                            "optimizer_update": int(global_step - 1),
+                            "epoch": int(local_epoch),
+                            "local_batch": int(local_step),
+                            "batch_size": int(vision_mask_diag.size(0)),
+                            "compression_rate": int(cr_used),
+                            "active_depth": int(active_depth),
+                            "loss": float(curr_loss),
+                            "loss_avg": float(running_avg_loss_value.avg),
+                            "grad_norm_after_clip": float(grad_norm if grad_norm > 0 else 0.0),
+                            "batch_hash": hashlib.sha256(hb.numpy().tobytes()).hexdigest(),
+                            "source_len_mean": float(source_lens.float().mean()),
+                            "source_len_min": int(source_lens.min()),
+                            "source_len_max": int(source_lens.max()),
+                            "vision_len_mean": float(real_slots / max(vision_mask_diag.size(0), 1)),
+                            "vision_len_min": int(vision_lens.min()),
+                            "vision_len_max": int(vision_lens.max()),
+                            "latent_slots_total": total_slots,
+                            "latent_slots_real": real_slots,
+                            "latent_padding_fraction": float(
+                                (total_slots - real_slots) / max(total_slots, 1)
+                            ),
+                            "mask_vit_padding": bool(model_args.mask_vit_padding),
+                            "vit_apply_final_layernorm": bool(
+                                model_args.vit_apply_final_layernorm
+                            ),
+                            "compact_decoder_positions": bool(
+                                model_args.compact_decoder_positions
+                            ),
+                            "fp32_master_weights": bool(args.fp32_master_weights),
+                            "fp32_master_scope": (
+                                str(args.fp32_master_scope)
+                                if args.fp32_master_weights
+                                else None
+                            ),
+                            "vit_frozen_frac": (
+                                vit_stats["vit_frozen_frac"] if vit_stats is not None else None
+                            ),
+                            "vit_drift": (
+                                vit_stats["vit_drift"] if vit_stats is not None else None
+                            ),
+                            "vit_master_drift": (
+                                vit_stats["vit_master_drift"] if vit_stats is not None else None
+                            ),
+                            "vit_master_resid": (
+                                vit_stats["vit_master_resid"] if vit_stats is not None else None
+                            ),
+                            "vit_master_resid_max": (
+                                vit_stats["vit_master_resid_max"] if vit_stats is not None else None
+                            ),
+                            "vit_tracked_params": (
+                                vit_stats["vit_tracked_params"] if vit_stats is not None else None
+                            ),
+                            "vit_drift_window_steps": int(args.log_interval),
+                            "mixer_gates": mixer_gates_full,
+                            "mixer_gate_grads": gate_grads_for_log,
+                            "mixer_contrib": (
+                                last_mixer_contrib.detach().float().cpu().tolist()
+                                if last_mixer_contrib is not None
+                                else None
+                            ),
+                            "mixer_layer_grad_norms": mixer_layer_grad_norms_for_log,
+                            "post_bottleneck_layer_grad_norms": (
+                                post_bottleneck_layer_grad_norms_for_log
+                            ),
+                        }
+                    )
+                    gate_grads_for_log = None
+                    mixer_layer_grad_norms_for_log = None
+                    post_bottleneck_layer_grad_norms_for_log = None
                 if csv_writer is not None:
                     csv_writer.append(
                         step=global_step,
@@ -646,14 +1793,20 @@ def main() -> None:
 
             if is_master and args.save_interval_steps > 0 and global_step % args.save_interval_steps == 0 and sync_step:
                 if global_step != pgs:
+                    next_epoch, next_batch = _next_resume_position(
+                        local_epoch,
+                        local_step,
+                        len(loader),
+                    )
                     save_cvlm_checkpoint(
                         args.output_dir,
                         model,
                         optimizer,
                         lr_scheduler,
-                        next_start_epoch=local_epoch,
+                        next_start_epoch=next_epoch,
                         global_step=global_step,
                         is_master=True,
+                        next_start_batch=next_batch,
                     )
                     pgs = global_step
 
@@ -672,6 +1825,7 @@ def main() -> None:
                     next_start_epoch=local_epoch + 1,
                     global_step=global_step,
                     is_master=True,
+                    next_start_batch=1,
                 )
                 pgs = global_step
 
@@ -684,6 +1838,7 @@ def main() -> None:
             next_start_epoch=args.epochs + 1,
             global_step=global_step,
             is_master=True,
+            next_start_batch=1,
         )
 
     if is_master:
@@ -698,6 +1853,8 @@ def main() -> None:
         trackio_run.finish()
     if csv_writer is not None:
         csv_writer.close()
+    if mechanistic_writer is not None:
+        mechanistic_writer.close()
     if plotter is not None:
         plotter.refresh()
 

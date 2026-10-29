@@ -28,7 +28,7 @@ export PYTHONUNBUFFERED=1
 # -----------------------------------------------------------------------------
 # Configuration (override by exporting env vars before running).
 # -----------------------------------------------------------------------------
-OUTPUT_DIR="${OUTPUT_DIR:-/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/sft_run_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-${ROOT}/runs/sft_run_$(date +%Y%m%d_%H%M%S)}"
 DATASET_NAME="${DATASET_NAME:-sggetao/PwC}"
 
 # Model

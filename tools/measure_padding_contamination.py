@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""Measure latent-padding contamination on an existing CVLM checkpoint.
+
+No retraining is required. The tool runs the same held-out samples under:
+
+1. batch size 1 versus batch size 8;
+2. ordinary versus length-bucketed batches;
+3. an explicit synthetic-latent-padding intervention.
+
+For a padding-safe ViT/mixer, teacher-forcing PPL should be invariant up to
+floating-point noise. For a legacy unmasked ViT/mixer, appended masked latent
+slots can change real-token states because Hugging Face ViTLayer has no key
+padding mask. The synthetic intervention is implemented inside CVLM *after*
+pooling, so it changes neither source tokens nor real pooled latents.
+"""
+
+import argparse
+import json
+import math
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "src"))
+os.environ.setdefault("DISABLE_LIGER", "1")
+
+
+def _as_bool(value):
+    return str(value).lower() in ("1", "true", "yes")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint_path", required=True)
+    parser.add_argument("--model_name_or_path", default="HuggingFaceTB/SmolLM2-1.7B-Instruct")
+    parser.add_argument("--text_encoder_name", default="answerdotai/ModernBERT-base")
+    parser.add_argument("--vision_encoder_name", default="google/vit-base-patch16-224")
+    parser.add_argument("--dataset_name", default="sggetao/PwC")
+    parser.add_argument("--dataset_split", default="test")
+    parser.add_argument("--compression_rate", type=int, default=16)
+    parser.add_argument("--num_pool_latents", type=int, default=4)
+    parser.add_argument("--max_vision_len", type=int, default=1024)
+    parser.add_argument("--max_source_len", type=int, default=1024)
+    parser.add_argument("--max_prompt_len", type=int, default=512)
+    parser.add_argument("--max_answer_len", type=int, default=1024)
+    parser.add_argument("--max_samples", type=int, default=500)
+    parser.add_argument(
+        "--batch1_samples",
+        type=int,
+        default=32,
+        help="Number of identical leading examples used for the batch_size=1 vs "
+        "batch_size=8 invariance check. Other conditions use --max_samples.",
+    )
+    parser.add_argument("--vit_init", default="pretrained", choices=["pretrained", "random"])
+    parser.add_argument("--freeze_vit", type=_as_bool, default=False)
+    parser.add_argument("--no_vit", type=_as_bool, default=False)
+    parser.add_argument("--mixer_depth_map", default="")
+    parser.add_argument("--legacy_projector", type=_as_bool, default=False)
+    parser.add_argument("--mask_vit_padding", type=_as_bool, default=False)
+    parser.add_argument("--vit_apply_final_layernorm", type=_as_bool, default=True)
+    parser.add_argument("--compact_decoder_positions", type=_as_bool, default=False)
+    parser.add_argument("--pad_fractions", default="0,0.25,0.5,0.75")
+    parser.add_argument(
+        "--attention_batches",
+        type=int,
+        default=2,
+        help="Measure padded-key attention mass on at most this many batches per "
+        "condition (0 disables). PPL still uses every sample.",
+    )
+    parser.add_argument(
+        "--attention_query_chunk",
+        type=int,
+        default=128,
+        help="Query chunk size for the offline QK/softmax recomputation. Lower "
+        "values reduce peak memory at cr=1.",
+    )
+    parser.add_argument("--output_json", required=True)
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
+
+
+def build_model(args):
+    import torch
+    from modeling import CVLM, ModelArguments, TrainingArguments
+    from safetensors.torch import load_file
+    from train_utils import validate_partial_checkpoint_load
+
+    model_args = ModelArguments(train=False)
+    model_args.model_name_or_path = args.model_name_or_path
+    model_args.text_encoder_name = args.text_encoder_name
+    model_args.vision_encoder_name = args.vision_encoder_name
+    model_args.compression_rate = args.compression_rate
+    model_args.num_pool_latents = max(args.num_pool_latents, 1)
+    model_args.max_vision_len = args.max_vision_len
+    model_args.projector_use_input_rmsnorm = not args.legacy_projector
+    model_args.vit_init = args.vit_init
+    model_args.vit_freeze = args.freeze_vit
+    model_args.vit_skip = args.no_vit
+    model_args.mixer_depth_map = args.mixer_depth_map
+    model_args.mask_vit_padding = args.mask_vit_padding
+    model_args.vit_apply_final_layernorm = args.vit_apply_final_layernorm
+    model_args.compact_decoder_positions = args.compact_decoder_positions
+
+    training_args = TrainingArguments(output_dir="/tmp/_pad_diag")
+    training_args.bf16 = torch.cuda.is_available()
+    model = CVLM(model_args, training_args)
+    state = load_file(args.checkpoint_path)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    validate_partial_checkpoint_load(
+        model,
+        missing,
+        unexpected,
+        args.checkpoint_path,
+    )
+    print(f"[load] missing={len(missing)} unexpected={len(unexpected)}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return model.to(device).eval(), device
+
+
+def forward_batch(model, batch, device):
+    import torch
+
+    keys = (
+        "source_ids",
+        "source_attention_mask",
+        "prompt_ids",
+        "answer_ids",
+        "answer_labels",
+        "prompt_mask",
+        "answer_mask",
+    )
+    moved = {key: batch[key].to(device) for key in keys}
+    with torch.no_grad():
+        out = model(
+            source_input_ids=moved["source_ids"],
+            source_attention_mask=moved["source_attention_mask"],
+            prompt_ids=moved["prompt_ids"],
+            answer_ids=moved["answer_ids"],
+            answer_labels=moved["answer_labels"],
+            prompt_mask=moved["prompt_mask"],
+            answer_mask=moved["answer_mask"],
+        )
+
+    labels_src = moved["answer_labels"]
+    prompt_width = moved["prompt_ids"].size(1)
+    vision_width = out["vision_mask"].size(1)
+    ignore = torch.full(
+        (labels_src.size(0), prompt_width + vision_width),
+        -100,
+        dtype=labels_src.dtype,
+        device=device,
+    )
+    labels = torch.cat([ignore, labels_src], dim=1)
+    logits = out["logits"]
+    shift_logits = logits[:, :-1, :].float()
+    shift_labels = labels[:, 1:]
+    mask = shift_labels != -100
+    per_token = torch.nn.functional.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        shift_labels.reshape(-1),
+        ignore_index=-100,
+        reduction="none",
+    ).view_as(shift_labels)
+    nll = (per_token * mask).sum()
+    vision_mask = out["vision_mask"].detach()
+    return {
+        "nll": float(nll),
+        "answer_tokens": int(mask.sum()),
+        "samples": int(labels_src.size(0)),
+        "latent_slots_total": int(vision_mask.numel()),
+        "latent_slots_real": int(vision_mask.sum()),
+        "synthetic_slots_total": int(
+            getattr(model, "_last_synthetic_pad_slots", 0)
+        )
+        * int(labels_src.size(0)),
+    }
+
+
+def ppl_over(model, loader, device):
+    total_nll = 0.0
+    total_tokens = 0
+    total_samples = 0
+    latent_slots_total = 0
+    latent_slots_real = 0
+    synthetic_slots_total = 0
+    for batch in loader:
+        metrics = forward_batch(model, batch, device)
+        total_nll += metrics["nll"]
+        total_tokens += metrics["answer_tokens"]
+        total_samples += metrics["samples"]
+        latent_slots_total += metrics["latent_slots_total"]
+        latent_slots_real += metrics["latent_slots_real"]
+        synthetic_slots_total += metrics["synthetic_slots_total"]
+    ppl = math.exp(min(total_nll / max(total_tokens, 1), 30.0))
+    return {
+        "ppl": ppl,
+        "answer_tokens": int(total_tokens),
+        "samples": int(total_samples),
+        "latent_slots_total": int(latent_slots_total),
+        "latent_slots_real": int(latent_slots_real),
+        "latent_padding_fraction": float(
+            (latent_slots_total - latent_slots_real)
+            / max(latent_slots_total, 1)
+        ),
+        "synthetic_slots_total": int(synthetic_slots_total),
+        "synthetic_slots_per_sample": float(
+            synthetic_slots_total / max(total_samples, 1)
+        ),
+    }
+
+
+class PaddingAttentionCollector:
+    """Measure legacy attention mass assigned to padded latent keys.
+
+    Native ``ViTLayer`` calls self-attention with ``output_attentions=False``,
+    so a forward hook cannot read the probabilities from its output. A
+    pre-forward hook instead recomputes only QK + softmax from the exact
+    normalized hidden states about to enter each attention module. This is an
+    offline diagnostic: the recomputation never enters the model graph and
+    cannot affect predictions.
+    """
+
+    def __init__(self, model, max_batches=2, query_chunk=128):
+        self.model = model
+        self.max_batches = max(int(max_batches), 0)
+        self.query_chunk = max(int(query_chunk), 1)
+        if getattr(model, "mixer_layers", None) is not None:
+            layers = list(model.mixer_layers)
+        elif getattr(model, "vision_encoder", None) is not None:
+            layers = list(model.vision_encoder.encoder.layer)
+        else:
+            layers = []
+        self.sums = [0.0] * len(layers)
+        self.counts = [0] * len(layers)
+        self.calls = [0] * len(layers)
+        self.handles = []
+        for index, layer in enumerate(layers):
+            self.handles.append(
+                layer.attention.attention.register_forward_pre_hook(
+                    self._make_hook(index)
+                )
+            )
+
+    def _make_hook(self, index):
+        def hook(module, inputs):
+            import torch
+
+            if (
+                not inputs
+                or self.max_batches == 0
+                or self.calls[index] >= self.max_batches
+            ):
+                return
+            self.calls[index] += 1
+            hidden_states = inputs[0].detach()
+            valid = getattr(self.model, "_current_vision_attention_mask", None)
+            if valid is None or hidden_states.size(1) != valid.size(1):
+                return
+            valid = valid.to(device=hidden_states.device, dtype=torch.bool)
+
+            batch_size = hidden_states.size(0)
+            n_heads = int(module.num_attention_heads)
+            head_dim = int(module.attention_head_size)
+            valid_query_count = int(valid.sum()) * n_heads
+            if bool(valid.all()):
+                self.counts[index] += valid_query_count
+                return
+            qkv_shape = (batch_size, -1, n_heads, head_dim)
+            with torch.no_grad():
+                key = module.key(hidden_states).view(*qkv_shape).transpose(1, 2)
+                query = module.query(hidden_states).view(*qkv_shape).transpose(1, 2)
+                scaling = float(getattr(module, "scaling", head_dim**-0.5))
+                key_t = key.transpose(-1, -2)
+                padded_keys = (~valid)[:, None, None, :]
+                for start in range(0, query.size(2), self.query_chunk):
+                    end = min(start + self.query_chunk, query.size(2))
+                    scores = torch.matmul(query[:, :, start:end], key_t) * scaling
+                    probabilities = torch.softmax(
+                        scores,
+                        dim=-1,
+                        dtype=torch.float32,
+                    )
+                    pad_mass = (probabilities * padded_keys).sum(dim=-1)
+                    valid_queries = valid[:, None, start:end].expand_as(pad_mass)
+                    values = pad_mass.masked_select(valid_queries)
+                    if values.numel() > 0:
+                        self.sums[index] += float(values.sum())
+                        self.counts[index] += int(values.numel())
+
+        return hook
+
+    def reset(self):
+        self.sums = [0.0] * len(self.sums)
+        self.counts = [0] * len(self.counts)
+        self.calls = [0] * len(self.calls)
+
+    def means(self, mask_safe):
+        if mask_safe and self.sums:
+            # The custom mask-safe path bypasses native ViTSelfAttention.forward;
+            # its key mask makes this quantity exactly zero by construction.
+            return [0.0] * len(self.sums)
+        return [
+            (total / count if count else None)
+            for total, count in zip(self.sums, self.counts)
+        ]
+
+    def close(self):
+        for handle in self.handles:
+            handle.remove()
+
+
+def main():
+    import torch
+    from cvlm_dataset import CvlmTrainDataset, make_collate_fn
+    from torch.utils.data import DataLoader, Subset
+
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    model, device = build_model(args)
+    dataset = CvlmTrainDataset(
+        hf_dataset_name=args.dataset_name,
+        hf_split=args.dataset_split,
+        decoder_tokenizer_name=args.model_name_or_path,
+        encoder_tokenizer_name=args.text_encoder_name,
+        max_prompt_len=args.max_prompt_len,
+        max_answer_len=args.max_answer_len,
+        max_source_len=args.max_source_len,
+        max_samples=args.max_samples,
+    )
+    collate = make_collate_fn(
+        dec_pad_id=model.tokenizer.pad_token_id,
+        enc_pad_id=model.encoder_tokenizer.pad_token_id,
+    )
+    attention_collector = PaddingAttentionCollector(
+        model,
+        max_batches=args.attention_batches,
+        query_chunk=args.attention_query_chunk,
+    )
+
+    results = {
+        "checkpoint": args.checkpoint_path,
+        "compression_rate": args.compression_rate,
+        "mixer_depth_map": args.mixer_depth_map,
+        "no_vit": args.no_vit,
+        "vit_init": args.vit_init,
+        "mask_vit_padding": args.mask_vit_padding,
+        "vit_apply_final_layernorm": args.vit_apply_final_layernorm,
+        "compact_decoder_positions": args.compact_decoder_positions,
+        "max_samples": len(dataset),
+        "batch_invariance_samples": min(
+            max(args.batch1_samples, 1),
+            len(dataset),
+        ),
+        "attention_batches": args.attention_batches,
+        "attention_query_chunk": args.attention_query_chunk,
+    }
+
+    # 1. Batch-size invariance on exactly the same dataset rows. Batch size 1
+    # is intentionally capped: running the entire held-out set one sample at a
+    # time is expensive and adds no information to this deterministic check.
+    invariance_count = min(max(args.batch1_samples, 1), len(dataset))
+    invariance_dataset = Subset(dataset, range(invariance_count))
+    for batch_size in (1, 8):
+        attention_collector.reset()
+        loader = DataLoader(
+            invariance_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collate,
+            num_workers=0,
+        )
+        metrics = ppl_over(model, loader, device)
+        metrics["padding_attention_mass_by_layer"] = attention_collector.means(
+            args.mask_vit_padding
+        )
+        results[f"batch_size_{batch_size}"] = metrics
+        print(f"[batch-size={batch_size}] PPL={metrics['ppl']:.6f}")
+    results["batch_size_ppl_delta"] = (
+        results["batch_size_8"]["ppl"] - results["batch_size_1"]["ppl"]
+    )
+
+    # Full bs=8 baseline for both length bucketing and synthetic intervention.
+    attention_collector.reset()
+    full_loader = DataLoader(
+        dataset,
+        batch_size=8,
+        shuffle=False,
+        collate_fn=collate,
+        num_workers=0,
+    )
+    full_metrics = ppl_over(model, full_loader, device)
+    full_metrics["padding_attention_mass_by_layer"] = attention_collector.means(
+        args.mask_vit_padding
+    )
+    results["batch_size_8_full"] = full_metrics
+    # Convenience mirror: `attention_batches` above is only the sampling
+    # budget, while this is the actual measured per-layer PAD attention mass.
+    results["padding_attention_mass_by_layer"] = full_metrics[
+        "padding_attention_mass_by_layer"
+    ]
+
+    # 2. Length bucketing: same full set, only batch composition changes.
+    lengths = [(index, int(dataset[index]["source_ids"].numel())) for index in range(len(dataset))]
+    bucket_order = [index for index, _ in sorted(lengths, key=lambda item: item[1])]
+    bucket_loader = DataLoader(
+        Subset(dataset, bucket_order),
+        batch_size=8,
+        shuffle=False,
+        collate_fn=collate,
+        num_workers=0,
+    )
+    attention_collector.reset()
+    bucket_metrics = ppl_over(model, bucket_loader, device)
+    bucket_metrics["padding_attention_mass_by_layer"] = attention_collector.means(
+        args.mask_vit_padding
+    )
+    results["batch_size_8_bucketed"] = bucket_metrics
+    results["bucketing_ppl_delta"] = (
+        full_metrics["ppl"] - bucket_metrics["ppl"]
+    )
+    print(f"[length-bucketed] PPL={bucket_metrics['ppl']:.6f}")
+
+    # 3. Causal intervention: append masked slots after pooling.
+    fractions = [float(value) for value in args.pad_fractions.split(",") if value.strip()]
+    if 0.0 not in fractions:
+        fractions.insert(0, 0.0)
+    results["synthetic_latent_padding"] = {}
+    base_ppl = None
+    for fraction in fractions:
+        if fraction == 0.0:
+            # Reuse the identical full bs=8 baseline rather than spending
+            # another full held-out pass.
+            metrics = dict(full_metrics)
+        else:
+            model.synthetic_latent_pad_fraction = float(fraction)
+            attention_collector.reset()
+            loader = DataLoader(
+                dataset,
+                batch_size=8,
+                shuffle=False,
+                collate_fn=collate,
+                num_workers=0,
+            )
+            metrics = ppl_over(model, loader, device)
+            metrics["padding_attention_mass_by_layer"] = attention_collector.means(
+                args.mask_vit_padding
+            )
+        if fraction == 0.0:
+            base_ppl = metrics["ppl"]
+        metrics["ppl_delta_vs_zero"] = (
+            metrics["ppl"] - base_ppl if base_ppl is not None else 0.0
+        )
+        metrics["requested_pad_fraction"] = float(fraction)
+        results["synthetic_latent_padding"][str(fraction)] = metrics
+        print(
+            f"[synthetic-latent-pad={fraction:.2f}] "
+            f"PPL={metrics['ppl']:.6f} delta={metrics['ppl_delta_vs_zero']:+.6f} "
+            f"actual_slots/sample={metrics['synthetic_slots_per_sample']:.1f}"
+        )
+        if fraction > 0.0 and metrics["synthetic_slots_total"] == 0:
+            print(
+                "  WARN: no synthetic slots fit under max_vision_len for this "
+                "condition; use the batch-composition result or a higher cr."
+            )
+    model.synthetic_latent_pad_fraction = 0.0
+    attention_collector.close()
+
+    os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
+    with open(args.output_json, "w", encoding="utf-8") as handle:
+        json.dump(results, handle, indent=2, ensure_ascii=False)
+    print(f"saved -> {args.output_json}")
+
+
+if __name__ == "__main__":
+    main()

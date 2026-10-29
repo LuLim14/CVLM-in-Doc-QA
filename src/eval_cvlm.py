@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 from cvlm_dataset import CvlmTrainDataset, make_collate_fn
 from modeling import CVLM, ModelArguments, TrainingArguments, _chunked_attention_pool
+from train_utils import validate_partial_checkpoint_load
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,15 +38,6 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--dataset_name", type=str, default="sggetao/PwC")
     p.add_argument("--dataset_split", type=str, default="test")
-    p.add_argument(
-        "--longbench_task",
-        type=str,
-        default="",
-        help="If set (e.g. 'hotpotqa'), evaluate a single LongBench QA subtask: "
-        "loads THUDM/LongBench config, applies the official prompt template + "
-        "per-task max_new_tokens, keeps all samples (no length filter/truncation), "
-        "and reports the official qa_f1_score. dataset_name must be THUDM/LongBench.",
-    )
     p.add_argument("--model_name_or_path", type=str, default=None)
     p.add_argument("--vision_encoder_name", type=str, default=None)
     p.add_argument("--text_encoder_name", type=str, default=None)
@@ -56,6 +48,15 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("NUM_POOL_LATENTS", "1")),
         help="K learnable latent queries for the chunked attention pool. Must match "
         "the value used at training time so checkpoint pool_queries [K,H] loads.",
+    )
+    p.add_argument(
+        "--mean_pool",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("MEAN_POOL", "0") == "1",
+        help="MEANPOOL ABLATION: MUST match training. The chunk pool becomes an EXACT masked "
+        "mean over the real tokens and pool_queries is frozen at zero (and therefore absent from "
+        "the checkpoint). Omitting it on a --mean_pool checkpoint silently evaluates the "
+        "attention pool instead. Env: MEAN_POOL.",
     )
     p.add_argument("--max_prompt_len", type=int, default=512)
     p.add_argument("--max_answer_len", type=int, default=2048)
@@ -74,9 +75,44 @@ def parse_args() -> argparse.Namespace:
             "baseline_llm",  # lower bound: question only, no document
             "baseline_llm_full",  # upper bound: question + full document text
             "baseline_proj",  # random linear projection, skips ViT
-            "baseline_truncate",  # no compression: decoder sees the LAST n context tokens
             "sft",  # SFT-trained decoder loaded from --sft_model_path
         ],
+    )
+    p.add_argument(
+        "--doc_truncation",
+        type=str,
+        default="none",
+        choices=["none", "first", "last", "random", "oracle", "query", "file"],
+        help="baseline_llm_full/sft only: replace the document inside full_prompt "
+        "with a budgeted decoder-token window before appending '\\n\\n' + question. "
+        "first/last/random = contiguous window (random is deterministic: seed + "
+        "sample idx); oracle = window centred on the answer's occurrence in the "
+        "document (first-N fallback when not found); query = the deterministic "
+        "BM25-style sentence selector conditioned on the question; file = "
+        "skim-then-read: the "
+        "document is replaced by `selected_text` from --doc_selection_file "
+        "(tools/score_chunks.py output, matched by idx; budget already applied "
+        "offline, so --doc_budget_cr must NOT be passed). 'none' keeps the full "
+        "document (current behaviour).",
+    )
+    p.add_argument(
+        "--doc_selection_file",
+        type=str,
+        default="",
+        help="JSONL from tools/score_chunks.py (one line per filtered sample: "
+        '{"idx", "selected_text", ...}). Required — and only valid — with '
+        "--doc_truncation=file. idx = position in the filtered dataset, so this "
+        "eval must use the same dataset/split and filter flags as the scoring run "
+        "(a line-count mismatch fails loudly).",
+    )
+    p.add_argument(
+        "--doc_budget_cr",
+        type=int,
+        default=0,
+        help="Document window budget in decoder tokens: min(ceil(L_enc/N), "
+        "max_vision_len) with L_enc the source length in encoder tokens — i.e. "
+        "exactly the CVLM vision-token budget at compression_rate=N. Required "
+        "(>0) when --doc_truncation != none.",
     )
     p.add_argument("--compute_generation_metrics", action="store_true")
     p.add_argument(
@@ -88,6 +124,14 @@ def parse_args() -> argparse.Namespace:
         "*_samples.json file next to the per-ckpt eval JSON. 0 disables.",
     )
     p.add_argument("--output_json", type=str, default="")
+    p.add_argument(
+        "--dump_per_sample",
+        type=str,
+        default="",
+        help="Path to a JSONL file receiving one line per evaluated sample "
+        "(answer NLL / token counts; plus prediction/reference/rougeL when "
+        "--compute_generation_metrics is set) for bootstrap CIs. '' disables.",
+    )
     p.add_argument("--tensorboard_dir", type=str, default="")
     p.add_argument("--tb_run_name", type=str, default="")
     p.add_argument("--trackio_project", type=str, default=os.environ.get("TRACKIO_PROJECT", "cvlm"))
@@ -116,31 +160,77 @@ def parse_args() -> argparse.Namespace:
         help="Must match training: omit pre-MLP RMSNorm so old checkpoints load without extra keys.",
     )
     p.add_argument(
-        "--vision_backend",
+        "--vit_init",
         type=str,
-        default=os.environ.get("VISION_BACKEND", "vit"),
-        choices=["vit", "random_vit", "none"],
-        help="Must match training: 'vit' (pretrained), 'random_vit' (random weights), "
-        "'none' (bypass ViT transformer). Sizes/loads the model identically to the checkpoint.",
+        choices=["pretrained", "random"],
+        default=os.environ.get("VIT_INIT", "pretrained"),
+        help="Must match training. For 'random' the checkpoint overwrites ViT weights anyway (strict=False), but passing it avoids relying on that.",
     )
     p.add_argument(
-        "--truncate_len",
+        "--vit_num_layers",
         type=int,
-        default=0,
-        help="For --mode baseline_truncate: number of decoder tokens of the context to keep "
-        "(the LAST n tokens; earlier context is discarded). 0 = auto = compression_rate * max_vision_len, "
-        "i.e. matched to the token budget the compressed pipeline would consume.",
+        default=int(os.environ.get("VIT_NUM_LAYERS", "0")),
+        help="POST-BOTTLENECK DEPTH ablation: MUST match training. 0 = full 12-layer ViT; N>0 keeps "
+        "only the first N blocks. A mismatch is caught by the initialization-manifest check (the "
+        "checkpoint would otherwise load into a differently-shaped stack). Env: VIT_NUM_LAYERS.",
+    )
+    p.add_argument(
+        "--freeze_vit",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("FREEZE_VIT", "0") == "1",
+        help="Must match training (frozen ViT weights are absent from the checkpoint and reload from HF).",
+    )
+    p.add_argument(
+        "--no_vit",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("NO_VIT", "0") == "1",
+        help="MUST match training for the no-ViT branch — otherwise eval silently builds a pretrained ViT and runs the latents through it.",
+    )
+    p.add_argument(
+        "--mixer_depth_map",
+        type=str,
+        default=os.environ.get("MIXER_DEPTH_MAP", ""),
+        help="RATE-DEPTH MIXER: MUST match training. Non-empty builds the model with the zero-gated "
+        "mixer stack instead of the ViT; the active depth is looked up from --compression_rate "
+        "(exact key; else nearest LOWER key; else smallest key — e.g. cr=32 with a map up to 16 "
+        "uses the cr=16 depth). Env: MIXER_DEPTH_MAP.",
+    )
+    p.add_argument(
+        "--mask_vit_padding",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("MASK_VIT_PADDING", "0") == "1",
+        help="Must match training. If true, real latent queries cannot attend to padded "
+        "latent slots inside ViT/mixer self-attention. Env: MASK_VIT_PADDING.",
+    )
+    p.add_argument(
+        "--vit_apply_final_layernorm",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("VIT_APPLY_FINAL_LAYERNORM", "1") == "1",
+        help="Must match training. Apply the plain ViT encoder's final LayerNorm. "
+        "Env: VIT_APPLY_FINAL_LAYERNORM.",
+    )
+    p.add_argument(
+        "--compact_decoder_positions",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("COMPACT_DECODER_POSITIONS", "0") == "1",
+        help="Must match training. Derive decoder position_ids from the cumulative "
+        "attention mask so internal masked latent slots do not shift the answer. "
+        "Env: COMPACT_DECODER_POSITIONS.",
+    )
+    p.add_argument(
+        "--force_zero_gates",
+        action="store_true",
+        default=os.environ.get("FORCE_ZERO_GATES", "0") == "1",
+        help="RATE-DEPTH MIXER diagnostic: after loading each checkpoint, zero mixer_gates "
+        "in place so the mixer collapses to the exact depth-0 (no-ViT) path. Compare the "
+        "held-out metrics of the SAME checkpoint with and without this flag: if they do not "
+        "get worse, the trained model was not actually using the extra depth. Requires "
+        "--mixer_depth_map (errors out when the model has no mixer). The output JSON records "
+        "force_zero_gates; the file name is the caller's job. Env: FORCE_ZERO_GATES=1.",
     )
     p.add_argument("--global_step", type=int, default=0)
     p.add_argument("--no_bf16", action="store_true")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument(
-        "--use_chat_template",
-        action="store_true",
-        default=os.environ.get("USE_CHAT_TEMPLATE", "0") == "1",
-        help="Wrap document+question in the decoder chat template and feed the "
-        "assistant-open suffix after the vision block at generation. Must match training.",
-    )
     return p.parse_args()
 
 
@@ -163,7 +253,10 @@ def _encode_source_for_baseline(model: CVLM, source_ids, source_mask):
     """Run the frozen text_encoder + chunked attention pool. Used by baseline_proj.
 
     Uses the model's trained pool_queries so the ablation isolates "ViT vs random
-    linear" rather than mixing in a different pooling rule.
+    linear" rather than mixing in a different pooling rule. Under the --mean_pool
+    arm there are no queries, so the baseline must use the same exact masked mean
+    the model was trained with (otherwise the baseline swaps in a *different*
+    pooling rule and stops being the intended control).
     """
     with torch.no_grad():
         h = model.text_encoder(input_ids=source_ids, attention_mask=source_mask).last_hidden_state
@@ -172,9 +265,165 @@ def _encode_source_for_baseline(model: CVLM, source_ids, source_mask):
         source_mask,
         compression_rate=model.compression_rate,
         max_vision_len=model.max_vision_len,
-        pool_queries=model.pool_queries,
+        pool_queries=None if getattr(model, "mean_pool", False) else model.pool_queries,
     )
     return pooled, vmask
+
+
+# Architecture flags whose value eval MUST reproduce exactly, mapped to
+# (argparse attribute, value assumed when the manifest predates the flag).
+#
+# Deliberately narrow: only flags introduced together with this check, so no
+# already-recorded run can newly fail. Both share the same failure mode — the
+# checkpoint loads cleanly (strict=False, and pool_queries is an allowed missing
+# key) into a DIFFERENT architecture, and the eval silently reports the wrong
+# arm. That exact class of silent swap has already cost us a run once.
+_MANIFEST_GUARDED_FLAGS = {
+    "mean_pool": ("mean_pool", False),
+    "vit_num_layers": ("vit_num_layers", 0),
+}
+
+
+def verify_architecture_against_manifest(
+    checkpoint_path: str,
+    args: argparse.Namespace,
+) -> Optional[dict]:
+    """Fail loudly when eval's architecture flags contradict the training run.
+
+    The training run writes ``initialization_manifest.json`` next to its
+    checkpoints. If it is there, the flags in ``_MANIFEST_GUARDED_FLAGS`` must
+    agree with what this eval was asked to build. Returns the recorded
+    ``architecture`` dict (or None when there is no manifest — pre-manifest runs
+    and ad-hoc checkpoints must keep working).
+    """
+    if not checkpoint_path:
+        return None
+    manifest_path = os.path.join(
+        os.path.dirname(os.path.abspath(checkpoint_path)), "initialization_manifest.json"
+    )
+    if not os.path.exists(manifest_path):
+        print(f"[arch-check] no initialization_manifest.json next to {checkpoint_path}; skipped")
+        return None
+    with open(manifest_path, encoding="utf-8") as handle:
+        architecture = json.load(handle).get("architecture", {}) or {}
+
+    mismatches = []
+    for key, (attr, absent_default) in _MANIFEST_GUARDED_FLAGS.items():
+        recorded = architecture.get(key, absent_default)
+        actual = getattr(args, attr, absent_default)
+        if type(absent_default) is bool:
+            recorded, actual = bool(recorded), bool(actual)
+        else:
+            recorded, actual = int(recorded), int(actual)
+        if recorded != actual:
+            mismatches.append(f"{key}: checkpoint was trained with {recorded!r}, eval got {actual!r}")
+    if mismatches:
+        raise RuntimeError(
+            f"Architecture mismatch against {manifest_path}: "
+            + "; ".join(mismatches)
+            + ". The checkpoint would load into a different model and the metrics would describe "
+            "the wrong arm. Pass the training flags (e.g. --mean_pool 1 / --vit_num_layers N)."
+        )
+    checked = {key: architecture.get(key, default) for key, (_, default) in _MANIFEST_GUARDED_FLAGS.items()}
+    print(f"[arch-check] OK against {manifest_path} ({checked})")
+    return architecture
+
+
+def force_zero_mixer_gates(model: Optional[CVLM]) -> int:
+    """Zero the rate-depth mixer's gates IN PLACE; returns how many were zeroed.
+
+    Collapses ``h <- h + g_i*(Layer_i(h)-h)`` to the identity at every depth, so
+    the vision path becomes byte-for-byte the depth-0 / no-ViT path while every
+    other trained weight (projectors, pool queries, pos-embed, mixer layers)
+    stays exactly as the checkpoint left it. Evaluating one checkpoint both ways
+    answers "does this model actually USE the depth it was given?" without
+    having to interpret the gate magnitudes themselves.
+
+    Raises ValueError when the model has no mixer — silently doing nothing here
+    would produce an eval JSON claiming an ablation that never happened.
+    """
+    gates = getattr(model, "mixer_gates", None) if model is not None else None
+    if gates is None:
+        raise ValueError(
+            "--force_zero_gates requires a model built with the rate-depth mixer "
+            "(pass --mixer_depth_map exactly as used at training time); this model has no "
+            "mixer_gates, so there is nothing to zero."
+        )
+    with torch.no_grad():
+        gates.zero_()
+    return int(gates.numel())
+
+
+class PerSampleDumper:
+    """Streams per-sample eval stats to a JSONL file (--dump_per_sample).
+
+    Teacher-forcing lines ({idx, answer_nll_nats, answer_tokens, correct_tokens})
+    are appended batch-by-batch and flushed, so an interrupted run keeps
+    everything already evaluated. When generation metrics run afterwards,
+    ``merge_generation`` adds prediction/reference/rougeL to the same records
+    and rewrites the file with the merged lines.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.records: list[dict] = []
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self._fh = open(path, "w")
+
+    def add_tf_batch(self, nll: torch.Tensor, n_tokens: torch.Tensor, n_correct: torch.Tensor) -> None:
+        for j in range(nll.size(0)):
+            rec = {
+                "idx": len(self.records),
+                "answer_nll_nats": float(nll[j].item()),
+                "answer_tokens": int(n_tokens[j].item()),
+                "correct_tokens": int(n_correct[j].item()),
+            }
+            self.records.append(rec)
+            self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._fh.flush()
+
+    def merge_generation(
+        self, predictions: list[str], references: list[str], per_sample_rougeL: list[float]
+    ) -> None:
+        n = min(len(self.records), len(predictions), len(references), len(per_sample_rougeL))
+        for j in range(n):
+            self.records[j]["prediction"] = predictions[j]
+            self.records[j]["reference"] = references[j]
+            self.records[j]["rougeL"] = float(per_sample_rougeL[j])
+        self._fh.close()
+        self._fh = open(self.path, "w")
+        for rec in self.records:
+            self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        if not self._fh.closed:
+            self._fh.close()
+
+
+def _dump_tf_batch(
+    dumper: Optional[PerSampleDumper],
+    per_token_loss: torch.Tensor,
+    flat_mask: torch.Tensor,
+    preds: torch.Tensor,
+    answer_labels: torch.Tensor,
+    batch_size: int,
+) -> None:
+    """Reduce one batch's flat per-token losses to per-sample dump stats.
+
+    ``per_token_loss`` / ``flat_mask`` are the flattened shifted tensors the TF
+    loops already compute (loss is 0 at ignore_index positions, and we mask
+    anyway); ``preds`` / ``answer_labels`` are the [B, A] answer-region tensors.
+    """
+    if dumper is None:
+        return
+    loss_2d = per_token_loss.view(batch_size, -1).float()
+    mask_2d = flat_mask.view(batch_size, -1)
+    nll = (loss_2d * mask_2d).sum(dim=1)
+    n_tokens = mask_2d.sum(dim=1)
+    ans_mask = answer_labels != -100
+    n_correct = ((preds == answer_labels) & ans_mask).sum(dim=1)
+    dumper.add_tf_batch(nll, n_tokens, n_correct)
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +438,7 @@ def eval_teacher_forcing_cvlm(
     device: torch.device,
     max_samples: int,
     shuffle_source: bool = False,
+    dumper: Optional[PerSampleDumper] = None,
 ) -> Dict[str, float]:
     """Teacher-forcing eval for CVLM.
 
@@ -260,6 +510,7 @@ def eval_teacher_forcing_cvlm(
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
+        _dump_tf_batch(dumper, per_tok, mask, preds, answer_labels, B)
         n_samples += B
         if 0 < max_samples <= n_samples:
             break
@@ -285,6 +536,7 @@ def eval_teacher_forcing_baseline_llm(
     loader: DataLoader,
     device: torch.device,
     max_samples: int,
+    dumper: Optional[PerSampleDumper] = None,
 ) -> Dict[str, float]:
     """Baseline: prompt tokens + answer tokens into the frozen decoder, no vision span."""
     model.eval()
@@ -333,6 +585,7 @@ def eval_teacher_forcing_baseline_llm(
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
+        _dump_tf_batch(dumper, per_token_loss, mask, preds, answer_labels, B)
         n_samples += B
         if 0 < max_samples <= n_samples:
             break
@@ -356,19 +609,15 @@ def eval_teacher_forcing_baseline_llm_full(
     loader: DataLoader,
     device: torch.device,
     max_samples: int,
-    prompt_key: str = "full_prompt_ids",
-    desc: str = "baseline_llm_full",
+    dumper: Optional[PerSampleDumper] = None,
 ) -> Dict[str, float]:
-    """Uncompressed-text baseline (teacher forcing) over a decoder prompt field.
+    """Oracle baseline: full (document + question) text as the decoder prompt.
 
-    ``prompt_key`` selects which decoder-side prompt to score, so this serves two
-    modes with identical logic:
-      * ``full_prompt_ids``  -> oracle: full (document + question) — upper bound.
-      * ``trunc_prompt_ids`` -> truncation baseline: last-n context + question.
-    No vision span in either case.
+    Uses ``full_prompt_ids`` from the collator (document + blank line + question).
+    No vision span. This is the uncompressed upper bound the CVLM must approach
+    while using far fewer tokens.
     """
     model.eval()
-    mask_key = prompt_key.replace("_ids", "_mask")
     loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
     total_loss = 0.0
     total_correct = 0
@@ -378,15 +627,15 @@ def eval_teacher_forcing_baseline_llm_full(
     max_dec_len = 0
     total_fp_real = 0
 
-    for batch in tqdm(loader, desc=f"eval ({desc})"):
+    for batch in tqdm(loader, desc="eval (baseline_llm_full)"):
         batch = _move(batch, device)
-        if prompt_key not in batch:
+        if "full_prompt_ids" not in batch:
             raise RuntimeError(
-                f"{desc} needs `{prompt_key}` from the collator; "
+                "baseline_llm_full needs `full_prompt_ids` from the collator; "
                 "re-generate the dataset with the updated cvlm_dataset.py."
             )
-        prompt_ids = batch[prompt_key]
-        prompt_mask = batch[mask_key]
+        prompt_ids = batch["full_prompt_ids"]
+        prompt_mask = batch["full_prompt_mask"]
         answer_ids = batch["answer_ids"]
         answer_labels = batch["answer_labels"]
         answer_mask = batch["answer_mask"]
@@ -419,6 +668,7 @@ def eval_teacher_forcing_baseline_llm_full(
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
+        _dump_tf_batch(dumper, per_tok, mask, preds, answer_labels, B)
         n_samples += B
         if 0 < max_samples <= n_samples:
             break
@@ -443,6 +693,7 @@ def eval_teacher_forcing_sft(
     loader: DataLoader,
     device: torch.device,
     max_samples: int,
+    dumper: Optional[PerSampleDumper] = None,
 ) -> Dict[str, float]:
     """SFT-trained decoder eval: same input format as baseline_llm_full
     (`full_prompt_ids` = document + blank line + question, then answer), but
@@ -512,6 +763,7 @@ def eval_teacher_forcing_sft(
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
+        _dump_tf_batch(dumper, per_tok, mask, preds, answer_labels, B)
         n_samples += B
         if 0 < max_samples <= n_samples:
             break
@@ -537,6 +789,7 @@ def eval_teacher_forcing_baseline_proj(
     loader: DataLoader,
     device: torch.device,
     max_samples: int,
+    dumper: Optional[PerSampleDumper] = None,
 ) -> Dict[str, float]:
     """Baseline: text encoder → chunked pool → random linear projection → decoder (skip ViT)."""
     model.eval()
@@ -585,6 +838,7 @@ def eval_teacher_forcing_baseline_proj(
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
+        _dump_tf_batch(dumper, per_token_loss, mask, preds, answer_labels, B)
         n_samples += B
         if 0 < max_samples <= n_samples:
             break
@@ -607,26 +861,6 @@ def eval_teacher_forcing_baseline_proj(
 # ---------------------------------------------------------------------------
 
 
-def _greedy_gen_kwargs(tokenizer) -> dict:
-    """Fully-deterministic decoding kwargs, identical across every eval mode.
-
-    Greedy search (``do_sample=False``, ``num_beams=1``). We explicitly set the
-    sampling knobs to None so a decoder's pretrained ``generation_config``
-    (e.g. SmolLM2-Instruct ships temperature=0.6 / top_p=0.9) cannot leak in and
-    make one mode/ablation non-greedy while another is greedy. ``pad_token_id`` /
-    ``eos_token_id`` are pinned so batched generation stops consistently.
-    """
-    return dict(
-        do_sample=False,
-        num_beams=1,
-        temperature=None,
-        top_p=None,
-        top_k=None,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-    )
-
-
 @torch.no_grad()
 def generate_answers(
     model: Optional[CVLM],
@@ -640,7 +874,7 @@ def generate_answers(
     sft_tokenizer=None,
     num_cached_samples: int = 0,
     encoder_tokenizer=None,
-) -> tuple[list[str], list[str], list[dict], list[list[str]], list[str]]:
+) -> tuple[list[str], list[str], list[dict]]:
     if mode == "sft":
         assert sft_decoder is not None and sft_tokenizer is not None
         sft_decoder.eval()
@@ -649,12 +883,9 @@ def generate_answers(
         assert model is not None
         model.eval()
         tokenizer = model.tokenizer
-    gen_kwargs = _greedy_gen_kwargs(tokenizer)
     predictions: list[str] = []
     references: list[str] = []
     cached_samples: list[dict] = []
-    answers_list: list[list[str]] = []  # raw multi-answers (LongBench)
-    tasks: list[str] = []               # per-sample task name (LongBench)
     n_samples = 0
 
     for batch in tqdm(loader, desc=f"generate ({mode})"):
@@ -679,8 +910,6 @@ def generate_answers(
                 prompt_ids=batch["prompt_ids"],
                 prompt_mask=prompt_mask,
                 max_new_tokens=max_new_tokens,
-                suffix_ids=batch.get("gen_suffix_ids"),
-                suffix_mask=batch.get("gen_suffix_mask"),
             )
         elif mode == "baseline_llm":
             prompt_embs = model.decoder.get_input_embeddings()(batch["prompt_ids"])
@@ -688,7 +917,9 @@ def generate_answers(
                 inputs_embeds=prompt_embs,
                 attention_mask=prompt_mask,
                 max_new_tokens=max_new_tokens,
-                **gen_kwargs,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
             )
         elif mode == "baseline_llm_full":
             fp_ids = batch["full_prompt_ids"]
@@ -698,19 +929,9 @@ def generate_answers(
                 inputs_embeds=prompt_embs,
                 attention_mask=fp_mask,
                 max_new_tokens=max_new_tokens,
-                **gen_kwargs,
-            )
-        elif mode == "baseline_truncate":
-            # No compression: decoder sees the LAST n context tokens as plain
-            # uncompressed text (earlier context discarded), plus the question.
-            tp_ids = batch["trunc_prompt_ids"]
-            tp_mask = batch["trunc_prompt_mask"]
-            prompt_embs = model.decoder.get_input_embeddings()(tp_ids)
-            gen_ids = model.decoder.generate(
-                inputs_embeds=prompt_embs,
-                attention_mask=tp_mask,
-                max_new_tokens=max_new_tokens,
-                **gen_kwargs,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
             )
         elif mode == "sft":
             fp_ids = batch["full_prompt_ids"]
@@ -719,7 +940,9 @@ def generate_answers(
                 input_ids=fp_ids,
                 attention_mask=fp_mask,
                 max_new_tokens=max_new_tokens,
-                **gen_kwargs,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
             )
             # generate() returns the prompt + new tokens; trim the prompt.
             gen_ids = gen_ids[:, fp_ids.size(1) :]
@@ -736,7 +959,9 @@ def generate_answers(
                 inputs_embeds=decoder_input,
                 attention_mask=attn,
                 max_new_tokens=max_new_tokens,
-                **gen_kwargs,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
             )
         else:
             raise ValueError(f"Unknown mode: {mode}")
@@ -753,17 +978,6 @@ def generate_answers(
             ref_texts.append(tokenizer.decode(ref_ids, skip_special_tokens=True))
         references.extend(ref_texts)
 
-        # Raw multi-answer + task passthrough for official LongBench scoring.
-        # Falls back to the single decoded reference for PwC (no such fields).
-        batch_answers = batch.get("answers_text", None)
-        batch_tasks = batch.get("task_name", None)
-        for i in range(B):
-            if batch_answers is not None:
-                answers_list.append([str(a) for a in batch_answers[i]])
-            else:
-                answers_list.append([ref_texts[i]])
-            tasks.append(str(batch_tasks[i]) if batch_tasks is not None else "")
-
         # Cache the first N (document, question, reference, prediction) tuples
         # so eval results are inspectable without re-running generation.
         if num_cached_samples > 0 and len(cached_samples) < num_cached_samples:
@@ -772,29 +986,14 @@ def generate_answers(
             # encoder vocab), else fall back to decoder tokenizer.
             prompt_ids = batch["prompt_ids"]
             prompt_mask = batch["prompt_mask"]
-            # Under the chat template the question lives in the generation suffix
-            # (fed after vision), not in prompt_ids (which is only the
-            # system+user-open header). Prefer the suffix so the dumped question
-            # is the real one; fall back to prompt_ids for the raw path.
-            gs_ids = batch.get("gen_suffix_ids", None)
-            gs_mask = batch.get("gen_suffix_mask", None)
             doc_ids = batch.get("source_ids", None)
             doc_mask = batch.get("source_attention_mask", None)
             doc_tok = encoder_tokenizer if encoder_tokenizer is not None else tokenizer
             for i in range(B):
                 if len(cached_samples) >= num_cached_samples:
                     break
-                if gs_ids is not None and gs_mask is not None:
-                    q_real = gs_ids[i][gs_mask[i].bool()]
-                else:
-                    q_real = prompt_ids[i][prompt_mask[i].bool()]
-                # Dump-only: keep the chat-template control tokens (im_start/
-                # im_end/assistant) visible so the templated protocol is inspectable
-                # in the JSON. Metrics still use the clean ref_texts/pred_texts above.
-                question_text = tokenizer.decode(q_real, skip_special_tokens=False)
-                ref_raw = answer_ids[i][answer_labels[i] != -100]
-                reference_text = tokenizer.decode(ref_raw, skip_special_tokens=False)
-                prediction_text = tokenizer.decode(gen_ids[i], skip_special_tokens=False)
+                q_real = prompt_ids[i][prompt_mask[i].bool()]
+                question_text = tokenizer.decode(q_real, skip_special_tokens=True)
                 if doc_ids is not None and doc_mask is not None:
                     d_real = doc_ids[i][doc_mask[i].bool()]
                     document_text = doc_tok.decode(d_real, skip_special_tokens=True)
@@ -805,8 +1004,8 @@ def generate_answers(
                         "index": n_samples + i,
                         "document": document_text,
                         "question": question_text,
-                        "reference": reference_text,
-                        "prediction": prediction_text,
+                        "reference": ref_texts[i],
+                        "prediction": pred_texts[i],
                     }
                 )
 
@@ -815,17 +1014,15 @@ def generate_answers(
             break
 
     if max_samples > 0:
-        return (
-            predictions[:max_samples],
-            references[:max_samples],
-            cached_samples,
-            answers_list[:max_samples],
-            tasks[:max_samples],
-        )
-    return predictions, references, cached_samples, answers_list, tasks
+        return predictions[:max_samples], references[:max_samples], cached_samples
+    return predictions, references, cached_samples
 
 
-def compute_generation_metrics(predictions: list[str], references: list[str]) -> Dict[str, float]:
+def compute_generation_metrics(
+    predictions: list[str],
+    references: list[str],
+    per_sample_rougeL: Optional[list[float]] = None,
+) -> Dict[str, float]:
     import sacrebleu
     from rouge_score import rouge_scorer
 
@@ -836,6 +1033,8 @@ def compute_generation_metrics(predictions: list[str], references: list[str]) ->
         r1.append(scores["rouge1"].fmeasure)
         r2.append(scores["rouge2"].fmeasure)
         rl.append(scores["rougeL"].fmeasure)
+    if per_sample_rougeL is not None:
+        per_sample_rougeL.extend(rl)
 
     bleu = sacrebleu.corpus_bleu(predictions, [references])
     n_exact = sum(1 for p, r in zip(predictions, references) if p.strip() == r.strip())
@@ -846,127 +1045,6 @@ def compute_generation_metrics(predictions: list[str], references: list[str]) ->
         "bleu4": bleu.score,
         "exact_match": n_exact / len(predictions) if predictions else 0.0,
     }
-
-
-# ---------------------------------------------------------------------------
-# Official LongBench QA scoring (byte-accurate port of THUDM/LongBench)
-#
-# Source: https://github.com/THUDM/LongBench  metrics.py + eval.py
-# We port ONLY the QA subset (qa_f1_score) so the numbers we report match the
-# public leaderboard exactly. Do NOT "improve" these functions — divergence from
-# the reference silently makes our scores incomparable to published results.
-# ---------------------------------------------------------------------------
-
-# The 6 English QA tasks from LongBench v1 that all use qa_f1_score.
-LONGBENCH_QA_TASKS = (
-    "narrativeqa",
-    "qasper",
-    "multifieldqa_en",
-    "hotpotqa",
-    "2wikimqa",
-    "musique",
-)
-
-# Per-task max_new_tokens (dataset2maxlen.json in the reference repo).
-LONGBENCH_QA_MAXLEN = {
-    "narrativeqa": 128,
-    "qasper": 128,
-    "multifieldqa_en": 64,
-    "hotpotqa": 32,
-    "2wikimqa": 32,
-    "musique": 32,
-}
-
-# Official prompt templates (dataset2prompt.json). {context} = document to
-# compress, {input} = question. Byte-accurate copy — do not edit.
-LONGBENCH_QA_PROMPT = {
-    "narrativeqa": "You are given a story, which can be either a novel or a movie script, and a question. Answer the question asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nStory: {context}\n\nNow, answer the question based on the story asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nQuestion: {input}\n\nAnswer:",
-    "qasper": "You are given a scientific article and a question. Answer the question as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write \"unanswerable\". If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". Do not provide any explanation.\n\nArticle: {context}\n\n Answer the question based on the above article as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write \"unanswerable\". If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". Do not provide any explanation.\n\nQuestion: {input}\n\nAnswer:",
-    "multifieldqa_en": "Read the following text and answer briefly.\n\n{context}\n\nNow, answer the following question based on the above text, only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
-    "hotpotqa": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\nAnswer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
-    "2wikimqa": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\nAnswer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
-    "musique": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\nAnswer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
-}
-
-
-def _lb_normalize_answer(s: str) -> str:
-    """Lower text and remove punctuation, articles and extra whitespace."""
-    import re
-    import string
-
-    def remove_articles(text):
-        return re.sub(r"\b(a|an|the)\b", " ", text)
-
-    def white_space_fix(text):
-        return " ".join(text.split())
-
-    def remove_punc(text):
-        exclude = set(string.punctuation)
-        return "".join(ch for ch in text if ch not in exclude)
-
-    def lower(text):
-        return text.lower()
-
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
-
-
-def _lb_f1_score(prediction_tokens: list[str], ground_truth_tokens: list[str]) -> float:
-    from collections import Counter
-
-    common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
-    num_same = sum(common.values())
-    if num_same == 0:
-        return 0.0
-    precision = 1.0 * num_same / len(prediction_tokens)
-    recall = 1.0 * num_same / len(ground_truth_tokens)
-    f1 = (2 * precision * recall) / (precision + recall)
-    return f1
-
-
-def lb_qa_f1_score(prediction: str, ground_truth: str) -> float:
-    normalized_prediction = _lb_normalize_answer(prediction)
-    normalized_ground_truth = _lb_normalize_answer(ground_truth)
-    prediction_tokens = normalized_prediction.split()
-    ground_truth_tokens = normalized_ground_truth.split()
-    return _lb_f1_score(prediction_tokens, ground_truth_tokens)
-
-
-def compute_longbench_metrics(
-    predictions: list[str],
-    answers_list: list[list[str]],
-    tasks: list[str],
-) -> Dict[str, float]:
-    """Official LongBench QA scoring.
-
-    Mirrors ``scorer`` in the reference ``eval.py``:
-      * per sample, take ``max`` of ``qa_f1_score`` over all ground-truth answers;
-      * average per task, then report ``round(100 * mean, 2)``;
-      * the overall LongBench-QA number is the *unweighted mean of per-task
-        scores* (matches how the leaderboard aggregates categories).
-
-    Note: the first-line truncation rule (``prediction.lstrip('\\n').split('\\n')[0]``)
-    in the reference applies only to trec/triviaqa/samsum/lsht — NOT to any QA
-    task — so we intentionally do not apply it here.
-    """
-    per_task_scores: Dict[str, list[float]] = {}
-    for pred, answers, task in zip(predictions, answers_list, tasks):
-        if task not in LONGBENCH_QA_TASKS:
-            continue
-        best = 0.0
-        for gt in answers:
-            best = max(best, lb_qa_f1_score(pred, gt))
-        per_task_scores.setdefault(task, []).append(best)
-
-    out: Dict[str, float] = {}
-    task_means: list[float] = []
-    for task, scores in per_task_scores.items():
-        mean = sum(scores) / len(scores) if scores else 0.0
-        out[f"longbench/{task}"] = round(100.0 * mean, 2)
-        out[f"longbench/{task}_n"] = float(len(scores))
-        task_means.append(mean)
-    if task_means:
-        out["longbench/qa_avg"] = round(100.0 * sum(task_means) / len(task_means), 2)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1083,6 +1161,39 @@ def main() -> None:
             "--all_checkpoints is incompatible with --mode sft: SFT eval uses "
             "--sft_model_path (an HF directory) rather than model_step_*.safetensors."
         )
+    if args.doc_truncation != "none":
+        if args.mode not in ("baseline_llm_full", "sft"):
+            raise ValueError(
+                f"--doc_truncation only applies to modes that consume full_prompt_ids "
+                f"(baseline_llm_full / sft); got --mode {args.mode}"
+            )
+        if args.doc_truncation == "file":
+            if not args.doc_selection_file:
+                raise ValueError("--doc_truncation=file requires --doc_selection_file <score_chunks JSONL>")
+            if args.doc_budget_cr > 0:
+                raise ValueError(
+                    "--doc_truncation=file: the token budget was applied offline by "
+                    "tools/score_chunks.py (--budget_cr); do not pass --doc_budget_cr here."
+                )
+        elif args.doc_budget_cr <= 0:
+            raise ValueError("--doc_truncation != none requires --doc_budget_cr > 0")
+    elif args.doc_budget_cr > 0:
+        raise ValueError("--doc_budget_cr > 0 requires --doc_truncation != none")
+    if args.doc_selection_file and args.doc_truncation != "file":
+        raise ValueError("--doc_selection_file is only valid with --doc_truncation=file")
+    if args.force_zero_gates:
+        # Fail before loading anything: the flag is only meaningful for the modes
+        # that actually run the mixer, and only for mixer-built models.
+        if args.mode not in ("cvlm", "cvlm_shuffle"):
+            raise ValueError(
+                f"--force_zero_gates only applies to modes that run the vision path through the "
+                f"rate-depth mixer (cvlm / cvlm_shuffle); got --mode {args.mode}"
+            )
+        if not str(args.mixer_depth_map or "").strip():
+            raise ValueError(
+                "--force_zero_gates requires --mixer_depth_map (the same map used at training "
+                "time); without it the model is built with a plain ViT and has no gates."
+            )
 
     # Optional per-checkpoint cr lookup: when --cr_schedule is set, each ckpt
     # is evaluated at the cr that produced its weights. Requires --all_checkpoints
@@ -1114,8 +1225,16 @@ def main() -> None:
     model_args.max_vision_len = args.max_vision_len
     model_args.compression_rate = args.compression_rate
     model_args.num_pool_latents = max(int(args.num_pool_latents), 1)
+    model_args.mean_pool = bool(args.mean_pool)
     model_args.projector_use_input_rmsnorm = not bool(args.legacy_projector)
-    model_args.vision_backend = str(args.vision_backend)
+    model_args.vit_init = str(args.vit_init)
+    model_args.vit_num_layers = int(args.vit_num_layers)
+    model_args.vit_freeze = bool(args.freeze_vit)
+    model_args.vit_skip = bool(args.no_vit)
+    model_args.mixer_depth_map = str(args.mixer_depth_map or "")
+    model_args.mask_vit_padding = bool(args.mask_vit_padding)
+    model_args.vit_apply_final_layernorm = bool(args.vit_apply_final_layernorm)
+    model_args.compact_decoder_positions = bool(args.compact_decoder_positions)
 
     training_args = TrainingArguments(output_dir="/tmp/eval_cvlm_dummy")
     training_args.bf16 = bool(use_bf16)
@@ -1143,6 +1262,9 @@ def main() -> None:
         # (encoder tokenizer still comes from text_encoder_name).
         model_args.model_name_or_path = args.sft_model_path
     else:
+        # BEFORE building 1.8B of weights: refuse an eval whose architecture
+        # flags contradict the run that produced the checkpoint.
+        verify_architecture_against_manifest(args.checkpoint_path, args)
         print(f"Loading model ({model_args.model_name_or_path})...")
         model = CVLM(model_args, training_args)
         model.to(device)
@@ -1151,6 +1273,13 @@ def main() -> None:
             print(f"Loading checkpoint: {args.checkpoint_path}")
             state_dict = load_file(args.checkpoint_path)
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            validate_partial_checkpoint_load(
+                model,
+                missing,
+                unexpected,
+                args.checkpoint_path,
+                allowed_missing_trainable={"pool_queries"},
+            )
             print(f"  loaded; missing={len(missing)} unexpected={len(unexpected)}")
 
         model.eval()
@@ -1183,61 +1312,21 @@ def main() -> None:
     collate = make_collate_fn(dec_pad_id=dec_pad, enc_pad_id=enc_pad)
 
     max_source_len = args.max_source_len if args.max_source_len > 0 else args.compression_rate * args.max_vision_len
-
-    # Truncation baseline budget (decoder tokens). Only build the field for the
-    # baseline_truncate mode. 0 => auto = compression_rate * max_vision_len, so
-    # the truncated context is matched to the compressed pipeline's token budget.
-    truncate_len = 0
-    if args.mode == "baseline_truncate":
-        truncate_len = args.truncate_len if args.truncate_len > 0 else args.compression_rate * args.max_vision_len
-        print(f"baseline_truncate: decoder keeps the LAST {truncate_len} context tokens.")
-
-    longbench_task = args.longbench_task.strip()
-    if longbench_task:
-        if longbench_task not in LONGBENCH_QA_TASKS:
-            raise ValueError(
-                f"--longbench_task must be one of {LONGBENCH_QA_TASKS}, got {longbench_task!r}"
-            )
-        # Official per-task decode budget; overrides --max_new_tokens so numbers
-        # match the leaderboard exactly.
-        args.max_new_tokens = LONGBENCH_QA_MAXLEN[longbench_task]
-        print(
-            f"LongBench eval: task={longbench_task}, template=official, "
-            f"max_new_tokens={args.max_new_tokens}, all samples kept."
-        )
-        dataset = CvlmTrainDataset(
-            hf_dataset_name=args.dataset_name,
-            hf_split=args.dataset_split,
-            decoder_tokenizer_name=model_args.model_name_or_path,
-            encoder_tokenizer_name=model_args.text_encoder_name,
-            max_prompt_len=args.max_prompt_len,
-            max_answer_len=args.max_answer_len,
-            max_source_len=max_source_len,
-            max_samples=args.max_samples,
-            hf_config=longbench_task,
-            source_col="context",
-            prompt_col="input",
-            answer_col="answers",
-            task_col="dataset",
-            prompt_template=LONGBENCH_QA_PROMPT[longbench_task],
-            multi_answer=True,
-            disable_length_filter=True,
-            truncate_len=truncate_len,
-            use_chat_template=args.use_chat_template,
-        )
-    else:
-        dataset = CvlmTrainDataset(
-            hf_dataset_name=args.dataset_name,
-            hf_split=args.dataset_split,
-            decoder_tokenizer_name=model_args.model_name_or_path,
-            encoder_tokenizer_name=model_args.text_encoder_name,
-            max_prompt_len=args.max_prompt_len,
-            max_answer_len=args.max_answer_len,
-            max_source_len=max_source_len,
-            max_samples=args.max_samples,
-            truncate_len=truncate_len,
-            use_chat_template=args.use_chat_template,
-        )
+    dataset = CvlmTrainDataset(
+        hf_dataset_name=args.dataset_name,
+        hf_split=args.dataset_split,
+        decoder_tokenizer_name=model_args.model_name_or_path,
+        encoder_tokenizer_name=model_args.text_encoder_name,
+        max_prompt_len=args.max_prompt_len,
+        max_answer_len=args.max_answer_len,
+        max_source_len=max_source_len,
+        max_samples=args.max_samples,
+        doc_truncation=args.doc_truncation,
+        doc_budget_cr=args.doc_budget_cr,
+        doc_budget_cap=args.max_vision_len,
+        doc_truncation_seed=args.seed,
+        doc_selection_file=args.doc_selection_file,
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -1307,9 +1396,19 @@ def main() -> None:
             "max_answer_len": args.max_answer_len,
             "max_vision_len": args.max_vision_len,
             "max_source_len": args.max_source_len,
+            "doc_truncation": args.doc_truncation,
+            "doc_budget_cr": int(args.doc_budget_cr),
+            "doc_selection_file": args.doc_selection_file,
             "checkpoint_path": getattr(args, "checkpoint_path", "") or getattr(args, "sft_model_path", ""),
             "global_step": int(args.global_step),
             "all_checkpoints": bool(args.all_checkpoints),
+            "mean_pool": bool(args.mean_pool),
+            "vit_num_layers": int(args.vit_num_layers),
+            "mixer_depth_map": str(args.mixer_depth_map or ""),
+            "mask_vit_padding": bool(args.mask_vit_padding),
+            "vit_apply_final_layernorm": bool(args.vit_apply_final_layernorm),
+            "compact_decoder_positions": bool(args.compact_decoder_positions),
+            "force_zero_gates": bool(args.force_zero_gates),
         }
         run = TrackioRun(
             project=args.trackio_project,
@@ -1344,8 +1443,21 @@ def main() -> None:
             assert model is not None
             state_dict = load_file(ckpt_path)
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            validate_partial_checkpoint_load(
+                model,
+                missing,
+                unexpected,
+                ckpt_path,
+                allowed_missing_trainable={"pool_queries"},
+            )
             print(f"  loaded; missing={len(missing)} unexpected={len(unexpected)}")
             model.eval()
+
+        if args.force_zero_gates:
+            # AFTER the checkpoint load (the checkpoint carries the trained
+            # gates), and re-applied for every checkpoint in --all_checkpoints.
+            n_gates = force_zero_mixer_gates(model)
+            print(f"  [force_zero_gates] zeroed {n_gates} mixer gate(s) -> exact depth-0 (no-ViT) path")
 
         # Per-ckpt cr: look up training cr from schedule, set model accordingly,
         # and pull (or compute) compression stats for this cr.
@@ -1359,31 +1471,42 @@ def main() -> None:
             eval_cr = int(args.compression_rate)
         assert comp_stats is not None
 
+        # Per-sample JSONL dump for bootstrap CIs. With --all_checkpoints each
+        # checkpoint gets its own file (same suffix scheme as --output_json).
+        dumper: Optional[PerSampleDumper] = None
+        if args.dump_per_sample:
+            if args.all_checkpoints:
+                dbase, dext = os.path.splitext(args.dump_per_sample)
+                dext = dext or ".jsonl"
+                if cr_schedule is not None:
+                    dump_path = f"{dbase}_native_step{ckpt_step}{dext}"
+                else:
+                    dump_path = f"{dbase}_step{ckpt_step}{dext}"
+            else:
+                dump_path = args.dump_per_sample
+            dumper = PerSampleDumper(dump_path)
+
         print(f"\n=== Teacher-forcing evaluation (mode={args.mode}, step={ckpt_step}) ===")
         if args.mode == "cvlm":
             assert model is not None
-            tf_metrics = eval_teacher_forcing_cvlm(model, loader, device, args.max_samples)
+            tf_metrics = eval_teacher_forcing_cvlm(model, loader, device, args.max_samples, dumper=dumper)
         elif args.mode == "cvlm_shuffle":
             assert model is not None
-            tf_metrics = eval_teacher_forcing_cvlm(model, loader, device, args.max_samples, shuffle_source=True)
+            tf_metrics = eval_teacher_forcing_cvlm(
+                model, loader, device, args.max_samples, shuffle_source=True, dumper=dumper
+            )
         elif args.mode == "baseline_llm":
             assert model is not None
-            tf_metrics = eval_teacher_forcing_baseline_llm(model, loader, device, args.max_samples)
+            tf_metrics = eval_teacher_forcing_baseline_llm(model, loader, device, args.max_samples, dumper=dumper)
         elif args.mode == "baseline_llm_full":
             assert model is not None
-            tf_metrics = eval_teacher_forcing_baseline_llm_full(model, loader, device, args.max_samples)
-        elif args.mode == "baseline_truncate":
-            assert model is not None
-            tf_metrics = eval_teacher_forcing_baseline_llm_full(
-                model, loader, device, args.max_samples,
-                prompt_key="trunc_prompt_ids", desc="baseline_truncate",
-            )
+            tf_metrics = eval_teacher_forcing_baseline_llm_full(model, loader, device, args.max_samples, dumper=dumper)
         elif args.mode == "baseline_proj":
             assert model is not None and proj is not None
-            tf_metrics = eval_teacher_forcing_baseline_proj(model, proj, loader, device, args.max_samples)
+            tf_metrics = eval_teacher_forcing_baseline_proj(model, proj, loader, device, args.max_samples, dumper=dumper)
         elif args.mode == "sft":
             assert sft_decoder is not None
-            tf_metrics = eval_teacher_forcing_sft(sft_decoder, loader, device, args.max_samples)
+            tf_metrics = eval_teacher_forcing_sft(sft_decoder, loader, device, args.max_samples, dumper=dumper)
         else:
             raise ValueError(f"Unknown mode: {args.mode}")
 
@@ -1429,7 +1552,7 @@ def main() -> None:
                 enc_tok_for_cache = enc_tok_for_pad  # already loaded above for SFT
             elif model is not None:
                 enc_tok_for_cache = getattr(model, "encoder_tokenizer", None)
-            preds, refs, cached_samples, answers_list, tasks = generate_answers(
+            preds, refs, cached_samples = generate_answers(
                 model,
                 loader,
                 device,
@@ -1442,20 +1565,30 @@ def main() -> None:
                 num_cached_samples=max(int(args.num_cached_samples), 0),
                 encoder_tokenizer=enc_tok_for_cache,
             )
-            gen_metrics = compute_generation_metrics(preds, refs)
+            per_sample_rl: list[float] = []
+            gen_metrics = compute_generation_metrics(
+                preds, refs, per_sample_rougeL=per_sample_rl if dumper is not None else None
+            )
+            if dumper is not None:
+                dumper.merge_generation(preds, refs, per_sample_rl)
             print(f"  ROUGE-1:       {gen_metrics['rouge1']:.4f}")
             print(f"  ROUGE-2:       {gen_metrics['rouge2']:.4f}")
             print(f"  ROUGE-L:       {gen_metrics['rougeL']:.4f}")
             print(f"  BLEU-4:        {gen_metrics['bleu4']:.2f}")
             print(f"  Exact Match:   {gen_metrics['exact_match']:.4f}")
 
-            # Official LongBench QA scoring (only when evaluating a LB subtask).
-            if longbench_task:
-                lb_metrics = compute_longbench_metrics(preds, answers_list, tasks)
-                gen_metrics.update(lb_metrics)
-                for k, v in lb_metrics.items():
-                    if not k.endswith("_n"):
-                        print(f"  {k}: {v}")
+        if dumper is not None:
+            dumper.close()
+            print(f"  wrote per-sample dump: {dumper.path} ({len(dumper.records)} lines)")
+
+        # oracle_hit_rate: fraction of evaluated samples whose answer (or an
+        # 8-gram of it) was found verbatim in the document. Only meaningful for
+        # --doc_truncation oracle; null in the JSON otherwise.
+        oracle_hit_rate: Optional[float] = None
+        if args.doc_truncation == "oracle":
+            hits = dataset._oracle_hits
+            oracle_hit_rate = sum(1 for h in hits.values() if h) / max(len(hits), 1)
+            print(f"  oracle_hit_rate: {oracle_hit_rate:.4f} ({len(hits)} samples)")
 
         results = {
             **tf_metrics,
@@ -1464,6 +1597,17 @@ def main() -> None:
             "bits_per_source_token": bps,
             "effective_context_reduction": eff_reduction,
             "compression_rate": int(eval_cr),
+            "doc_truncation": args.doc_truncation,
+            "doc_budget_cr": int(args.doc_budget_cr),
+            "doc_selection_file": args.doc_selection_file,
+            "oracle_hit_rate": oracle_hit_rate,
+            "mean_pool": bool(args.mean_pool),
+            "vit_num_layers": int(args.vit_num_layers),
+            "mixer_depth_map": str(args.mixer_depth_map or ""),
+            "mask_vit_padding": bool(args.mask_vit_padding),
+            "vit_apply_final_layernorm": bool(args.vit_apply_final_layernorm),
+            "compact_decoder_positions": bool(args.compact_decoder_positions),
+            "force_zero_gates": bool(args.force_zero_gates),
         }
         last_results = results
 

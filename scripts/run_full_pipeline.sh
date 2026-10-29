@@ -53,6 +53,11 @@ MAX_SAMPLES="${MAX_SAMPLES:-0}"            # cap HF dataset rows; 0 = all
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
 LOG_INTERVAL="${LOG_INTERVAL:-10}"
 SAVE_INTERVAL_STEPS="${SAVE_INTERVAL_STEPS:-0}"
+# Mechanistic audit artifacts: a fixed tokenized probe and the exact step-0
+# compression-path weights. These make CKA/weight-drift analysis possible from
+# saved checkpoints without recreating the dataset or random initialization.
+MECHANISTIC_PROBE_SAMPLES="${MECHANISTIC_PROBE_SAMPLES:-16}"
+SAVE_MECHANISTIC_INIT="${SAVE_MECHANISTIC_INIT:-1}"
 NPROC="${NPROC:-1}"
 # Linear warmup stabilises the first ~100 optimizer steps. With the projectors
 # + ViT freshly initialised, early grad norms can spike above 100; without
@@ -62,13 +67,10 @@ WARMUP_STEPS="${WARMUP_STEPS:-100}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-1}"
 UNFREEZE_ENCODER_TOP_K="${UNFREEZE_ENCODER_TOP_K:-22}"   # 0 = encoder fully frozen; >0 unfreezes top-K layers + final_norm, 22 == fully unreeze for ModerBert
 NUM_POOL_LATENTS="${NUM_POOL_LATENTS:-4}"                # K learnable queries per chunk for the attention pool; K>1 = Perceiver-style multi-query pool whose K outputs are mean-pooled to 1 vision token per chunk
-
-# Vision-stage ablation (must match at train and eval). One run per backend —
-# launch each with its own OUTPUT_DIR.
-#   vit        = pretrained ViT (default / base setup for comparison)
-#   random_vit = same architecture, random weights (isolates pretrained prior)
-#   none       = bypass the ViT transformer+layernorm (isolates ViT computation)
-VISION_BACKEND="${VISION_BACKEND:-vit}"
+# MEANPOOL ABLATION (MeanPool+Project): 1 = the chunk pool is an EXACT masked
+# mean with no learnable part (pool_queries stays allocated but frozen at zero).
+# Passed to BOTH train and eval — a mismatch silently evaluates a different pool.
+MEAN_POOL="${MEAN_POOL:-0}"
 
 # 1 = plain projectors (no input_norm.* in safetensors — old runs before RMSNorm)
 LEGACY_PROJECTOR="${LEGACY_PROJECTOR:-0}"
@@ -76,12 +78,57 @@ export LEGACY_PROJECTOR
 
 CR_SCHEDULE="${CR_SCHEDULE:-1:6000,2:12000,4:18000,8:24000,16:0}"   # empty = static cr from COMPRESSION_RATE
 DISABLE_LR_SCHEDULE="${DISABLE_LR_SCHEDULE:-1}"   # 1 = constant LR after warmup (no cosine decay)
-USE_CHAT_TEMPLATE="${USE_CHAT_TEMPLATE:-1}"   # 1 = wrap doc+question+answer in the decoder chat template (train + eval must match)
 
+# NUMERICAL-PRECISION control. 1 = AdamW keeps fp32 master copies of the bf16
+# trainable weights (params stay bf16 for forward/backward; updates smaller than
+# half a bf16 ULP accumulate in the master instead of being rounded away). With
+# 0 (legacy) an update of size ~lr=1e-4 cannot move a ~1.0-magnitude pretrained
+# ViT weight at all, which confounds the pretrained-vs-random comparison.
+FP32_MASTER_WEIGHTS="${FP32_MASTER_WEIGHTS:-0}"
+# Scope of that treatment: all = every low-precision trainable tensor (~1.84B
+# params here — the decoder IS trainable — i.e. ~20.5 GiB of extra optimizer
+# state and four sub-modules changing numerics at once); vision = ONLY the
+# ViT/mixer stack (~86M, ~1.0 GiB), the isolated control.
+FP32_MASTER_SCOPE="${FP32_MASTER_SCOPE:-all}"
+
+# ViT ablation branch (prior study): VIT_INIT=pretrained|random, FREEZE_VIT=0|1, NO_VIT=0|1.
+VIT_INIT="${VIT_INIT:-pretrained}"
+FREEZE_VIT="${FREEZE_VIT:-0}"
+NO_VIT="${NO_VIT:-0}"
+# POST-BOTTLENECK DEPTH: 0 = the full 12-layer ViT; N>0 keeps only the first N
+# blocks (same block type / init draw / final LayerNorm as the 12-layer arm, so
+# a 0/N/12 curve differs in depth ONLY). Passed to BOTH train and eval.
+VIT_NUM_LAYERS="${VIT_NUM_LAYERS:-0}"
+
+# RATE-DEPTH MIXER: non-empty "cr:depth,..." map replaces the ViT with a stack
+# of zero-gated ViTLayer blocks (depth per compression rate). Passed to BOTH
+# train and eval. Incompatible with NO_VIT/FREEZE_VIT/VIT_INIT=random.
+MIXER_DEPTH_MAP="${MIXER_DEPTH_MAP:-}"
+# Padding-safe ViT/mixer attention. Keep 0 only for exact reproduction of the
+# legacy unmasked runs; new controlled experiments should set 1 for every arm.
+MASK_VIT_PADDING="${MASK_VIT_PADDING:-0}"
+# Plain ViTModel applies a final LayerNorm after encoder.layer; the bare mixer
+# stack does not. Set 0 for a direct-vs-zero-gated control with matched blocks.
+VIT_APPLY_FINAL_LAYERNORM="${VIT_APPLY_FINAL_LAYERNORM:-1}"
+# Compact decoder positions across left-padding and internal masked latent
+# slots. Generation already does this; enabling it aligns teacher forcing.
+COMPACT_DECODER_POSITIONS="${COMPACT_DECODER_POSITIONS:-0}"
+# MIXED-CR training: non-empty whitespace-separated cr set (e.g. "1 2 4 8 16")
+# samples one cr per optimizer step from a balanced deterministic sequence.
+# Replaces the CR_SCHEDULE curriculum (an empty --cr_schedule is forced below).
+MIXED_CR_SET="${MIXED_CR_SET:-}"
+
+# Optional short tag baked into the default run-dir name (e.g. abl_randomvit).
+RUN_TAG="${RUN_TAG:-cvlm}"
+# Root for run dirs; override RUNS_ROOT or the full OUTPUT_DIR.
+RUNS_ROOT="${RUNS_ROOT:-${ROOT}/runs}"
 # Output dir — default name embeds main hyperparameters for easy A/B comparison.
 # Override by exporting OUTPUT_DIR=/abs/path before running the script.
-OUTPUT_DIR="${OUTPUT_DIR:-/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_$(date +%Y%m%d_%H%M%S)_layer_norm_cr${COMPRESSION_RATE}_vl${MAX_VISION_LEN}_sl${MAX_SOURCE_LEN}_bs${BATCH_SIZE}_lr${LR}_ep${EPOCHS}_gc${GRADIENT_CHECKPOINTING}_unfrzed${UNFREEZE_ENCODER_TOP_K}_lt${NUM_POOL_LATENTS}}"
-# OUTPUT_DIR=/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_20260515_231650_vit_large_cr1_vl1024_sl0_bs64_lr1e-4_ep10_gc1_unfrzed22_lt4
+OUTPUT_DIR="${OUTPUT_DIR:-${RUNS_ROOT}/run_$(date +%Y%m%d_%H%M%S)_${RUN_TAG}_cr${COMPRESSION_RATE}_vl${MAX_VISION_LEN}_sl${MAX_SOURCE_LEN}_bs${BATCH_SIZE}_lr${LR}_ep${EPOCHS}_gc${GRADIENT_CHECKPOINTING}_unfrzed${UNFREEZE_ENCODER_TOP_K}_lt${NUM_POOL_LATENTS}}"
+
+# Resume: export RESUME_DIR=/abs/path/to/run to continue from its latest
+# checkpoint pair (needed to survive partition walltime limits).
+RESUME_DIR="${RESUME_DIR:-}"
 
 # Eval
 EVAL_SPLIT="${EVAL_SPLIT:-test}"          # use 'test' once you have one
@@ -95,19 +142,11 @@ EVAL_COMPUTE_GEN="${EVAL_COMPUTE_GEN:-1}"  # 1 = run ROUGE / BLEU generation met
 NUM_CACHED_SAMPLES="${NUM_CACHED_SAMPLES:-16}"   # N decoded {doc,q,ref,pred} tuples dumped per ckpt next to eval JSON; 0 disables
 EVAL_ALL_CHECKPOINTS="${EVAL_ALL_CHECKPOINTS:-1}"  # 1 = sweep every model_step_*.safetensors
 EVAL_CR_SCHEDULE="${EVAL_CR_SCHEDULE:-1:6000,2:12000,4:18000,8:24000,16:0}"           # if set + EVAL_ALL_CHECKPOINTS=1, eval each ckpt at the cr that trained it
-
-# --- LongBench QA eval (eval-only; official leaderboard qa_f1_score) ---
-# Runs after the PwC eval. Loops the QA subtasks x EVAL_MODES against
-# THUDM/LongBench (test split), applying the official prompt template and
-# per-task max_new_tokens. No sample is dropped: LB_MAX_SOURCE_LEN must be large
-# enough to hold the longest document (documents are truncated to it only at the
-# encoder). Set LONGBENCH_EVAL=0 to skip.
-LONGBENCH_EVAL="${LONGBENCH_EVAL:-1}"
-LONGBENCH_DATASET="${LONGBENCH_DATASET:-THUDM/LongBench}"
-LONGBENCH_SPLIT="${LONGBENCH_SPLIT:-test}"
-LONGBENCH_TASKS="${LONGBENCH_TASKS:-narrativeqa qasper multifieldqa_en hotpotqa 2wikimqa musique}"
-LB_MAX_SOURCE_LEN="${LB_MAX_SOURCE_LEN:-32768}"   # encoder-side truncation cap; keep every eval sample
-LB_MAX_PROMPT_LEN="${LB_MAX_PROMPT_LEN:-2048}"    # template wrapper + question fit uncompressed
+if [[ -n "${MIXED_CR_SET}" ]]; then
+  # Mixed-cr training has no per-step "which cr trained this checkpoint"
+  # mapping, so the native-cr eval sweep would be wrong — force it off.
+  EVAL_CR_SCHEDULE=""
+fi
 
 # trackio (replaces TensorBoard for the live UI)
 TRACKIO_PROJECT="${TRACKIO_PROJECT:-cvlm}"
@@ -124,18 +163,9 @@ else
 fi
 
 TB_DIR="${OUTPUT_DIR}/tb"
-# Log directory is overridable (LOG_DIR). Default keeps the log next to the
-# checkpoints as pipeline.log (unchanged). When LOG_DIR is set to a shared dir,
-# the file is prefixed with the run name so parallel ablations don't clobber
-# each other's logs.
-if [[ -n "${LOG_DIR:-}" && "${LOG_DIR}" != "${OUTPUT_DIR}" ]]; then
-  LOG_FILE="${LOG_DIR}/$(basename "${OUTPUT_DIR}").pipeline.log"
-else
-  LOG_DIR="${OUTPUT_DIR}"
-  LOG_FILE="${OUTPUT_DIR}/pipeline.log"
-fi
+LOG_FILE="${OUTPUT_DIR}/pipeline.log"
 
-mkdir -p "${OUTPUT_DIR}" "${TB_DIR}" "${LOG_DIR}"
+mkdir -p "${OUTPUT_DIR}" "${TB_DIR}"
 
 # Tee everything to a log file so you can `tail -f` it from another shell.
 exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -151,15 +181,27 @@ echo "  MAX_VISION_LEN    = ${MAX_VISION_LEN}"
 echo "  MAX_SOURCE_LEN    = ${MAX_SOURCE_LEN} (0 = cr*max_vision_len)"
 echo "  COMPRESSION_RATE  = ${COMPRESSION_RATE}"
 echo "  MAX_SAMPLES       = ${MAX_SAMPLES} (0 = all)"
+echo "  MECHANISTIC_PROBE_SAMPLES = ${MECHANISTIC_PROBE_SAMPLES}"
+echo "  SAVE_MECHANISTIC_INIT = ${SAVE_MECHANISTIC_INIT}"
 echo "  ENABLE_WARMUP     = ${ENABLE_WARMUP} (steps=${WARMUP_STEPS})"
 echo "  GRADIENT_CHECKPOINTING = ${GRADIENT_CHECKPOINTING}"
 echo "  UNFREEZE_ENCODER_TOP_K = ${UNFREEZE_ENCODER_TOP_K}"
 echo "  NUM_POOL_LATENTS  = ${NUM_POOL_LATENTS}"
-echo "  VISION_BACKEND    = ${VISION_BACKEND}"
+echo "  MEAN_POOL         = ${MEAN_POOL}"
+echo "  VIT_INIT          = ${VIT_INIT}"
+echo "  VIT_NUM_LAYERS    = ${VIT_NUM_LAYERS} (0 = all)"
+echo "  FREEZE_VIT        = ${FREEZE_VIT}"
+echo "  NO_VIT            = ${NO_VIT}"
+echo "  MIXER_DEPTH_MAP   = ${MIXER_DEPTH_MAP:-<off>}"
+echo "  MASK_VIT_PADDING  = ${MASK_VIT_PADDING}"
+echo "  VIT_APPLY_FINAL_LAYERNORM = ${VIT_APPLY_FINAL_LAYERNORM}"
+echo "  COMPACT_DECODER_POSITIONS = ${COMPACT_DECODER_POSITIONS}"
+echo "  MIXED_CR_SET      = ${MIXED_CR_SET:-<off>}"
+echo "  FP32_MASTER_WEIGHTS = ${FP32_MASTER_WEIGHTS} (scope=${FP32_MASTER_SCOPE})"
+echo "  RESUME_DIR        = ${RESUME_DIR:-<none>}"
 echo "  LEGACY_PROJECTOR  = ${LEGACY_PROJECTOR}"
 echo "  CR_SCHEDULE       = ${CR_SCHEDULE:-<static>}"
 echo "  DISABLE_LR_SCHEDULE = ${DISABLE_LR_SCHEDULE}"
-echo "  USE_CHAT_TEMPLATE = ${USE_CHAT_TEMPLATE}"
 echo "  EVAL_MODES        = ${EVAL_MODES}"
 echo "  EVAL_COMPUTE_GEN  = ${EVAL_COMPUTE_GEN}"
 echo "  NUM_CACHED_SAMPLES   = ${NUM_CACHED_SAMPLES}"
@@ -173,6 +215,31 @@ echo "  TRACKIO_SPACE_ID  = ${TRACKIO_SPACE_ID:-<local-only>}"
 echo "  TRACKIO_DISABLE   = ${TRACKIO_DISABLE}"
 echo "  SKIP_TRAIN        = ${SKIP_TRAIN:-0}  (set EVAL_ONLY=1 or SKIP_TRAIN=1 for eval-only)"
 echo "======================================================================"
+# Resolved architecture flags on disk, independent of any sbatch wrapper: these
+# are the values THIS invocation actually forwards to train_cvlm/eval_cvlm, so a
+# run directory always carries the arm it really ran (env vars read directly by
+# python would otherwise leave no artifact).
+{
+  echo "MEAN_POOL=${MEAN_POOL}"
+  echo "VIT_NUM_LAYERS=${VIT_NUM_LAYERS}"
+  echo "VIT_INIT=${VIT_INIT}"
+  echo "FREEZE_VIT=${FREEZE_VIT}"
+  echo "NO_VIT=${NO_VIT}"
+  echo "MIXER_DEPTH_MAP=${MIXER_DEPTH_MAP}"
+  echo "MASK_VIT_PADDING=${MASK_VIT_PADDING}"
+  echo "VIT_APPLY_FINAL_LAYERNORM=${VIT_APPLY_FINAL_LAYERNORM}"
+  echo "COMPACT_DECODER_POSITIONS=${COMPACT_DECODER_POSITIONS}"
+  echo "NUM_POOL_LATENTS=${NUM_POOL_LATENTS}"
+  echo "CR_SCHEDULE=${CR_SCHEDULE}"
+  echo "MIXED_CR_SET=${MIXED_CR_SET}"
+  echo "COMPRESSION_RATE=${COMPRESSION_RATE}"
+  echo "EPOCHS=${EPOCHS}"
+  echo "BATCH_SIZE=${BATCH_SIZE}"
+  echo "GRAD_ACCUM=${GRAD_ACCUM}"
+  echo "LR=${LR}"
+  echo "SEED=${SEED:-42}"
+} > "${OUTPUT_DIR}/PIPELINE_FLAGS"
+
 echo "trackio UI:   trackio show --project ${TRACKIO_PROJECT}"
 echo "(or set TRACKIO_SPACE_ID=user/space to host on HF Spaces)"
 echo "======================================================================"
@@ -201,22 +268,45 @@ run_train() {
     --gradient_accumulation_steps "${GRAD_ACCUM}"
     --log_interval "${LOG_INTERVAL}"
     --save_interval_steps "${SAVE_INTERVAL_STEPS}"
+    --mechanistic_probe_samples "${MECHANISTIC_PROBE_SAMPLES}"
+    --save_mechanistic_init "${SAVE_MECHANISTIC_INIT}"
     --tensorboard_dir "${TB_DIR}/train"
     --gradient_checkpointing "${GRADIENT_CHECKPOINTING}"
     --unfreeze_encoder_top_k "${UNFREEZE_ENCODER_TOP_K}"
     --num_pool_latents "${NUM_POOL_LATENTS}"
-    --vision_backend "${VISION_BACKEND}"
-    --cr_schedule "${CR_SCHEDULE}"
+    --mean_pool "${MEAN_POOL}"
     --disable_lr_schedule "${DISABLE_LR_SCHEDULE}"
+    --vit_init "${VIT_INIT}"
+    --vit_num_layers "${VIT_NUM_LAYERS}"
+    --freeze_vit "${FREEZE_VIT}"
+    --no_vit "${NO_VIT}"
+    --mask_vit_padding "${MASK_VIT_PADDING}"
+    --vit_apply_final_layernorm "${VIT_APPLY_FINAL_LAYERNORM}"
+    --compact_decoder_positions "${COMPACT_DECODER_POSITIONS}"
+    --fp32_master_weights "${FP32_MASTER_WEIGHTS}"
+    --fp32_master_scope "${FP32_MASTER_SCOPE}"
+    --seed "${SEED:-42}"
   )
+  if [[ -n "${MIXED_CR_SET}" ]]; then
+    # Mixed-cr replaces the stage curriculum. --cr_schedule "" is passed
+    # EXPLICITLY (not just omitted) so an exported CR_SCHEDULE env var cannot
+    # leak back in through the argparse env-default and trip the
+    # mixed_cr_set/cr_schedule incompatibility check.
+    TRAIN_ARGS+=( --mixed_cr_set "${MIXED_CR_SET}" --cr_schedule "" )
+  else
+    TRAIN_ARGS+=( --cr_schedule "${CR_SCHEDULE}" )
+  fi
+  if [[ -n "${MIXER_DEPTH_MAP}" ]]; then
+    TRAIN_ARGS+=( --mixer_depth_map "${MIXER_DEPTH_MAP}" )
+  fi
   if [[ "${LEGACY_PROJECTOR}" == "1" ]]; then
     TRAIN_ARGS+=( --legacy_projector true )
   fi
-  if [[ "${USE_CHAT_TEMPLATE}" == "1" ]]; then
-    TRAIN_ARGS+=( --use_chat_template )
-  fi
   if [[ "${ENABLE_WARMUP}" == "1" ]]; then
     TRAIN_ARGS+=( --enable_warmup --warmup_steps "${WARMUP_STEPS}" )
+  fi
+  if [[ -n "${RESUME_DIR}" ]]; then
+    TRAIN_ARGS+=( --resume_dir "${RESUME_DIR}" )
   fi
   if [[ "${NPROC}" -gt 1 ]]; then
     torchrun --nproc_per_node="${NPROC}" "${TRAIN_ARGS[@]}"
@@ -228,10 +318,10 @@ run_train() {
 SKIP_TRAIN="${SKIP_TRAIN:-0}"
 if [[ "${SKIP_TRAIN}" == "1" ]]; then
   echo; echo "===== Step 1/2: SKIPPED (eval-only) ====="
-elif compgen -G "${OUTPUT_DIR}/model_step_"*.safetensors >/dev/null 2>&1; then
+elif [[ -z "${RESUME_DIR}" ]] && compgen -G "${OUTPUT_DIR}/model_step_"*.safetensors >/dev/null 2>&1; then
   echo "ERROR: checkpoints already exist in OUTPUT_DIR=${OUTPUT_DIR}" >&2
   echo "  Refusing to train into an existing run. Use EVAL_ONLY=1 or SKIP_TRAIN=1 for eval," >&2
-  echo "  or set OUTPUT_DIR to a new directory to train from scratch." >&2
+  echo "  set RESUME_DIR=${OUTPUT_DIR} to continue it, or point OUTPUT_DIR at a new directory." >&2
   exit 1
 else
   run_train
@@ -263,7 +353,7 @@ for MODE in ${EVAL_MODES}; do
     --vision_encoder_name "${VISION_ENCODER_NAME}"
     --compression_rate "${COMPRESSION_RATE}"
     --num_pool_latents "${NUM_POOL_LATENTS}"
-    --vision_backend "${VISION_BACKEND}"
+    --mean_pool "${MEAN_POOL}"
     --mode "${MODE}"
     --max_samples "${EVAL_MAX_SAMPLES}"
     --batch_size "${EVAL_BATCH_SIZE}"
@@ -276,12 +366,23 @@ for MODE in ${EVAL_MODES}; do
     --global_step "${STEP}"
     --output_json "${OUTPUT_DIR}/eval_${MODE}.json"
     --num_cached_samples "${NUM_CACHED_SAMPLES}"
+    --vit_init "${VIT_INIT}"
+    --vit_num_layers "${VIT_NUM_LAYERS}"
+    --freeze_vit "${FREEZE_VIT}"
+    --no_vit "${NO_VIT}"
+    --mask_vit_padding "${MASK_VIT_PADDING}"
+    --vit_apply_final_layernorm "${VIT_APPLY_FINAL_LAYERNORM}"
+    --compact_decoder_positions "${COMPACT_DECODER_POSITIONS}"
+    --seed "${SEED:-42}"
   )
+  if [[ -n "${MIXER_DEPTH_MAP}" ]]; then
+    EVAL_CMD+=( --mixer_depth_map "${MIXER_DEPTH_MAP}" )
+  fi
+  if [[ "${EVAL_DUMP:-0}" == "1" ]]; then
+    EVAL_CMD+=( --dump_per_sample "${OUTPUT_DIR}/eval_${MODE}_dump.jsonl" )
+  fi
   if [[ "${LEGACY_PROJECTOR}" == "1" ]]; then
     EVAL_CMD+=( --legacy_projector true )
-  fi
-  if [[ "${USE_CHAT_TEMPLATE}" == "1" ]]; then
-    EVAL_CMD+=( --use_chat_template )
   fi
   if [[ "${EVAL_COMPUTE_GEN}" == "1" ]]; then
     EVAL_CMD+=( --compute_generation_metrics )
@@ -300,62 +401,6 @@ for MODE in ${EVAL_MODES}; do
   fi
   "${EVAL_CMD[@]}"
 done
-
-# ---------------------------------------------------------------------------
-# LongBench QA eval (official leaderboard qa_f1_score).
-# ---------------------------------------------------------------------------
-if [[ "${LONGBENCH_EVAL}" == "1" ]]; then
-  echo; echo "===== LongBench QA eval (dataset=${LONGBENCH_DATASET}) ====="
-  for MODE in ${EVAL_MODES}; do
-    for LB_TASK in ${LONGBENCH_TASKS}; do
-      echo; echo "----- LongBench mode=${MODE} task=${LB_TASK} -----"
-      LB_CMD=(
-        python "${ROOT}/src/eval_cvlm.py"
-        --checkpoint_path "${CKPT}"
-        --dataset_name "${LONGBENCH_DATASET}"
-        --dataset_split "${LONGBENCH_SPLIT}"
-        --longbench_task "${LB_TASK}"
-        --model_name_or_path "${MODEL_NAME}"
-        --text_encoder_name "${TEXT_ENCODER_NAME}"
-        --vision_encoder_name "${VISION_ENCODER_NAME}"
-        --compression_rate "${COMPRESSION_RATE}"
-        --num_pool_latents "${NUM_POOL_LATENTS}"
-        --vision_backend "${VISION_BACKEND}"
-        --mode "${MODE}"
-        --max_samples "${EVAL_MAX_SAMPLES}"
-        --batch_size "${EVAL_BATCH_SIZE}"
-        --max_prompt_len "${LB_MAX_PROMPT_LEN}"
-        --max_answer_len "${MAX_ANSWER_LEN}"
-        --max_vision_len "${MAX_VISION_LEN}"
-        --max_source_len "${LB_MAX_SOURCE_LEN}"
-        --tensorboard_dir "${TB_DIR}"
-        --tb_run_name "lb_${MODE}_${LB_TASK}"
-        --global_step "${STEP}"
-        --output_json "${OUTPUT_DIR}/longbench_${MODE}_${LB_TASK}.json"
-        --num_cached_samples "${NUM_CACHED_SAMPLES}"
-        --compute_generation_metrics
-      )
-      if [[ "${LEGACY_PROJECTOR}" == "1" ]]; then
-        LB_CMD+=( --legacy_projector true )
-      fi
-      if [[ "${USE_CHAT_TEMPLATE}" == "1" ]]; then
-        LB_CMD+=( --use_chat_template )
-      fi
-      if [[ "${EVAL_ALL_CHECKPOINTS}" == "1" ]]; then
-        LB_CMD+=( --all_checkpoints )
-      fi
-      # cr-dependent modes get the per-ckpt cr schedule; baseline_llm{,_full} ignore it.
-      if [[ -n "${EVAL_CR_SCHEDULE}" && "${EVAL_ALL_CHECKPOINTS}" == "1" ]]; then
-        case "${MODE}" in
-          cvlm|cvlm_shuffle|baseline_proj)
-            LB_CMD+=( --cr_schedule "${EVAL_CR_SCHEDULE}" )
-            ;;
-        esac
-      fi
-      "${LB_CMD[@]}"
-    done
-  done
-fi
 
 echo
 echo "======================================================================"

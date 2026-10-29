@@ -1,0 +1,19 @@
+{
+  "paper": {
+    "path": "docs/paper.pdf",
+    "sha256": "ba92bb8463b47769fb8315fad4120db651e5c4ccfbe00cc7f38f05f55ea6eece",
+    "pages": 16
+  },
+  "poster": {
+    "path": "docs/poster.pdf",
+    "sha256": "307c8929fb68b396d59a93a5dce2ded4c15a22f771711da4399bfa6ef4288e2a",
+    "pages": 1
+  },
+  "architecture": {
+    "path": "docs/assets/architecture.png",
+    "source": "docs/paper.pdf",
+    "page_1_based": 4,
+    "clip_points": [96, 68, 500, 254],
+    "render_scale": 4
+  }
+}

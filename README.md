@@ -1,82 +1,119 @@
-# CVLM for Document Question Answering
+# What Should Occupy the Context Budget?
 
-**Can a document be compressed into a short sequence of learned embeddings and still answer questions about it?** This research code studies that question with a text encoder, a chunked attention pool, an optional Vision Transformer (ViT), and a language model decoder.
+### Latent Compression versus Budget-Matched Truncation in Document QA
 
-The repository includes training and evaluation pipelines, a supervised fine-tuning (SFT) baseline, tests, and a three-arm ViT ablation. It is a research prototype rather than an installable Python package.
+**Artem Cherepanov · Albina Burlova**<br>
+HSE University · SaluteDevices<br>
+Accepted at **DocInsights 2026 @ EMNLP**
 
-## How it works
+[Paper](docs/paper.pdf) · [Poster](docs/poster.pdf) · [Reproduction guide](docs/reproduction.md) · [Reported results](results/paper_metrics.json) · [Citation](#citation)
 
-```mermaid
-flowchart LR
-    D[Document] --> E[ModernBERT text encoder]
-    E --> P[Chunked attention pooling]
-    P --> T[Text projector]
-    T --> V{Vision stage}
-    V -->|vit| A[Pretrained ViT]
-    V -->|random_vit| B[Randomly initialized ViT]
-    V -->|none| C[Bypass ViT]
-    A --> Q[Vision projector]
-    B --> Q
-    C --> Q
-    Q --> L[SmolLM2 decoder]
-    U[Question] --> L
-    L --> O[Answer]
-```
+When a decoder has room for only a short document context, what should occupy those positions? We compare learned latent vectors with retained text under the **same per-example decoder-context cap**. Each retention policy has a reader trained on its selected contexts.
 
-The document is encoded at training and inference time. The pool reduces its token sequence according to the compression rate; the question stays in the decoder prompt. The three vision backends let us test whether a pretrained ViT, its architecture without pretrained weights, or neither helps document QA. See [`src/modeling.py`](src/modeling.py) for the model and [`src/cvlm_dataset.py`](src/cvlm_dataset.py) for data handling.
+Our strongest tested compressor, **Pool+Project**, encodes the document with ModernBERT, pools chunks into learned vectors, and projects them directly into the decoder's embedding space. The document representation is independent of the question and can be reused across questions. The decoder generates an answer conditioned on the question and latents.
 
-## Ablation snapshot
+<p align="center">
+  <img src="docs/assets/architecture.png" width="1000" alt="Pool+Project architecture: document encoder, chunked attention pooling, direct projection, and a decoder receiving question tokens and learned latents. Optional post-pooling transformer blocks form the ablation branch.">
+</p>
 
-The included results compare the three vision backends across compression settings. This dashboard plots the best checkpoint selected for each setting:
+## Main results
 
-![ViT ablation: QA metrics versus effective context reduction](vit_abl_metrics/dashboard.png)
+Final-paper results on **3,000 held-out PwC QA pairs from 205 documents**, with SmolLM2-1.7B-Instruct. Perplexity and token accuracy are measured on teacher-forced answer tokens.
 
-At configured compression rate 4, the recorded effective context reduction is **3.55×**:
+| System | PPL ↓, cr=8 | Token accuracy ↑ | PPL ↓, cr=16 | Token accuracy ↑ |
+|:--|--:|--:|--:|--:|
+| **Pool+Project** | **3.464** | **0.681** | **4.062** | **0.649** |
+| First-N + matched reader | 5.584 | 0.610 | 6.473 | 0.585 |
+| LLMLingua-2 + matched reader | 5.563 | 0.608 | 6.609 | 0.580 |
+| BM25 + matched reader | 5.349 | 0.620 | 6.565 | 0.584 |
 
-| Vision backend | Token accuracy ↑ | ROUGE-L ↑ | BLEU-4 ↑ | Perplexity ↓ |
-| --- | ---: | ---: | ---: | ---: |
-| Pretrained ViT | 0.7152 | 0.4503 | 21.55 | 2.9596 |
-| Random ViT | 0.7157 | 0.4510 | 21.51 | 2.9467 |
-| No ViT | **0.7331** | **0.4774** | **23.94** | **2.7148** |
+Here `cr` is the encoder-side pooling factor. A document of `L` encoder tokens produces `ceil(L / cr)` latent positions. Retention baselines receive that many available decoder-token positions. Discrete text selectors can leave some positions unused.
 
-These are results from the checked-in ablation artifacts, not a claim that the same ranking holds on other datasets or runs. See the [full metrics table](vit_abl_metrics/metrics_table.csv), [individual plots](vit_abl_metrics/), and [representation analysis](vit_abl_metrics/repr/RUN.md).
+The uncompressed **frozen** full-document reference has PPL **3.653** and token accuracy **0.719**. It uses a different context budget and reader training protocol from the rows above.
 
-## Run a small experiment
+Adding a post-pooling transformer reduces quality in the tested one-layer and twelve-layer settings. The twelve-layer comparison repeats in the discovery run, two paired replications, and a second decoder family, Qwen2.5. Removing the twelve-layer block saves **86.4M non-decoder parameters**. Forward time falls from **72.8 to 68.5 ms** at cr=8 in the paper's A100 microbenchmark.
 
-The scripts expect Linux, a CUDA GPU with enough memory for the selected models, Python 3.10+, and access to Hugging Face models and datasets. The default model stack is SmolLM2-1.7B-Instruct, ModernBERT-base, and ViT-base-patch16-224. Install a PyTorch build suitable for your CUDA environment, then install the Python dependencies used by the scripts:
+The paper also reports first-sentence generation and document-clustered paired intervals. The study covers short English documents and two small decoder families. Full protocols and scope are described in the [paper](docs/paper.pdf).
+
+## Installation
+
+Use **Python 3.11**. Full training requires a CUDA GPU. Run these commands from the repository root in a fresh environment:
 
 ```bash
-python -m pip install transformers datasets safetensors liger-kernel numpy tqdm \
-  sacrebleu rouge-score matplotlib trackio pytest
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-gpu.txt
 ```
 
-`pyproject.toml` contains lint and type-checker settings; it does not define an installable package or pin runtime dependencies.
+The CUDA 12.4 command assumes a compatible NVIDIA driver. The recorded training environment used PyTorch 2.5.1, Transformers 4.57.6, and Liger 0.8.x. Core package pins are recorded in [requirements.txt](requirements.txt); additional utility versions are release dependencies rather than a recovered lockfile of every historical run.
 
-From the repository root, this example limits the dataset, disables the longer LongBench sweep, and writes artifacts to a local directory:
+For LLMLingua-2 selection:
 
 ```bash
-OUTPUT_DIR="$PWD/runs/smoke" \
-MAX_SAMPLES=128 EVAL_MAX_SAMPLES=32 \
-EPOCHS=1 BATCH_SIZE=1 GRAD_ACCUM=1 \
-COMPRESSION_RATE=4 CR_SCHEDULE='' EVAL_CR_SCHEDULE='' \
-MAX_VISION_LEN=256 EVAL_MODES=cvlm \
-EVAL_ALL_CHECKPOINTS=0 LONGBENCH_EVAL=0 \
-TRACKIO_DISABLE=1 \
-bash scripts/run_full_pipeline.sh
+python -m pip install -r requirements-selectors.txt
 ```
 
-The pipeline saves `model_step_*.safetensors`, `eval_cvlm.json`, and `pipeline.log` under `OUTPUT_DIR`. Set `SKIP_TRAIN=1` with an existing run directory to evaluate a saved checkpoint. The default full pipeline also evaluates language-model baselines and LongBench QA tasks; inspect the environment variables near the top of [`scripts/run_full_pipeline.sh`](scripts/run_full_pipeline.sh) before a larger run.
+Models and data are fetched from Hugging Face on first use. The principal dependencies are [ModernBERT-base](https://huggingface.co/answerdotai/ModernBERT-base), [SmolLM2-1.7B-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct), and the [PwC dataset](https://huggingface.co/datasets/sggetao/PwC). Mixer ablations also use the [ViT-Base configuration](https://huggingface.co/google/vit-base-patch16-224). Each upstream asset retains its own license and terms.
 
-To run the full-document SFT baseline, use [`scripts/run_sft_pipeline.sh`](scripts/run_sft_pipeline.sh) with a separate `OUTPUT_DIR`. Use `VISION_BACKEND=vit`, `random_vit`, or `none` with separate run directories for the vision-stage comparison.
+## Train and evaluate
 
-## Repository guide
+Start with the [reproduction guide](docs/reproduction.md). It gives explicit commands for the paper's Pool+Project recipe, evaluation at cr=8 and cr=16, depth and pooling ablations, and selector-specific readers.
+
+```bash
+python src/train_cvlm.py --help
+python src/train_sft.py --help
+python src/eval_cvlm.py --help
+```
+
+The model, encoder, and decoder are trained jointly in the main experiment, with encoder input embeddings held fixed. The historical `vision` / `vit` names in the code also denote text latents and the optional transformer block. **`--no_vit true` selects Pool+Project.** The default `--vit_num_layers 0` means the full ViT stack, so it does not select the zero-layer model.
+
+## Repository contents
 
 | Path | Contents |
-| --- | --- |
-| [`src/`](src/) | Model, dataset, training, evaluation, and logging code |
-| [`scripts/`](scripts/) | CVLM and SFT pipeline entry points |
-| [`tests/`](tests/) | Unit and smoke tests for compression, model behavior, and logging |
-| [`vit_abl_metrics/`](vit_abl_metrics/) | Ablation plots, CSV metrics, and representation-analysis artifacts |
-| [`pyproject.toml`](pyproject.toml) | Ruff and mypy configuration |
+|:--|:--|
+| `src/modeling.py` | Compressor, decoder integration, and architecture variants |
+| `src/train_cvlm.py` | Joint training with compression curriculum and checkpoint manifests |
+| `src/train_sft.py` | Readers trained on first-N, BM25, or preselected contexts |
+| `src/eval_cvlm.py` | Answer-token metrics, generation, and per-example dumps |
+| `tools/` | Selection, paired document-cluster statistics, and diagnostics |
+| `tests/` | CPU tests and optional CUDA/Liger checks |
+| `docs/` | Final paper, poster, and reproduction instructions |
+| `results/paper_metrics.json` | Aggregate values transcribed from the final paper, with table references |
+| `hse/` | Historical Slurm recipes tied to the original cluster |
 
-Run the tests from the repository root with `PYTHONPATH=src python -m pytest tests`. Some tests require the model dependencies above; the GPU smoke test requires a compatible CUDA environment.
+## Released artifacts
+
+This release includes the training and evaluation code, tests, final paper, poster, and reported aggregate metrics. **Trained checkpoints and original per-example evaluation dumps are not included.** Training is therefore required before running checkpoint-based evaluation. The reported metrics are transcriptions of the final paper, not outputs generated by installing this repository.
+
+PwC pairs third-party source documents with model-generated QA. Download it from the upstream dataset repository. Source documents, dataset-derived sample embeddings, and text-bearing evaluation dumps are excluded from this release. The [artifact notes](docs/artifacts.md) describe the available evidence and files produced by a new run.
+
+## Tests
+
+Tests use small synthetic fixtures and do not require model weights or the dataset. On a CPU-only Linux installation, install the CPU PyTorch wheel instead of the CUDA wheel above, omit `requirements-gpu.txt`, and run:
+
+```bash
+python -m pip install -r requirements-dev.txt
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+DISABLE_LIGER=1 TRACKIO_DISABLE=1 python -m pytest -q
+```
+
+CUDA and fused-kernel checks skip when their dependencies are unavailable.
+
+## Citation
+
+```bibtex
+@misc{cherepanov2026contextbudget,
+  title = {What Should Occupy the Context Budget? Latent Compression versus Budget-Matched Truncation in Document QA},
+  author = {Cherepanov, Artem and Burlova, Albina},
+  year = {2026},
+  note = {Accepted at the DocInsights Workshop at EMNLP 2026},
+  url = {https://github.com/LuLim14/CVLM-in-Doc-QA}
+}
+```
+
+## Acknowledgments
+
+This work is an output of a research project (HSE-BR-2025-025) implemented as part of the Basic Research Program at HSE University.

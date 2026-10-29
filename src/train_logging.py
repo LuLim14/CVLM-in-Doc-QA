@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Optional
 
@@ -38,6 +39,29 @@ class MetricsCsvWriter:
             f"{int(step)},{float(loss):.6f},{float(loss_avg):.6f},"
             f"{float(lr):.10f},{float(grad_norm):.6f},{float(batch_time):.6f}\n"
         )
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+
+class MechanisticJsonlWriter:
+    """Append-only structured diagnostics for post-hoc mechanistic analysis.
+
+    Trackio is disabled on the cluster and stdout is awkward to align across
+    arms. JSONL preserves exact CR labels, padding statistics, gates, gate
+    gradients and per-layer contributions at every training log point.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self._fh = open(path, "a", buffering=1, encoding="utf-8")
+
+    def append(self, payload: dict) -> None:
+        self._fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
 
     def close(self) -> None:
         try:

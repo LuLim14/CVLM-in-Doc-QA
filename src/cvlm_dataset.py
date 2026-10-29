@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List
+import bisect
+import json
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -14,6 +16,52 @@ from datasets import Dataset as HFDataset
 from datasets import load_dataset
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer, PreTrainedTokenizer
+
+
+def compute_chunk_decoder_spans(
+    enc_offsets: Sequence[Tuple[int, int]],
+    dec_offsets: Sequence[Tuple[int, int]],
+    compression_rate: int,
+    max_chunks: int,
+) -> List[Tuple[int, int]]:
+    """Map encoder-token chunks to decoder-token spans via char offsets.
+
+    Chunk i covers encoder tokens [i*cr, (i+1)*cr) — the same chunking as
+    _chunked_attention_pool (including the max_chunks==max_vision_len cap), so
+    chunk i here corresponds 1:1 to vision token i. Its char span starts at
+    the first covered encoder token's char start. Decoder-token boundaries are
+    found by bisecting decoder char offsets: boundary b_i = first decoder
+    token whose char end exceeds the chunk's char start; the final boundary is
+    the first decoder token starting at/after the covered region's char end
+    (drops decoder tokens beyond the encoder-truncated document part).
+
+    The mapping is NOT byte-exact at chunk boundaries (encoder and decoder
+    tokenizations disagree on word splits); a decoder token straddling a
+    boundary is assigned to the last chunk whose char start it covers. Some
+    spans may be empty (multiple encoder tokens inside one decoder token) —
+    callers keep such chunks compressed.
+
+    Returns a list of (start, end) half-open decoder-token index pairs, one
+    per chunk, contiguous and non-decreasing.
+    """
+    L = len(enc_offsets)
+    cr = max(int(compression_rate), 1)
+    if L == 0 or len(dec_offsets) == 0:
+        return []
+    n = min((L + cr - 1) // cr, max(int(max_chunks), 1))
+    dec_starts = [s for s, _ in dec_offsets]
+    dec_ends = [e for _, e in dec_offsets]
+    bounds: List[int] = []
+    for i in range(n):
+        chunk_char_start = enc_offsets[i * cr][0]
+        bounds.append(bisect.bisect_right(dec_ends, chunk_char_start))
+    last_enc = min(n * cr, L) - 1
+    covered_char_end = enc_offsets[last_enc][1]
+    bounds.append(bisect.bisect_left(dec_starts, covered_char_end))
+    for i in range(1, len(bounds)):
+        if bounds[i] < bounds[i - 1]:
+            bounds[i] = bounds[i - 1]
+    return [(bounds[i], bounds[i + 1]) for i in range(n)]
 
 
 class CvlmTrainDataset(Dataset):
@@ -29,57 +77,57 @@ class CvlmTrainDataset(Dataset):
         max_answer_len: int,
         max_source_len: int,
         max_samples: int = 0,
-        source_col: str = 'input',
-        prompt_col: str = 'prompt',
-        answer_col: str = 'answer',
-        task_col: str | None = None,
-        prompt_template: str | None = None,
-        multi_answer: bool = False,
-        disable_length_filter: bool = False,
-        hf_config: str | None = None,
-        truncate_len: int = 0,
-        use_chat_template: bool = False,
+        doc_truncation: str = "none",
+        doc_budget_cr: int = 0,
+        doc_budget_cap: int = 0,
+        doc_truncation_seed: int = 42,
+        mixed_fidelity_p: float = 0.0,
+        mixed_chunk_cr: int = 0,
+        mixed_max_chunks: int = 0,
+        doc_selection_file: str = "",
     ) -> None:
-        # Column mapping decouples this dataset from PwC's exact schema so the
-        # same class can serve LongBench eval (context/input/answers/dataset).
-        #   source_col : document to be compressed into vision tokens.
-        #   prompt_col : the user question (stays uncompressed).
-        #   answer_col : gold answer. If ``multi_answer`` it is a List[str].
-        #   task_col   : per-row task/subtask name (LongBench "dataset" field).
-        # ``prompt_template`` is the official LongBench template with {context}
-        # and {input} placeholders. When set, the compressed document replaces
-        # {context} (dropped from the decoder prompt) and the remaining wrapper
-        # text — instruction prefix + "Question: {input}\nAnswer:" — becomes the
-        # uncompressed decoder prompt. ``disable_length_filter`` keeps every
-        # eval sample (we raise max_source_len instead of dropping samples).
-        self.source_col = source_col
-        self.prompt_col = prompt_col
-        self.answer_col = answer_col
-        self.task_col = task_col
-        self.prompt_template = prompt_template
-        self.multi_answer = multi_answer
-        # >0 enables the truncation baseline field: the decoder sees the LAST
-        # ``truncate_len`` decoder-tokens of the context (uncompressed), with
-        # earlier context discarded. Matches the "truncation baseline" from the
-        # compression literature.
-        self.truncate_len = int(truncate_len)
-        # When True, wrap decoder text in the decoder's chat template (system +
-        # user + assistant turns) for train/eval consistency with the instruct
-        # model. The compressed document occupies its slot inside the user turn,
-        # so the templated wrapper is split around the document: everything
-        # before it becomes ``prompt_ids`` (seen before the vision block) and
-        # everything after it — document suffix + question + assistant-open +
-        # answer — becomes ``answer_ids``, with only the gold answer scored.
-        self.use_chat_template = bool(use_chat_template)
-        if hf_config is not None:
-            self._hf: HFDataset = load_dataset(hf_dataset_name, hf_config, split=hf_split)
-        else:
-            self._hf = load_dataset(hf_dataset_name, split=hf_split)
+        self._hf: HFDataset = load_dataset(hf_dataset_name, split=hf_split)
         if max_samples > 0:
             self._hf = self._hf.select(range(min(max_samples, len(self._hf))))
         self.max_prompt_len = max_prompt_len
         self.max_answer_len = max_answer_len
         self.max_source_len = max_source_len
+
+        # Optional eval-only truncation of the document inside `full_prompt_ids`
+        # (consumed by the baseline_llm_full / sft eval paths). "none" keeps the
+        # historical behaviour: full document + "\n\n" + question. The budgeted
+        # strategies (first/last/random/oracle) cut the document to a
+        # decoder-token window of size min(ceil(L_enc / doc_budget_cr),
+        # doc_budget_cap) — i.e. exactly the vision-token budget CVLM would
+        # spend at compression_rate=doc_budget_cr. "file" (skim-then-read)
+        # replaces the document with `selected_text` from a
+        # tools/score_chunks.py JSONL, matched by idx = position in this
+        # filtered dataset; the budget was applied offline by that tool.
+        self.doc_truncation = str(doc_truncation)
+        self.doc_budget_cr = int(doc_budget_cr)
+        self.doc_budget_cap = int(doc_budget_cap)
+        self.doc_truncation_seed = int(doc_truncation_seed)
+        self.doc_selection_file = str(doc_selection_file or "")
+        if self.doc_truncation not in ("none", "first", "last", "random", "oracle", "query", "file"):
+            raise ValueError(f"Unknown doc_truncation: {self.doc_truncation!r}")
+        if self.doc_truncation == "file":
+            if not self.doc_selection_file:
+                raise ValueError("doc_truncation='file' requires doc_selection_file (tools/score_chunks.py JSONL)")
+        elif self.doc_truncation != "none":
+            if self.doc_budget_cr <= 0:
+                raise ValueError("doc_truncation != 'none' requires doc_budget_cr > 0")
+            if self.doc_budget_cap <= 0:
+                raise ValueError("doc_truncation != 'none' requires doc_budget_cap > 0 (max_vision_len)")
+            print(
+                f"CvlmTrainDataset: doc_truncation={self.doc_truncation}, "
+                f"budget=min(ceil(L_enc/{self.doc_budget_cr}), {self.doc_budget_cap}) decoder tokens"
+            )
+        # idx → truncated document window (decoder-token ids); idx → answer-found
+        # flag (oracle strategy only). Memoised so the teacher-forcing and
+        # generate passes see identical windows ('random' included) and hits are
+        # counted once per sample.
+        self._doc_window_cache: Dict[int, List[int]] = {}
+        self._oracle_hits: Dict[int, bool] = {}
 
         self._dec_tok: PreTrainedTokenizer = AutoTokenizer.from_pretrained(
             decoder_tokenizer_name, use_fast=False
@@ -94,23 +142,42 @@ class CvlmTrainDataset(Dataset):
         self.dec_pad_id: int = self._dec_tok.pad_token_id
         self.enc_pad_id: int = self._enc_tok.pad_token_id
 
-        # LongBench eval: keep every sample. We size max_source_len large enough
-        # to hold the longest document rather than dropping any evaluation row.
-        if disable_length_filter:
-            self._row_indices: List[int] = list(range(len(self._hf)))
-            print(f'CvlmTrainDataset: eval mode, kept all {len(self._row_indices)} samples')
-            return
+        # MIXED-FIDELITY extras: when enabled, __getitem__ additionally yields
+        # the decoder-tokenised document (tokenised ONCE, with a fast decoder
+        # tokenizer for char offsets) and per-chunk decoder-token spans, where
+        # chunks are the same [i*cr, (i+1)*cr) encoder-token windows the model's
+        # _chunked_attention_pool compresses into vision tokens. Chunking is
+        # fixed at construction time (mixed_chunk_cr), so this mode is
+        # incompatible with an in-training cr schedule.
+        self.mixed_fidelity: bool = float(mixed_fidelity_p) > 0.0
+        self.mixed_chunk_cr = int(mixed_chunk_cr)
+        self.mixed_max_chunks = int(mixed_max_chunks)
+        self._mixed_dec_tok: PreTrainedTokenizer | None = None
+        if self.mixed_fidelity:
+            if self.mixed_chunk_cr <= 0:
+                raise ValueError("mixed_fidelity_p > 0 requires mixed_chunk_cr > 0 (the training compression_rate)")
+            if self.mixed_max_chunks <= 0:
+                raise ValueError("mixed_fidelity_p > 0 requires mixed_max_chunks > 0 (max_vision_len)")
+            if not getattr(self._enc_tok, "is_fast", False):
+                raise ValueError("mixed_fidelity_p > 0 requires a FAST encoder tokenizer (char offset mapping)")
+            self._mixed_dec_tok = AutoTokenizer.from_pretrained(decoder_tokenizer_name, use_fast=True)
+            if not getattr(self._mixed_dec_tok, "is_fast", False):
+                raise ValueError("mixed_fidelity_p > 0 requires a FAST decoder tokenizer (char offset mapping)")
+            print(
+                f"CvlmTrainDataset: MIXED-FIDELITY extras enabled "
+                f"(chunk_cr={self.mixed_chunk_cr}, max_chunks={self.mixed_max_chunks})"
+            )
 
         # Vectorised length pass: one batched fast-tokenizer call per field.
-        inputs = [str(x) for x in self._hf[self.source_col]]
-        prompts = [str(x) for x in self._hf[self.prompt_col]]
-        answers = [self._first_answer(a) for a in self._hf[self.answer_col]]
+        # PwC rows have "input" (source document to compress), "prompt" (the
+        # user's question about the document), and "answer".
+        inputs = list(self._hf["input"])
+        prompts = list(self._hf["prompt"])
+        answers = list(self._hf["answer"])
 
-        print(f'Tokenising {len(inputs)} samples to compute length filter...')
-        enc_lens = self._batched_lengths(self._enc_tok, inputs)  # source lens in encoder tokens
-        dec_prompt_lens = self._batched_lengths(
-            self._dec_tok, prompts
-        )  # question lens in decoder tokens
+        print(f"Tokenising {len(inputs)} samples to compute length filter...")
+        enc_lens = self._batched_lengths(self._enc_tok, inputs)        # source lens in encoder tokens
+        dec_prompt_lens = self._batched_lengths(self._dec_tok, prompts)  # question lens in decoder tokens
         dec_answer_lens = self._batched_lengths(self._dec_tok, answers)
 
         keep = []
@@ -122,110 +189,227 @@ class CvlmTrainDataset(Dataset):
             if dec_answer_lens[i] > max_answer_len:
                 continue
             keep.append(i)
-        self._row_indices = keep
+        self._row_indices: List[int] = keep
         print(
-            f'CvlmTrainDataset: kept {len(keep)}/{len(inputs)} samples '
-            f'(source_tokens<={max_source_len}, prompt_tokens<={max_prompt_len}, '
-            f'answer_tokens<={max_answer_len})'
+            f"CvlmTrainDataset: kept {len(keep)}/{len(inputs)} samples "
+            f"(source_tokens<={max_source_len}, prompt_tokens<={max_prompt_len}, "
+            f"answer_tokens<={max_answer_len})"
         )
         if not keep:
-            raise RuntimeError('No samples passed length filters; loosen caps.')
+            raise RuntimeError("No samples passed length filters; loosen caps.")
+
+        # Skim-then-read selections must be loaded AFTER the filter so the line
+        # count can be validated against the filtered length (idx alignment).
+        self._doc_selection: Dict[int, str] = {}
+        if self.doc_truncation == "file":
+            self._load_doc_selection()
+
+    def _load_doc_selection(self) -> None:
+        """Load {idx -> selected_text} from a tools/score_chunks.py JSONL.
+
+        idx is the position in THIS filtered dataset; alignment therefore
+        requires the scoring run to have used the same dataset/split and the
+        same max_source_len / max_prompt_len / max_answer_len / max_samples.
+        A line-count mismatch is the tell-tale of diverged filters and fails
+        loudly here rather than silently mispairing documents and questions.
+        """
+        records: List[Dict[str, Any]] = []
+        with open(self.doc_selection_file) as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"{self.doc_selection_file}:{line_no}: invalid JSON: {e}") from e
+        n = len(self._row_indices)
+        if len(records) != n:
+            raise ValueError(
+                f"doc_selection_file {self.doc_selection_file!r} has {len(records)} lines but the "
+                f"filtered dataset has {n} samples — idx alignment is broken. Re-run "
+                f"tools/score_chunks.py with the SAME dataset/split and filter flags "
+                f"(max_source_len/max_prompt_len/max_answer_len/max_samples) as this eval."
+            )
+        for rec in records:
+            if "idx" not in rec or "selected_text" not in rec:
+                raise ValueError(
+                    f"doc_selection_file {self.doc_selection_file!r}: every line needs "
+                    f"'idx' and 'selected_text'; got keys {sorted(rec)}"
+                )
+            i = int(rec["idx"])
+            if not 0 <= i < n:
+                raise ValueError(f"doc_selection_file idx {i} out of range [0, {n})")
+            if i in self._doc_selection:
+                raise ValueError(f"doc_selection_file has duplicate idx {i}")
+            self._doc_selection[i] = str(rec["selected_text"])
+        print(
+            f"CvlmTrainDataset: doc_truncation=file — loaded {n} selected_text "
+            f"windows from {self.doc_selection_file}"
+        )
 
     @staticmethod
-    def _first_answer(a: Any) -> str:
-        """Ground truth for the length pass: first element if it is a list."""
-        if isinstance(a, (list, tuple)):
-            return str(a[0]) if a else ''
-        return str(a)
-
-    @staticmethod
-    def _batched_lengths(
-        tokenizer: PreTrainedTokenizer, texts: List[str], batch: int = 1024
-    ) -> List[int]:
+    def _batched_lengths(tokenizer: PreTrainedTokenizer, texts: List[str], batch: int = 1024) -> List[int]:
         out: List[int] = []
         for start in range(0, len(texts), batch):
             enc = tokenizer(
-                [str(t) for t in texts[start : start + batch]],
+                [str(t) for t in texts[start:start + batch]],
                 add_special_tokens=False,
                 truncation=False,
                 padding=False,
                 return_attention_mask=False,
             )
-            out.extend(len(ids) for ids in enc['input_ids'])
+            out.extend(len(ids) for ids in enc["input_ids"])
         return out
 
-    # Sentinel marking the compressed document's position inside the user turn.
-    # Picked to be a single string that never collides with real content; we
-    # split the rendered chat template on it to recover the pre-/post-document
-    # text spans, then tokenise each span separately.
-    _DOC_SENTINEL = '\ue000CVLM_DOC\ue000'
+    @staticmethod
+    def _find_answer_span(document: str, answer: str) -> tuple[int, int, bool]:
+        """Locate the answer inside the document for the `oracle` strategy.
 
-    def _apply_template(self, user_content: str, answer_text: str) -> str:
-        """Render system+user+assistant turns with the decoder chat template.
-
-        ``add_generation_prompt`` is implied by appending the assistant turn.
-        The default system prompt is kept (protocol consistency with the
-        instruct model). Returns the full templated string including the gold
-        answer and its closing token.
+        Tries the exact answer string first, then the first 8-word n-gram of the
+        answer that occurs verbatim in the document. Returns
+        ``(char_start, char_len, found)``; ``(0, 0, False)`` when nothing matches.
         """
-        msgs = [
-            {'role': 'user', 'content': user_content},
-            {'role': 'assistant', 'content': answer_text},
+        answer = answer.strip()
+        if answer:
+            pos = document.find(answer)
+            if pos >= 0:
+                return pos, len(answer), True
+            words = answer.split()
+            for i in range(len(words) - 7):
+                gram = " ".join(words[i : i + 8])
+                pos = document.find(gram)
+                if pos >= 0:
+                    return pos, len(gram), True
+        return 0, 0, False
+
+    def _query_selected_ids(
+        self, doc_ids: List[int], document: str, question: str, budget: int
+    ) -> List[int]:
+        """BM25-style question-conditioned sentence selection within budget."""
+        import math
+        import re as _re
+
+        sents = [x for x in _re.split(r"(?<=[.!?])\s+", document) if x.strip()]
+        if len(sents) <= 1:
+            return list(doc_ids[:budget])
+        tok = lambda text: _re.findall(r"[a-z0-9]+", text.lower())
+        q_terms = set(tok(question))
+        sent_terms = [tok(sentence) for sentence in sents]
+        df = {term: sum(1 for terms in sent_terms if term in terms) for term in q_terms}
+        n_sentences = len(sents)
+        avg_len = sum(len(terms) for terms in sent_terms) / max(n_sentences, 1)
+        k1, b = 1.5, 0.75
+        scores = []
+        for terms in sent_terms:
+            score = 0.0
+            for term in q_terms:
+                freq = terms.count(term)
+                if not freq:
+                    continue
+                idf = math.log(
+                    1.0 + (n_sentences - df[term] + 0.5) / (df[term] + 0.5)
+                )
+                score += idf * (freq * (k1 + 1)) / (
+                    freq + k1 * (1 - b + b * len(terms) / max(avg_len, 1e-9))
+                )
+            scores.append(score)
+        lengths = [
+            len(
+                self._dec_tok(
+                    sentence, add_special_tokens=False, truncation=False
+                )["input_ids"]
+            )
+            for sentence in sents
         ]
-        return self._dec_tok.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=False
-        )
+        chosen, used = [], 0
+        for sent_idx in sorted(
+            range(n_sentences), key=lambda item: (-scores[item], item)
+        ):
+            if used + lengths[sent_idx] > budget:
+                continue
+            chosen.append(sent_idx)
+            used += lengths[sent_idx]
+            if used >= budget:
+                break
+        if not chosen:
+            return list(doc_ids[:budget])
+        selected_text = " ".join(sents[item] for item in sorted(chosen))
+        selected_ids = self._dec_tok(
+            selected_text, add_special_tokens=False, truncation=False
+        )["input_ids"]
+        return list(selected_ids[:budget])
 
-    def _template_gen_prompt(self, user_content: str) -> str:
-        """Templated wrapper ending at the assistant-open tag (for generation)."""
-        msgs = [{'role': 'user', 'content': user_content}]
-        return self._dec_tok.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True
-        )
+    def _truncated_doc_ids(self, idx: int, record: Dict[str, Any]) -> List[int]:
+        """Decoder-token window of the document under the truncation budget.
 
-    def _split_templated(self, user_content_with_doc: str, answer_text: str):
-        """Split the templated sequence at the compressed-document boundary.
-
-        ``user_content_with_doc`` is the user-turn content with ``_DOC_SENTINEL``
-        marking where the compressed document sits. Returns
-        (prompt_ids, answer_ids, answer_prompt_len, gen_suffix_ids):
-          prompt_ids       : tokens BEFORE the document (system + user-open + any
-                             user text preceding the document).
-          answer_ids       : tokens AFTER the document — document suffix +
-                             question + assistant-open + gold answer + closing.
-          answer_prompt_len: #tokens in answer_ids that precede the gold answer
-                             (masked to -100 so only the answer is scored).
-          gen_suffix_ids   : the answer-prefix tokens (document suffix + question
-                             + assistant-open) — fed after the vision block at
-                             generation so decoding starts on the answer.
+        Budget = min(ceil(L_enc / doc_budget_cr), doc_budget_cap) decoder tokens,
+        where L_enc is the source length in *encoder* tokens (same measurement
+        as the __init__ length filter / compression stats). Window placement:
+        first / last / random contiguous (deterministic seed = doc_truncation_seed
+        + idx) / oracle (centred on the answer occurrence, first-N fallback).
+        The `file` strategy short-circuits: the window is the decoder
+        tokenisation of the offline-selected `selected_text` (budget already
+        applied by tools/score_chunks.py), no budget formula here.
         """
-        full = self._apply_template(user_content_with_doc, answer_text)
-        assert self._DOC_SENTINEL in full, 'document sentinel lost in template'
-        pre_doc, post_doc_full = full.split(self._DOC_SENTINEL, 1)
-        # post_doc_full = <doc-suffix + question><|im_end|>\n<|im_start|>assistant\n<answer><|im_end|>\n
-        gen_prompt = self._template_gen_prompt(user_content_with_doc)
-        _, post_doc_prefix = gen_prompt.split(self._DOC_SENTINEL, 1)
-        assert post_doc_full.startswith(post_doc_prefix), 'template prefix mismatch'
-
-        # ``pre_doc`` is separated from everything after it by the vision block,
-        # so tokenising it alone introduces no cross-boundary merge (vision, not
-        # text, follows it). Everything after the document is contiguous text, so
-        # it MUST be tokenised jointly to match real decoder tokenisation — then
-        # the answer boundary is recovered by token-prefix length. Tokenising the
-        # prefix and the tail separately would drift (control-token/newline
-        # merges), mis-aligning the label mask.
-        prompt_ids = self._dec_tok(pre_doc, add_special_tokens=False)['input_ids']
-        answer_ids = self._dec_tok(post_doc_full, add_special_tokens=False)['input_ids']
-        prefix_ids = self._dec_tok(post_doc_prefix, add_special_tokens=False)['input_ids']
-        # The gen prefix is a proper token-prefix of the jointly-tokenised answer
-        # because the assistant-open tag ends in "\n", a clean token boundary the
-        # answer text does not merge across.
-        answer_prompt_len = len(prefix_ids)
-        assert answer_ids[:answer_prompt_len] == prefix_ids, (
-            'answer prefix is not a clean token-prefix of the joint answer; '
-            'template split would misalign the label mask'
+        cached = self._doc_window_cache.get(idx)
+        if cached is not None:
+            return cached
+        if self.doc_truncation == "file":
+            # Skim-then-read: the budgeted window was selected offline by
+            # tools/score_chunks.py; just decoder-tokenise its raw text.
+            sel = self._doc_selection.get(idx)
+            if sel is None:
+                raise KeyError(f"doc_truncation='file': no selected_text for idx {idx}")
+            window = list(
+                self._dec_tok(sel, add_special_tokens=False, truncation=False)["input_ids"]
+            )
+            self._doc_window_cache[idx] = window
+            return window
+        document = str(record["input"])
+        doc_ids: List[int] = self._dec_tok(
+            document, add_special_tokens=False, truncation=False
+        )["input_ids"]
+        l_enc = min(
+            len(self._enc_tok(document, add_special_tokens=False, truncation=False)["input_ids"]),
+            self.max_source_len,
         )
-        return prompt_ids, answer_ids, answer_prompt_len, prefix_ids
+        cr = max(self.doc_budget_cr, 1)
+        budget = max(min((l_enc + cr - 1) // cr, self.doc_budget_cap), 1)
+        n = len(doc_ids)
+        start = 0
+        if self.doc_truncation == "oracle":
+            char_pos, char_len, hit = self._find_answer_span(document, str(record["answer"]))
+            self._oracle_hits[idx] = hit
+            if hit and n > budget:
+                # Char position → token position via prefix re-tokenisation
+                # (the slow decoder tokenizer exposes no offset mapping).
+                t_start = len(
+                    self._dec_tok(document[:char_pos], add_special_tokens=False, truncation=False)["input_ids"]
+                )
+                t_len = len(
+                    self._dec_tok(
+                        document[char_pos : char_pos + char_len], add_special_tokens=False, truncation=False
+                    )["input_ids"]
+                )
+                center = t_start + t_len // 2
+                start = min(max(center - budget // 2, 0), n - budget)
+        elif self.doc_truncation == "query":
+            window = self._query_selected_ids(
+                doc_ids, document, str(record["prompt"]), budget
+            )
+            self._doc_window_cache[idx] = window
+            return window
+        elif n > budget:
+            if self.doc_truncation == "last":
+                start = n - budget
+            elif self.doc_truncation == "random":
+                rng = np.random.default_rng(self.doc_truncation_seed + idx)
+                start = int(rng.integers(0, n - budget + 1))
+            # "first" keeps start = 0.
+        window = list(doc_ids[start : start + budget])
+        self._doc_window_cache[idx] = window
+        return window
 
     def __len__(self) -> int:
         return len(self._row_indices)
@@ -233,109 +417,66 @@ class CvlmTrainDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row_id = self._row_indices[idx]
         record = self._hf[row_id]
-        source_text = str(record[self.source_col])
-        question_text = str(record[self.prompt_col])
-
         src = self._enc_tok(
-            source_text,
+            str(record["input"]),
             add_special_tokens=False,
             truncation=True,
             max_length=self.max_source_len,
             return_tensors=None,
+            return_offsets_mapping=self.mixed_fidelity,
+        ) # TODO: is it good that we use truncated? But we use from _row_indices that prepered from __init__
+        # Prompt is the user's *question* about the document, not the document
+        # itself. The document goes into `source_ids` (to be compressed into
+        # vision tokens); the question stays as raw prompt tokens.
+        prompt = self._dec_tok(
+            str(record["prompt"]), add_special_tokens=False, truncation=False
         )
-
-        # Answers: raw text passthrough for reference-based scoring (LongBench is
-        # multi-answer). answer_ids/labels still come from the FIRST answer so the
-        # training / NLL path is unchanged.
-        raw = record[self.answer_col]
-        if self.multi_answer:
-            answers_text = [str(x) for x in raw] if isinstance(raw, (list, tuple)) else [str(raw)]
-        else:
-            answers_text = [str(raw)]
-        answer_text = answers_text[0]
-
-        # Build the user-turn content with a sentinel where the compressed
-        # document goes, and the fully-inlined version (document inlined) used by
-        # the oracle / truncation prompts.
-        if self.prompt_template is not None:
-            # LongBench: official template with {context} (compressed) + {input}.
-            user_with_doc = self.prompt_template.format(
-                context=self._DOC_SENTINEL, input=question_text
+        answer = self._dec_tok(
+            str(record["answer"]), add_special_tokens=False, truncation=False
+        )
+        # full_prompt_ids = decoder-tokenised(document + question). Only used by
+        # the eval `baseline_llm_full` oracle (upper-bound LLM that sees the raw
+        # uncompressed document). Training does not consume this field. With
+        # doc_truncation != "none" the document part is cut to a budgeted token
+        # window first, then glued to "\n\n" + question as usual.
+        if self.doc_truncation != "none":
+            doc_window = self._truncated_doc_ids(idx, record)
+            tail = self._dec_tok(
+                "\n\n" + str(record["prompt"]), add_special_tokens=False, truncation=False
             )
-            user_inline = self.prompt_template.format(
-                context=source_text, input=question_text
-            )
+            full_ids = list(doc_window) + list(tail["input_ids"])
         else:
-            # PwC: user turn = document + blank line + question.
-            user_with_doc = self._DOC_SENTINEL + '\n\n' + question_text
-            user_inline = source_text + '\n\n' + question_text
-
-        gen_suffix_ids = None
-        answer_prompt_len = 0
-        if self.use_chat_template:
-            # Chat-templated: split the rendered template at the document so the
-            # compressed document (vision) sits between prompt_ids and answer_ids.
-            prompt_ids, answer_ids, answer_prompt_len, gen_suffix_ids = self._split_templated(
-                user_with_doc, answer_text
+            full_prompt_text = str(record["input"]) + "\n\n" + str(record["prompt"])
+            full_prompt = self._dec_tok(
+                full_prompt_text, add_special_tokens=False, truncation=False
             )
-            # Oracle / truncation prompts are generation-only: full templated
-            # wrapper (document inlined) ending at the assistant-open tag.
-            full_prompt_ids = self._dec_tok(
-                self._template_gen_prompt(user_inline), add_special_tokens=False
-            )['input_ids']
-        else:
-            # Raw-text (legacy) path: prompt = question only; oracle = doc+question.
-            if self.prompt_template is not None:
-                _, _, suffix = self.prompt_template.partition('{context}')
-                decoder_prompt_text = suffix.replace('{input}', question_text)
-            else:
-                decoder_prompt_text = question_text
-            prompt_ids = self._dec_tok(decoder_prompt_text, add_special_tokens=False)['input_ids']
-            answer_ids = self._dec_tok(answer_text, add_special_tokens=False)['input_ids']
-            full_prompt_ids = self._dec_tok(user_inline, add_special_tokens=False)['input_ids']
-
-        # Truncation baseline: keep the LAST ``truncate_len`` decoder-tokens of
-        # the context, discard the earlier context, then re-assemble with the
-        # (untruncated) wrapper + question. Only the document is shortened, so the
-        # decoder sees a well-formed prompt over the tail of the context.
-        trunc_ids = None
-        if self.truncate_len > 0:
-            ctx_ids = self._dec_tok(
-                source_text, add_special_tokens=False, truncation=False
-            )['input_ids']
-            kept_ctx = self._dec_tok.decode(ctx_ids[-self.truncate_len:])
-            if self.prompt_template is not None:
-                trunc_user = self.prompt_template.format(context=kept_ctx, input=question_text)
-            else:
-                trunc_user = kept_ctx + '\n\n' + question_text
-            if self.use_chat_template:
-                trunc_ids = self._dec_tok(
-                    self._template_gen_prompt(trunc_user), add_special_tokens=False
-                )['input_ids']
-            else:
-                trunc_ids = self._dec_tok(trunc_user, add_special_tokens=False)['input_ids']
-
-        task_name = str(record[self.task_col]) if self.task_col is not None else ''
-
+            full_ids = full_prompt["input_ids"]
         out = {
-            'source_ids': torch.as_tensor(src['input_ids'], dtype=torch.long),
-            'prompt_ids': torch.as_tensor(prompt_ids, dtype=torch.long),
-            'full_prompt_ids': torch.as_tensor(full_prompt_ids, dtype=torch.long),
-            'answer_ids': torch.as_tensor(answer_ids, dtype=torch.long),
-            # #answer tokens preceding the gold answer (chat-template prefix:
-            # document-suffix + question + assistant-open). Masked to -100 in the
-            # collator so only the gold answer is scored. 0 in the raw path.
-            'answer_prompt_len': int(answer_prompt_len),
-            'answers_text': answers_text,
-            'task_name': task_name,
+            "source_ids": torch.as_tensor(src["input_ids"], dtype=torch.long),
+            "prompt_ids": torch.as_tensor(prompt["input_ids"], dtype=torch.long),
+            "full_prompt_ids": torch.as_tensor(full_ids, dtype=torch.long),
+            "answer_ids": torch.as_tensor(answer["input_ids"], dtype=torch.long),
         }
-        # Chat-template generation suffix (document-suffix + question +
-        # assistant-open): fed after the vision block at generation so decoding
-        # begins on the answer. Absent in the raw path.
-        if gen_suffix_ids is not None:
-            out['gen_suffix_ids'] = torch.as_tensor(gen_suffix_ids, dtype=torch.long)
-        if trunc_ids is not None:
-            out['trunc_prompt_ids'] = torch.as_tensor(trunc_ids, dtype=torch.long)
+        if self.mixed_fidelity:
+            # Decoder-tokenise the document ONCE (fast tokenizer, with char
+            # offsets); chunk spans index into these ids. Ids come from the
+            # fast tokenizer so ids and spans are internally consistent even if
+            # the slow decoder tokenizer would split slightly differently.
+            assert self._mixed_dec_tok is not None
+            doc_dec = self._mixed_dec_tok(
+                str(record["input"]),
+                add_special_tokens=False,
+                truncation=False,
+                return_offsets_mapping=True,
+            )
+            spans = compute_chunk_decoder_spans(
+                src["offset_mapping"],
+                doc_dec["offset_mapping"],
+                compression_rate=self.mixed_chunk_cr,
+                max_chunks=self.mixed_max_chunks,
+            )
+            out["doc_dec_ids"] = torch.as_tensor(doc_dec["input_ids"], dtype=torch.long)
+            out["chunk_dec_spans"] = torch.as_tensor(spans, dtype=torch.long).reshape(-1, 2)
         return out
 
 
@@ -347,102 +488,78 @@ def make_collate_fn(
         b = len(samples)
 
         # Source (encoder input): right-pad with encoder pad id.
-        max_s = max(s['source_ids'].shape[0] for s in samples)
+        max_s = max(s["source_ids"].shape[0] for s in samples)
         source_ids = torch.full((b, max_s), enc_pad_id, dtype=torch.long)
         source_attention_mask = torch.zeros(b, max_s, dtype=torch.long)
 
         # Prompt: LEFT-pad so real tokens sit flush against the vision block.
-        max_p = max(s['prompt_ids'].shape[0] for s in samples)
+        max_p = max(s["prompt_ids"].shape[0] for s in samples)
         prompt_ids = torch.full((b, max_p), dec_pad_id, dtype=torch.long)
         prompt_mask = torch.zeros(b, max_p, dtype=torch.long)
 
         # Full prompt (doc + question) for the baseline_llm_full oracle.
-        has_full = 'full_prompt_ids' in samples[0]
+        has_full = "full_prompt_ids" in samples[0]
         if has_full:
-            max_fp = max(s['full_prompt_ids'].shape[0] for s in samples)
+            max_fp = max(s["full_prompt_ids"].shape[0] for s in samples)
             full_prompt_ids = torch.full((b, max_fp), dec_pad_id, dtype=torch.long)
             full_prompt_mask = torch.zeros(b, max_fp, dtype=torch.long)
 
-        # Truncated prompt (last-n context + question) for baseline_truncate.
-        # LEFT-pad like the other decoder-generation prompts.
-        has_trunc = 'trunc_prompt_ids' in samples[0]
-        if has_trunc:
-            max_tp = max(s['trunc_prompt_ids'].shape[0] for s in samples)
-            trunc_prompt_ids = torch.full((b, max_tp), dec_pad_id, dtype=torch.long)
-            trunc_prompt_mask = torch.zeros(b, max_tp, dtype=torch.long)
-
-        # Chat-template generation suffix (question + assistant-open) fed after
-        # the vision block at generation. LEFT-pad so real tokens sit flush after
-        # vision. Empty samples (len 0) are allowed and yield an all-pad row.
-        has_suffix = 'gen_suffix_ids' in samples[0]
-        if has_suffix:
-            max_gs = max(s['gen_suffix_ids'].shape[0] for s in samples)
-            gen_suffix_ids = torch.full((b, max_gs), dec_pad_id, dtype=torch.long)
-            gen_suffix_mask = torch.zeros(b, max_gs, dtype=torch.long)
-
         # Answer: right-pad (standard).
-        max_a = max(s['answer_ids'].shape[0] for s in samples)
+        max_a = max(s["answer_ids"].shape[0] for s in samples)
         answer_ids = torch.full((b, max_a), dec_pad_id, dtype=torch.long)
         answer_labels = torch.full((b, max_a), -100, dtype=torch.long)
         answer_mask = torch.zeros(b, max_a, dtype=torch.long)
 
+        # MIXED-FIDELITY extras: decoder-tokenised document (right-pad with the
+        # decoder pad id; validity is bounded by the spans, no separate mask
+        # needed) + per-chunk decoder spans (pad with (0, 0); chunk_counts says
+        # how many rows are real per sample).
+        has_mixed = "doc_dec_ids" in samples[0]
+        if has_mixed:
+            max_d = max(max(s["doc_dec_ids"].shape[0] for s in samples), 1)
+            doc_dec_ids = torch.full((b, max_d), dec_pad_id, dtype=torch.long)
+            max_c = max(max(s["chunk_dec_spans"].shape[0] for s in samples), 1)
+            chunk_dec_spans = torch.zeros(b, max_c, 2, dtype=torch.long)
+            chunk_counts = torch.zeros(b, dtype=torch.long)
+
         for i, s in enumerate(samples):
-            sids, pids, aids = s['source_ids'], s['prompt_ids'], s['answer_ids']
+            sids, pids, aids = s["source_ids"], s["prompt_ids"], s["answer_ids"]
             sl, pl, al = sids.shape[0], pids.shape[0], aids.shape[0]
             source_ids[i, :sl] = sids
             source_attention_mask[i, :sl] = 1
-            prompt_ids[i, max_p - pl :] = pids
-            prompt_mask[i, max_p - pl :] = 1
+            prompt_ids[i, max_p - pl:] = pids
+            prompt_mask[i, max_p - pl:] = 1
             answer_ids[i, :al] = aids
             answer_labels[i, :al] = aids
             answer_mask[i, :al] = 1
-            # Chat-template: mask the answer-prefix (document-suffix + question +
-            # assistant-open) so loss is scored only on the gold answer. The
-            # decoder still attends over these tokens (answer_mask stays 1); only
-            # their labels are ignored. answer_prompt_len is 0 in the raw path.
-            apl = int(s.get('answer_prompt_len', 0))
-            if apl > 0:
-                answer_labels[i, :apl] = -100
-            if has_suffix:
-                gsids = s['gen_suffix_ids']
-                gsl = gsids.shape[0]
-                if gsl > 0:
-                    gen_suffix_ids[i, max_gs - gsl :] = gsids
-                    gen_suffix_mask[i, max_gs - gsl :] = 1
             if has_full:
-                fpids = s['full_prompt_ids']
+                fpids = s["full_prompt_ids"]
                 fpl = fpids.shape[0]
-                full_prompt_ids[i, max_fp - fpl :] = fpids
-                full_prompt_mask[i, max_fp - fpl :] = 1
-            if has_trunc:
-                tpids = s['trunc_prompt_ids']
-                tpl = tpids.shape[0]
-                trunc_prompt_ids[i, max_tp - tpl :] = tpids
-                trunc_prompt_mask[i, max_tp - tpl :] = 1
+                full_prompt_ids[i, max_fp - fpl:] = fpids
+                full_prompt_mask[i, max_fp - fpl:] = 1
+            if has_mixed:
+                dids = s["doc_dec_ids"]
+                doc_dec_ids[i, :dids.shape[0]] = dids
+                spans = s["chunk_dec_spans"]
+                chunk_dec_spans[i, :spans.shape[0]] = spans
+                chunk_counts[i] = spans.shape[0]
 
         out = {
-            'source_ids': source_ids,
-            'source_attention_mask': source_attention_mask,
-            'prompt_ids': prompt_ids,
-            'prompt_mask': prompt_mask,
-            'answer_ids': answer_ids,
-            'answer_labels': answer_labels,
-            'answer_mask': answer_mask,
+            "source_ids": source_ids,
+            "source_attention_mask": source_attention_mask,
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "answer_ids": answer_ids,
+            "answer_labels": answer_labels,
+            "answer_mask": answer_mask,
         }
         if has_full:
-            out['full_prompt_ids'] = full_prompt_ids
-            out['full_prompt_mask'] = full_prompt_mask
-        if has_trunc:
-            out['trunc_prompt_ids'] = trunc_prompt_ids
-            out['trunc_prompt_mask'] = trunc_prompt_mask
-        if has_suffix:
-            out['gen_suffix_ids'] = gen_suffix_ids
-            out['gen_suffix_mask'] = gen_suffix_mask
-        # Non-tensor passthrough for reference-based scoring (LongBench).
-        if 'answers_text' in samples[0]:
-            out['answers_text'] = [s['answers_text'] for s in samples]
-        if 'task_name' in samples[0]:
-            out['task_name'] = [s['task_name'] for s in samples]
+            out["full_prompt_ids"] = full_prompt_ids
+            out["full_prompt_mask"] = full_prompt_mask
+        if has_mixed:
+            out["doc_dec_ids"] = doc_dec_ids
+            out["chunk_dec_spans"] = chunk_dec_spans
+            out["chunk_counts"] = chunk_counts
         return out
 
     return collate_cvlm_batch

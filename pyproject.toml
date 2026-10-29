@@ -20,6 +20,10 @@ known-first-party = ["cvlm_dataset", "modeling", "train_utils"]
 [tool.ruff.format]
 quote-style = "double"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
 [tool.mypy]
 python_version = "3.10"
 strict = false

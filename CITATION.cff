@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the accompanying DocInsights 2026 paper."
+type: software
+title: "CVLM: What Should Occupy the Context Budget?"
+authors:
+  - family-names: Cherepanov
+    given-names: Artem
+    affiliation: "HSE University; SaluteDevices"
+  - family-names: Burlova
+    given-names: Albina
+    affiliation: "HSE University"
+repository-code: "https://github.com/LuLim14/CVLM-in-Doc-QA"
+url: "https://github.com/LuLim14/CVLM-in-Doc-QA"
+preferred-citation:
+  type: conference-paper
+  title: "What Should Occupy the Context Budget? Latent Compression versus Budget-Matched Truncation in Document QA"
+  authors:
+    - family-names: Cherepanov
+      given-names: Artem
+    - family-names: Burlova
+      given-names: Albina
+  year: 2026
+  conference:
+    name: "DocInsights Workshop at EMNLP 2026"
+  notes: "Accepted workshop paper. See docs/paper.pdf for the final manuscript."
+  url: "https://github.com/LuLim14/CVLM-in-Doc-QA"

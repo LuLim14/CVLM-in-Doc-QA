@@ -1,0 +1,71 @@
+{
+  "provenance": {
+    "source": "docs/paper.pdf",
+    "kind": "transcribed_final_paper_aggregates",
+    "recomputed_for_release": false,
+    "dataset": "sggetao/PwC",
+    "evaluation_slice": "FRESH",
+    "qa_pairs": 3000,
+    "documents": 205,
+    "budget": "same per-example decoder document-position cap",
+    "cr_definition": "encoder-side pooling factor",
+    "ppl_definition": "exp(sum(answer_nll) / sum(answer_tokens))",
+    "token_accuracy_definition": "sum(correct_answer_tokens) / sum(answer_tokens)"
+  },
+  "smollm2_matched_readers": {
+    "source_table": "Table 1",
+    "decoder": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+    "rows": [
+      {"system": "Pool+Project", "cr": 8, "ppl": 3.464, "token_accuracy": 0.681},
+      {"system": "Pool+Project", "cr": 16, "ppl": 4.062, "token_accuracy": 0.649},
+      {"system": "First-N matched reader", "cr": 8, "ppl": 5.584, "token_accuracy": 0.610},
+      {"system": "First-N matched reader", "cr": 16, "ppl": 6.473, "token_accuracy": 0.585},
+      {"system": "LLMLingua-2 matched reader", "cr": 8, "ppl": 5.563, "token_accuracy": 0.608},
+      {"system": "LLMLingua-2 matched reader", "cr": 16, "ppl": 6.609, "token_accuracy": 0.580},
+      {"system": "BM25 matched reader", "cr": 8, "ppl": 5.349, "token_accuracy": 0.620},
+      {"system": "BM25 matched reader", "cr": 16, "ppl": 6.565, "token_accuracy": 0.584}
+    ]
+  },
+  "full_document_reference": {
+    "source_table": "Table 1",
+    "decoder": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+    "decoder_training": "frozen",
+    "common_cap_comparison": false,
+    "ppl": 3.653,
+    "token_accuracy": 0.719
+  },
+  "qwen_matched_readers": {
+    "source": "Section 4, The main result transfers to Qwen2.5",
+    "decoder": "Qwen/Qwen2.5-0.5B-Instruct",
+    "rows": [
+      {"system": "Pool+Project", "cr": 8, "ppl": 5.395},
+      {"system": "Pool+Project", "cr": 16, "ppl": 6.916},
+      {"system": "First-N matched reader", "cr": 8, "ppl": 13.748},
+      {"system": "First-N matched reader", "cr": 16, "ppl": 16.958}
+    ]
+  },
+  "depth_replications": {
+    "source_table": "Table 8",
+    "cr": 16,
+    "rows": [
+      {"seed": 42, "sampler": "discovery", "pool_project_ppl": 4.0618, "mixer_12_ppl": 4.6876, "ppl_gap": 0.6258},
+      {"seed": 43, "sampler": "deterministic_epoch", "pool_project_ppl": 4.0605, "mixer_12_ppl": 4.7145, "ppl_gap": 0.6540},
+      {"seed": 44, "sampler": "deterministic_epoch", "pool_project_ppl": 4.0574, "mixer_12_ppl": 4.9512, "ppl_gap": 0.8938}
+    ]
+  },
+  "systems": {
+    "source_table": "Table 6",
+    "hardware": "NVIDIA A100",
+    "precision": "bf16",
+    "batch_size": 8,
+    "source_tokens": 1024,
+    "prompt_tokens": 16,
+    "answer_tokens": 32,
+    "parameter_count_scope": "non-decoder",
+    "timing_and_memory_scope": "includes decoder",
+    "rows": [
+      {"system": "Pool+Project", "non_decoder_parameters_millions": 163.2, "forward_ms_cr8": 68.5, "forward_ms_cr16": 60.2, "peak_memory_gb_cr8": 3.92},
+      {"system": "Pool+12L Mixer", "non_decoder_parameters_millions": 249.6, "forward_ms_cr8": 72.8, "forward_ms_cr16": 65.0, "peak_memory_gb_cr8": 4.09}
+    ]
+  }
+}

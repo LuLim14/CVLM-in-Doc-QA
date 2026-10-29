@@ -82,12 +82,14 @@ def parse_args() -> argparse.Namespace:
         "--doc_truncation",
         type=str,
         default="none",
-        choices=["none", "first", "last", "random", "oracle", "file"],
+        choices=["none", "first", "last", "random", "oracle", "query", "file"],
         help="baseline_llm_full/sft only: replace the document inside full_prompt "
         "with a budgeted decoder-token window before appending '\\n\\n' + question. "
         "first/last/random = contiguous window (random is deterministic: seed + "
         "sample idx); oracle = window centred on the answer's occurrence in the "
-        "document (first-N fallback when not found); file = skim-then-read: the "
+        "document (first-N fallback when not found); query = the deterministic "
+        "BM25-style sentence selector conditioned on the question; file = "
+        "skim-then-read: the "
         "document is replaced by `selected_text` from --doc_selection_file "
         "(tools/score_chunks.py output, matched by idx; budget already applied "
         "offline, so --doc_budget_cr must NOT be passed). 'none' keeps the full "

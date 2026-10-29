@@ -108,7 +108,7 @@ class CvlmTrainDataset(Dataset):
         self.doc_budget_cap = int(doc_budget_cap)
         self.doc_truncation_seed = int(doc_truncation_seed)
         self.doc_selection_file = str(doc_selection_file or "")
-        if self.doc_truncation not in ("none", "first", "last", "random", "oracle", "file"):
+        if self.doc_truncation not in ("none", "first", "last", "random", "oracle", "query", "file"):
             raise ValueError(f"Unknown doc_truncation: {self.doc_truncation!r}")
         if self.doc_truncation == "file":
             if not self.doc_selection_file:
@@ -283,6 +283,63 @@ class CvlmTrainDataset(Dataset):
                     return pos, len(gram), True
         return 0, 0, False
 
+    def _query_selected_ids(
+        self, doc_ids: List[int], document: str, question: str, budget: int
+    ) -> List[int]:
+        """BM25-style question-conditioned sentence selection within budget."""
+        import math
+        import re as _re
+
+        sents = [x for x in _re.split(r"(?<=[.!?])\s+", document) if x.strip()]
+        if len(sents) <= 1:
+            return list(doc_ids[:budget])
+        tok = lambda text: _re.findall(r"[a-z0-9]+", text.lower())
+        q_terms = set(tok(question))
+        sent_terms = [tok(sentence) for sentence in sents]
+        df = {term: sum(1 for terms in sent_terms if term in terms) for term in q_terms}
+        n_sentences = len(sents)
+        avg_len = sum(len(terms) for terms in sent_terms) / max(n_sentences, 1)
+        k1, b = 1.5, 0.75
+        scores = []
+        for terms in sent_terms:
+            score = 0.0
+            for term in q_terms:
+                freq = terms.count(term)
+                if not freq:
+                    continue
+                idf = math.log(
+                    1.0 + (n_sentences - df[term] + 0.5) / (df[term] + 0.5)
+                )
+                score += idf * (freq * (k1 + 1)) / (
+                    freq + k1 * (1 - b + b * len(terms) / max(avg_len, 1e-9))
+                )
+            scores.append(score)
+        lengths = [
+            len(
+                self._dec_tok(
+                    sentence, add_special_tokens=False, truncation=False
+                )["input_ids"]
+            )
+            for sentence in sents
+        ]
+        chosen, used = [], 0
+        for sent_idx in sorted(
+            range(n_sentences), key=lambda item: (-scores[item], item)
+        ):
+            if used + lengths[sent_idx] > budget:
+                continue
+            chosen.append(sent_idx)
+            used += lengths[sent_idx]
+            if used >= budget:
+                break
+        if not chosen:
+            return list(doc_ids[:budget])
+        selected_text = " ".join(sents[item] for item in sorted(chosen))
+        selected_ids = self._dec_tok(
+            selected_text, add_special_tokens=False, truncation=False
+        )["input_ids"]
+        return list(selected_ids[:budget])
+
     def _truncated_doc_ids(self, idx: int, record: Dict[str, Any]) -> List[int]:
         """Decoder-token window of the document under the truncation budget.
 
@@ -337,6 +394,12 @@ class CvlmTrainDataset(Dataset):
                 )
                 center = t_start + t_len // 2
                 start = min(max(center - budget // 2, 0), n - budget)
+        elif self.doc_truncation == "query":
+            window = self._query_selected_ids(
+                doc_ids, document, str(record["prompt"]), budget
+            )
+            self._doc_window_cache[idx] = window
+            return window
         elif n > budget:
             if self.doc_truncation == "last":
                 start = n - budget

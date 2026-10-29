@@ -17,7 +17,10 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -98,6 +101,8 @@ class SftFullDocDataset(Dataset):
         max_vision_len: int = 1024,
         max_source_len: int = 0,
         encoder_tokenizer_name: str = "",
+        doc_selection_file: str = "",
+        selection_policy: str = "first",
     ) -> None:
         """truncate_cr=0 keeps the legacy full-document behaviour.
 
@@ -115,6 +120,16 @@ class SftFullDocDataset(Dataset):
         self.max_answer_len = max_answer_len
         self.truncate_cr = int(truncate_cr)
         self.max_vision_len = int(max_vision_len)
+        self.doc_selection_file = str(doc_selection_file or "")
+        self.selection_policy = str(selection_policy)
+        if self.selection_policy not in ("first", "query", "file"):
+            raise ValueError(f"unknown selection_policy={self.selection_policy!r}")
+        if self.doc_selection_file and self.selection_policy != "file":
+            raise ValueError("doc_selection_file requires selection_policy='file'")
+        if self.selection_policy == "file" and not self.doc_selection_file:
+            raise ValueError("selection_policy='file' requires doc_selection_file")
+        if self.selection_policy != "first" and self.truncate_cr <= 0:
+            raise ValueError("doc_selection_file requires truncate_cr > 0 to define the cap")
 
         ds = load_dataset(hf_dataset_name, split=hf_split)
         if max_samples > 0:
@@ -165,6 +180,47 @@ class SftFullDocDataset(Dataset):
             )
         else:
             self._doc_budgets = None
+
+        self._doc_selection: Dict[int, str] = {}
+        if self.doc_selection_file:
+            records: List[Dict[str, Any]] = []
+            with open(self.doc_selection_file) as handle:
+                for line_no, line in enumerate(handle, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"{self.doc_selection_file}:{line_no}: invalid JSON: {exc}"
+                        ) from exc
+            if len(records) != len(keep):
+                raise ValueError(
+                    f"doc_selection_file has {len(records)} rows but the filtered training "
+                    f"dataset has {len(keep)} rows"
+                )
+            for rec in records:
+                if "idx" not in rec or "selected_text" not in rec:
+                    raise ValueError(
+                        "every selection row requires 'idx' and 'selected_text'; "
+                        f"got keys {sorted(rec)}"
+                    )
+                selected_idx = int(rec["idx"])
+                if not 0 <= selected_idx < len(keep):
+                    raise ValueError(
+                        f"selection idx {selected_idx} outside [0, {len(keep)})"
+                    )
+                if selected_idx in self._doc_selection:
+                    raise ValueError(f"duplicate selection idx {selected_idx}")
+                self._doc_selection[selected_idx] = str(rec["selected_text"])
+            if len(self._doc_selection) != len(keep):
+                raise ValueError("selection file does not cover every filtered training row")
+            print(
+                f"[train_sft] loaded {len(self._doc_selection)} selected documents "
+                f"from {self.doc_selection_file}"
+            )
+        self._query_cache: Dict[int, List[int]] = {}
         print(
             f"[train_sft] kept {len(keep)}/{len(inputs)} samples "
             f"(prompt<={max_prompt_len}, answer<={max_answer_len}, source<={max_source_len or 'inf'})"
@@ -191,12 +247,87 @@ class SftFullDocDataset(Dataset):
     def __len__(self) -> int:
         return len(self._inputs)
 
+    def _query_selected_ids(
+        self, doc_ids: List[int], document: str, question: str, budget: int
+    ) -> List[int]:
+        """Exact BM25-style selector used by the published headline row."""
+        sents = [x for x in re.split(r"(?<=[.!?])\s+", document) if x.strip()]
+        if len(sents) <= 1:
+            return list(doc_ids[:budget])
+
+        def tokenize_terms(text: str) -> List[str]:
+            return re.findall(r"[a-z0-9]+", text.lower())
+
+        q_terms = set(tokenize_terms(question))
+        sent_terms = [tokenize_terms(sentence) for sentence in sents]
+        df = {term: sum(1 for terms in sent_terms if term in terms) for term in q_terms}
+        n_sentences = len(sents)
+        avg_len = sum(len(terms) for terms in sent_terms) / max(n_sentences, 1)
+        k1, b = 1.5, 0.75
+        scores: List[float] = []
+        for terms in sent_terms:
+            score = 0.0
+            for term in q_terms:
+                freq = terms.count(term)
+                if not freq:
+                    continue
+                idf = math.log(
+                    1.0 + (n_sentences - df[term] + 0.5) / (df[term] + 0.5)
+                )
+                score += idf * (freq * (k1 + 1)) / (
+                    freq + k1 * (1 - b + b * len(terms) / max(avg_len, 1e-9))
+                )
+            scores.append(score)
+        lengths = [
+            len(
+                self.tokenizer(
+                    sentence, add_special_tokens=False, truncation=False
+                )["input_ids"]
+            )
+            for sentence in sents
+        ]
+        chosen: List[int] = []
+        used = 0
+        for sent_idx in sorted(
+            range(n_sentences), key=lambda item: (-scores[item], item)
+        ):
+            if used + lengths[sent_idx] > budget:
+                continue
+            chosen.append(sent_idx)
+            used += lengths[sent_idx]
+            if used >= budget:
+                break
+        if not chosen:
+            return list(doc_ids[:budget])
+        selected_text = " ".join(sents[item] for item in sorted(chosen))
+        selected_ids = self.tokenizer(
+            selected_text, add_special_tokens=False, truncation=False
+        )["input_ids"]
+        return list(selected_ids[:budget])
+
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
         if self._doc_budgets is not None:
+            source_document = str(self._inputs[idx])
+            document = self._doc_selection.get(idx, source_document)
             doc_ids = self.tokenizer(
-                str(self._inputs[idx]), add_special_tokens=False, truncation=False
+                document, add_special_tokens=False, truncation=False
             )["input_ids"]
-            doc_ids = doc_ids[: self._doc_budgets[idx]]
+            budget = self._doc_budgets[idx]
+            if self.selection_policy == "file" and len(doc_ids) > budget:
+                raise ValueError(
+                    f"selected document idx={idx} uses {len(doc_ids)} decoder tokens, "
+                    f"exceeding cap {budget}"
+                )
+            if self.selection_policy == "query":
+                cached = self._query_cache.get(idx)
+                if cached is None:
+                    cached = self._query_selected_ids(
+                        list(doc_ids), source_document, str(self._prompts[idx]), budget
+                    )
+                    self._query_cache[idx] = cached
+                doc_ids = cached
+            elif self.selection_policy == "first":
+                doc_ids = doc_ids[:budget]
             tail_ids = self.tokenizer(
                 "\n\n" + str(self._prompts[idx]), add_special_tokens=False, truncation=False
             )["input_ids"]
@@ -392,10 +523,31 @@ def parse_args() -> argparse.Namespace:
         help="If >0, drop samples whose doc exceeds this many ENCODER tokens (mirror of the CVLM filter).",
     )
     p.add_argument("--text_encoder_name", type=str, default="answerdotai/ModernBERT-base")
+    p.add_argument(
+        "--doc_selection_file",
+        type=str,
+        default="",
+        help="Optional JSONL with one {idx, selected_text} row per filtered training "
+        "example. Requires --truncate_cr and enforces the same per-example cap.",
+    )
+    p.add_argument(
+        "--selection_policy",
+        type=str,
+        default="first",
+        choices=["first", "query", "file"],
+        help="Document representation used for SFT. 'query' is the exact "
+        "BM25-style sentence selector used by the query-aware baseline.",
+    )
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument(
+        "--lr_scheduler_type",
+        type=str,
+        default="cosine",
+        choices=["cosine", "constant", "constant_with_warmup", "linear"],
+    )
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--enable_warmup", action="store_true")
     p.add_argument("--warmup_ratio", type=float, default=0.0)
@@ -458,6 +610,8 @@ def main() -> None:
         max_vision_len=args.max_vision_len,
         max_source_len=args.max_source_len,
         encoder_tokenizer_name=args.text_encoder_name,
+        doc_selection_file=args.doc_selection_file,
+        selection_policy=args.selection_policy,
     )
     collator = SftCollator(pad_token_id=tokenizer.pad_token_id)
 
@@ -477,7 +631,7 @@ def main() -> None:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.lr,
         max_grad_norm=args.grad_clip,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type=args.lr_scheduler_type,
         warmup_steps=args.warmup_steps if args.enable_warmup else 0,
         warmup_ratio=args.warmup_ratio if args.enable_warmup else 0.0,
         bf16=use_bf16,
@@ -502,6 +656,7 @@ def main() -> None:
         "batch_size": args.batch_size,
         "grad_accum": args.gradient_accumulation_steps,
         "lr": args.lr,
+        "lr_scheduler_type": args.lr_scheduler_type,
         "max_prompt_len": args.max_prompt_len,
         "max_answer_len": args.max_answer_len,
         "seed": args.seed,
@@ -509,6 +664,8 @@ def main() -> None:
         "warmup_steps": args.warmup_steps if args.enable_warmup else 0,
         "world_size": int(os.environ.get("WORLD_SIZE", "1")),
         "task": "sft_baseline",
+        "doc_selection_file": args.doc_selection_file,
+        "selection_policy": args.selection_policy,
     }
 
     trainer = Trainer(

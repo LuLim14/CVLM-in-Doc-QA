@@ -1,67 +1,11 @@
-# Запуск абляций CVLM на cHARISMa — runbook
+# Historical cluster recipes
 
-Цель: собрать к 01–02.08 таблицы prior-абляции (pretrained/random/frozen/no-ViT)
-и truncated-SFT бейзлайны для DocInsights 2026. Протокол всех веток един и
-задан ТОЛЬКО в `protocol.env`.
+These scripts record the Slurm campaigns used during the experiments. They contain the original cluster's partition names, module environment, absolute paths, snapshot identifiers, and checkpoint locations. They are retained as protocol records and require adaptation before use on another system.
 
-## Порядок действий
+Use the [reproduction guide](../docs/reproduction.md) for portable training and evaluation commands. The public entrypoints are `src/train_cvlm.py`, `src/train_sft.py`, and `src/eval_cvlm.py`.
 
-```bash
-# 0. Залить код на кластер (с Мака, из корня репозитория):
-rsync -avz --exclude .git --exclude __pycache__ --exclude runs \
-    ~/Desktop/CVLM/code/ hse-trail:/home/aburlova/cvlm/
+`protocol.env` records the main curriculum, source and context limits, optimizer settings, and model identifiers. It also sets offline cache paths and evaluation defaults specific to the cluster. In particular, inherited `EVAL_CR_SCHEDULE` and `EVAL_ALL_CHECKPOINTS` values are incompatible with some isolated reader evaluations. The reproduction guide clears them explicitly.
 
-# 1. ЛОГИН-нода: окружение (~15 мин, один раз)
-ssh hse-trail "bash /home/aburlova/cvlm/hse/setup_env.sh"
+The recipe names describe historical campaigns. Some exploratory arms were not part of the final paper. The final [paper](../docs/paper.pdf) and [reported aggregates](../results/paper_metrics.json) identify the published comparisons.
 
-# 2. ЛОГИН-нода: предзагрузка HF (модели+датасет, ~10 мин; упадёт, если у PwC нет split test!)
-ssh hse-trail "bash /home/aburlova/cvlm/hse/prefetch.sh"
-
-# 3. Смоук (gpu-ef-quick, ~1-2 ч): 4 ветки по 30 шагов + микро-eval + замер сек/шаг
-ssh hse-trail "cd /home/aburlova/cvlm/hse && sbatch smoke.sbatch"
-#    После завершения посмотреть batch_time в логе; если сек/шаг сильно > 12с —
-#    ужать CR_SCHEDULE в protocol.env (одинаково для всех веток!) и только потом п.4.
-
-# 4. Боевой запуск: 4 абляции + 2 truncated-SFT параллельно
-ssh hse-trail "bash /home/aburlova/cvlm/hse/launch_all.sh"
-
-# 5. Мониторинг (не чаще раза в ~минуту, батчить):
-ssh hse-trail "squeue -u aburlova -o '%i %j %T %M %R'; tail -3 /home/aburlova/cvlm/runs/_logs/abl_vit_*.out"
-
-# 6. Забрать результаты на Мак:
-rsync -avz --include '*/' --include 'eval_*.json' --include 'metrics.csv' \
-    --include 'pipeline.log' --include '*.png' --exclude '*' \
-    hse-trail:/home/aburlova/cvlm/runs/ ~/Desktop/CVLM/runs_hse/
-```
-
-## Ветки
-
-| job | флаги | что проверяет |
-|---|---|---|
-| abl_vit | (дефолт) | pretrained trainable ViT — референс |
-| abl_randomvit | VIT_INIT=random | вклад ИМЕННО визуальных весов (RQ1) |
-| abl_frozenvit | FREEZE_VIT=1 | пригоден ли приор без переписывания (RQ1b) |
-| abl_novit | NO_VIT=1 | нужна ли capacity ViT вообще (RQ2) |
-| sft_trunc8/16 | TRUNC_CR=8/16 | trained-truncation бейзлайн (RQ3) |
-| sft_full (опц.) | TRUNC_CR=0 | ceiling |
-
-## Тайминг и риски
-
-- Укороченный протокол ~7.5k шагов ≈ 15–27 ч/ветку на A100 (оценка; смоук уточнит).
-  Форс-чекпоинт на каждой границе стадии ⇒ даже упавшая на cr=16 ветка отдаёт cr≤8.
-- Walltime 2 суток; если не влезает — resume:
-  `sbatch --job-name=abl_vit --export=ALL,BRANCH=vit,RESUME=/home/aburlova/cvlm/runs/abl_vit_<stamp> train_branch.sbatch`
-  (нюанс: mid-epoch resume перезапускает эпоху при сохранённом global_step — позиция куррикулума не теряется).
-- Диск: ~11–12 GB на пару чекпоинтов, до ~100 GB на ветку. sbatch в конце сам
-  чистит старые trainer_step_*.pt. Проверять: `du -sh /home/aburlova/cvlm/runs`.
-- Если liger/triton не заведётся на compute-ноде: аварийно `DISABLE_LIGER=1` +
-  BATCH_SIZE=16, GRAD_ACCUM=4 в protocol.env (для ВСЕХ веток одинаково).
-- ВАЖНО для eval no-ViT ветки: флаг `--no_vit` обязан передаваться и в eval
-  (run_full_pipeline.sh это делает автоматически через NO_VIT).
-
-## Что дальше (после схода прогонов — отдельные скрипты, wave 2)
-
-- truncation-сетка inference-time (first/last/random/oracle-window),
-- cross-CR матрица (каждый стадийный чекпоинт × все cr, включая 32),
-- bootstrap-CI + пер-сэмпловый дамп,
-- eval truncated-SFT с усечённым документом (симметрия train/eval).
+The launchers refer to run directories and immutable snapshots that are not distributed here. Several scripts manage or remove old training checkpoints inside their configured output directories. Read and adapt the paths and retention settings before submitting any job.

@@ -60,6 +60,12 @@ Protocol (literal)
    BOTH ways and the reimplemented renderer must reproduce the public API's
    ``compressed_prompt`` byte for byte, or the run aborts.
 
+   Decoder BPE length can very rarely be non-monotone even though the retained
+   word sets are nested. When an observed bisection probe detects that case,
+   the implementation enumerates every percentile boundary at which a word
+   set can change and chooses the lowest feasible percentile. This exact
+   fallback reuses the same word scores and performs no extra model forward.
+
    ``--search_mode rate_grid`` keeps the pure public-API path (bisection on
    ``rate``) for settings the threshold path does not replicate — non-empty
    ``--force_tokens`` or ``--drop_consecutive``.
@@ -119,7 +125,7 @@ import json
 import os
 import sys
 import time
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
 
 # Nothing here trains or computes a loss; liger's fused patches are pure risk.
 os.environ.setdefault("DISABLE_LIGER", "1")
@@ -344,6 +350,52 @@ class LinguaWordScorer:
         return "".join(parts)
 
 
+def threshold_q_candidates(
+    scored: List[Tuple[List[str], List[float], List[float]]]
+) -> List[float]:
+    """All percentile regimes at which LLMLingua's retained words can change.
+
+    ``numpy.percentile`` linearly interpolates a sorted vector at rank
+    ``q/100 * (n-1)``. A keep-set transition can therefore occur only where
+    that interpolation reaches one of the token-weighted word probabilities.
+    Evaluating each such boundary and one point in every open interval covers
+    every distinct retained-word set, including the equality behaviour at the
+    boundary itself.
+    """
+    boundaries = {0.0, 100.0}
+    for _, _, weighted_word_probs in scored:
+        values = sorted(float(x) for x in weighted_word_probs)
+        n = len(values)
+        if n <= 1:
+            continue
+        for i, value in enumerate(values):
+            if i == 0 or value != values[i - 1]:
+                boundaries.add(100.0 * i / (n - 1))
+    ordered = sorted(boundaries)
+    candidates = set(ordered)
+    for left, right in zip(ordered, ordered[1:]):
+        candidates.add((left + right) / 2.0)
+    return sorted(candidates)
+
+
+def exact_threshold_selection(
+    scored: List[Tuple[List[str], List[float], List[float]]],
+    render: Callable[[List[Tuple[List[str], List[float], List[float]]], float], str],
+    token_length: Callable[[str], int],
+    budget: int,
+) -> Tuple[str, int, float]:
+    """Return the lowest-percentile (largest nested word set) feasible output."""
+    for q in threshold_q_candidates(scored):
+        text = render(scored, q)
+        tokens = token_length(text)
+        if tokens <= budget:
+            return text, tokens, q
+    raise RuntimeError(
+        "LLMLingua exact threshold enumeration found no output within "
+        f"the decoder-token budget={budget}"
+    )
+
+
 def main() -> None:
     args = parse_args()
     if args.budget_cr <= 0:
@@ -415,6 +467,7 @@ def main() -> None:
 
     gpu_seconds = [0.0]  # accumulated LLMLingua forward time
     call_count = [0]
+    nonmonotone_fallback_count = [0]
 
     def compress_threshold(document: str, budget: int) -> Dict[str, object]:
         """Bisect the continuous percentile; one transformer pass per document."""
@@ -458,7 +511,7 @@ def main() -> None:
             probes.append((mid, tok))
             if tok <= budget:
                 hi = mid
-                if tok > best_tok or not best_text:
+                if tok > best_tok or (tok == best_tok and mid < best_q) or not best_text:
                     best_text, best_tok, best_q = text, tok, mid
                 if tok == budget:
                     break
@@ -470,18 +523,35 @@ def main() -> None:
         # Refuse to publish a falsely "maximal" selection if that happens on
         # any point the actual search observed.
         ordered = sorted(probes)
+        nonmonotone = False
         for (q0, t0), (q1, t1) in zip(ordered, ordered[1:]):
             if t1 > t0:
-                raise RuntimeError(
-                    "decoder-token length is non-monotone in LLMLingua percentile "
-                    f"({t0} at q={q0:.8f}, {t1} at q={q1:.8f}); bisection is invalid"
-                )
+                nonmonotone = True
+                break
+        if nonmonotone:
+            # The retained word sets are still nested as q rises. Enumerating
+            # every keep-set regime lets us select the lowest q whose actual
+            # decoder-token length is within budget, without truncating the
+            # published method's output or running its transformer again.
+            nonmonotone_fallback_count[0] += 1
+            text, tok, q = exact_threshold_selection(
+                scored, scorer.render, n_dec, budget
+            )
+            return {
+                "selected_text": text,
+                "dec_tokens": tok,
+                "q": q,
+                "n_calls": 1,
+                "truncated": False,
+                "nonmonotone_fallback": True,
+            }
         return {
             "selected_text": best_text,
             "dec_tokens": best_tok,
             "q": best_q,
             "n_calls": 1,
             "truncated": False,
+            "nonmonotone_fallback": False,
         }
 
     def compress_rate_grid(document: str, budget: int) -> Dict[str, object]:
@@ -527,6 +597,7 @@ def main() -> None:
             "q": 100.0 * (1.0 - best_rate),
             "n_calls": n_calls,
             "truncated": truncated,
+            "nonmonotone_fallback": False,
         }
 
     def compress_one(document: str, budget: int) -> Dict[str, object]:
@@ -542,6 +613,7 @@ def main() -> None:
                 "q": 0.0,
                 "n_calls": 0,
                 "truncated": False,
+                "nonmonotone_fallback": False,
             }
         t0 = time.time()
         out = compress_threshold(document, budget) if scorer else compress_rate_grid(document, budget)
@@ -655,6 +727,7 @@ def main() -> None:
                 "percentile_q": float(out["q"]),
                 "n_calls": int(out["n_calls"]),
                 "truncated": bool(out["truncated"]),
+                "nonmonotone_fallback": bool(out.get("nonmonotone_fallback", False)),
                 "compress_seconds": float(out.get("compress_seconds", 0.0)),
             }
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -704,6 +777,7 @@ def main() -> None:
         "n_truncated_safety_net": int(n_truncated),
         "n_empty_selections": int(n_empty),
         "n_llmlingua_forward_calls": int(call_count[0]),
+        "n_nonmonotone_fallback_documents": int(nonmonotone_fallback_count[0]),
         "llmlingua_seconds_total": float(gpu_seconds[0]),
         "llmlingua_seconds_per_document": float(gpu_seconds[0] / max(n_docs, 1)),
         "wall_seconds_total": float(wall),
